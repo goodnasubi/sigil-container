@@ -250,7 +250,15 @@ pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Res
           }
 
           // mode (100..108), uid (108..116), gid (116..124) のパース
-          let mode = parse_octal(&header, 100, 8).unwrap_or(0);
+          let mut mode = 0;
+          match parse_octal(&header, 100, 8) {
+            Ok(v) => {
+              mode = v;
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
           let mut uid = 0;
           match parse_octal(&header, 108, 8) {
             Ok(v) => {
