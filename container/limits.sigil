@@ -106,6 +106,36 @@ pub fn max_port_count() -> Int
   return 64;
 }
 
+// 宣言可能な外向き通信許可規則の最大数: 64
+pub fn max_egress_rules() -> Int
+  intent "宣言可能な外向き通信許可規則の最大数 (64) を返す"
+  requires none
+  ensures result == 64
+  effects none
+{
+  return 64;
+}
+
+// 宣言可能なコンテナ間接続規則の最大数: 64
+pub fn max_peer_rules() -> Int
+  intent "宣言可能なコンテナ間接続規則の最大数 (64) を返す"
+  requires none
+  ensures result == 64
+  effects none
+{
+  return 64;
+}
+
+// 1 つのブリッジネットワークが収容可能な最大エンドポイント数: 1024
+pub fn max_network_endpoints() -> Int
+  intent "ブリッジ上の最大エンドポイント数 (1024) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
 // 宣言可能なマウントの最大数: 32
 pub fn max_mount_count() -> Int
   intent "宣言可能なマウント最大数 (32) を返す"

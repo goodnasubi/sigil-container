@@ -5,9 +5,11 @@ module container.spec
 use container.error.ContainerError;
 use container.limits.default_non_root_gid;
 use container.limits.default_non_root_uid;
+use container.limits.max_egress_rules;
 use container.limits.max_env_var_count;
 use container.limits.max_log_size;
 use container.limits.max_mount_count;
+use container.limits.max_peer_rules;
 use container.limits.max_port_count;
 use container.limits.max_spec_size;
 
@@ -19,6 +21,18 @@ pub struct PortMapping {
   container_port: Int,
   protocol: String,
   host_ip: String,
+}
+
+pub struct EgressRule {
+  destination: String,
+  port: Int,
+  protocol: String,
+}
+
+pub struct PeerConnection {
+  target_workload: String,
+  port: Int,
+  protocol: String,
 }
 
 pub struct Mount {
@@ -74,6 +88,8 @@ pub struct ContainerSpec {
   resources: Resources,
   network_enabled: Bool,
   ports: List<PortMapping>,
+  egress_rules: List<EgressRule>,
+  peer_connections: List<PeerConnection>,
   mounts: List<Mount>,
   secrets: List<SecretFile>,
   restart_policy: RestartPolicy,
@@ -86,6 +102,24 @@ pub fn new_port_mapping(host_port: Int, container_port: Int, protocol: String, h
   effects none
 {
   return PortMapping { host_port: host_port, container_port: container_port, protocol: protocol, host_ip: host_ip };
+}
+
+pub fn new_egress_rule(destination: String, port: Int, protocol: String) -> EgressRule
+  intent "EgressRule を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return EgressRule { destination: destination, port: port, protocol: protocol };
+}
+
+pub fn new_peer_connection(target_workload: String, port: Int, protocol: String) -> PeerConnection
+  intent "PeerConnection を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return PeerConnection { target_workload: target_workload, port: port, protocol: protocol };
 }
 
 pub fn new_mount(source: String, destination: String, readonly: Bool, mount_type: String) -> Mount
@@ -125,12 +159,21 @@ pub fn new_resources(memory_max_bytes: Int, cpu_quota_us: Int, pids_max: Int, di
 }
 
 pub fn new_container_spec(image_digest: String, args: List<String>, env_vars: List<EnvVar>, working_dir: String, isolation: Isolation, resources: Resources, network_enabled: Bool, ports: List<PortMapping>, mounts: List<Mount>, secrets: List<SecretFile>, restart_policy: RestartPolicy) -> ContainerSpec
-  intent "ContainerSpec を構築する"
+  intent "ContainerSpec を構築する (外向き規則・コンテナ間接続は既定で空 = 既定拒否)"
   requires none
   ensures none
   effects none
 {
-  return ContainerSpec { image_digest: image_digest, args: args, env_vars: env_vars, working_dir: working_dir, isolation: isolation, resources: resources, network_enabled: network_enabled, ports: ports, mounts: mounts, secrets: secrets, restart_policy: restart_policy };
+  return ContainerSpec { image_digest: image_digest, args: args, env_vars: env_vars, working_dir: working_dir, isolation: isolation, resources: resources, network_enabled: network_enabled, ports: ports, egress_rules: List.new(), peer_connections: List.new(), mounts: mounts, secrets: secrets, restart_policy: restart_policy };
+}
+
+pub fn new_container_spec_full(image_digest: String, args: List<String>, env_vars: List<EnvVar>, working_dir: String, isolation: Isolation, resources: Resources, network_enabled: Bool, ports: List<PortMapping>, egress_rules: List<EgressRule>, peer_connections: List<PeerConnection>, mounts: List<Mount>, secrets: List<SecretFile>, restart_policy: RestartPolicy) -> ContainerSpec
+  intent "ネットワーク接続規則を含む ContainerSpec を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return ContainerSpec { image_digest: image_digest, args: args, env_vars: env_vars, working_dir: working_dir, isolation: isolation, resources: resources, network_enabled: network_enabled, ports: ports, egress_rules: egress_rules, peer_connections: peer_connections, mounts: mounts, secrets: secrets, restart_policy: restart_policy };
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +451,30 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
     p = p + 1;
   }
 
+  let mut eg_i = 0;
+  while eg_i < spec.egress_rules.len() {
+    match spec.egress_rules.get(eg_i) {
+      Some(eg) => {
+        total = total + eg.destination.as_bytes().len();
+        total = total + eg.protocol.as_bytes().len();
+      }
+      None => {}
+    }
+    eg_i = eg_i + 1;
+  }
+
+  let mut pc_i = 0;
+  while pc_i < spec.peer_connections.len() {
+    match spec.peer_connections.get(pc_i) {
+      Some(pc) => {
+        total = total + pc.target_workload.as_bytes().len();
+        total = total + pc.protocol.as_bytes().len();
+      }
+      None => {}
+    }
+    pc_i = pc_i + 1;
+  }
+
   let mut s = 0;
   while s < spec.secrets.len() {
     match spec.secrets.get(s) {
@@ -529,9 +596,17 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
     return Err(ContainerError.LimitExceeded("ログ量上限がシステム最大許容値を超過しています。"));
   }
 
-  // 9. ネットワーク: 既定で接続なし。無効時のポート公開は拒否
-  if !spec.network_enabled && spec.ports.len() > 0 {
-    return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでポートマッピングを宣言することはできません。"));
+  // 9. ネットワーク: 既定で接続なし。無効時のポート公開・外向き通信・ピア接続は拒否
+  if !spec.network_enabled {
+    if spec.ports.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでポートマッピングを宣言することはできません。"));
+    }
+    if spec.egress_rules.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナで外向き通信の許可を宣言することはできません。"));
+    }
+    if spec.peer_connections.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでコンテナ間接続を宣言することはできません。"));
+    }
   }
   if spec.ports.len() > max_port_count() {
     return Err(ContainerError.LimitExceeded("宣言されたポートマッピング数が上限を超過しています。"));
@@ -546,6 +621,9 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
         if p.host_port <= 0 || p.host_port > 65535 {
           return Err(ContainerError.SpecValidation("ホストポート番号が不正です。"));
         }
+        if p.protocol != "tcp" && p.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("ポートマッピングのプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
         // 初版は外部公開しないため、host_ip は 127.0.0.1 または内部アドレスのみ
         if p.host_ip == "0.0.0.0" {
           return Err(ContainerError.SpecValidation("ポートの全方位公開 (0.0.0.0) は拒否されます。ループバックまたは宣言された内部アドレスに限定してください。"));
@@ -554,6 +632,48 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
       None => {}
     }
     p_idx = p_idx + 1;
+  }
+  if spec.egress_rules.len() > max_egress_rules() {
+    return Err(ContainerError.LimitExceeded("宣言された外向き通信許可規則数が上限を超過しています。"));
+  }
+  let mut eg_idx = 0;
+  while eg_idx < spec.egress_rules.len() {
+    match spec.egress_rules.get(eg_idx) {
+      Some(eg) => {
+        if eg.destination.len() == 0 {
+          return Err(ContainerError.SpecValidation("外向き通信許可の宛先が空です。"));
+        }
+        if eg.port <= 0 || eg.port > 65535 {
+          return Err(ContainerError.SpecValidation("外向き通信許可のポート番号が不正です。"));
+        }
+        if eg.protocol != "tcp" && eg.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("外向き通信許可のプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    eg_idx = eg_idx + 1;
+  }
+  if spec.peer_connections.len() > max_peer_rules() {
+    return Err(ContainerError.LimitExceeded("宣言されたコンテナ間接続規則数が上限を超過しています。"));
+  }
+  let mut pc_idx = 0;
+  while pc_idx < spec.peer_connections.len() {
+    match spec.peer_connections.get(pc_idx) {
+      Some(pc) => {
+        if pc.target_workload.len() == 0 {
+          return Err(ContainerError.SpecValidation("コンテナ間接続の対象ワークロード名が空です。"));
+        }
+        if pc.port <= 0 || pc.port > 65535 {
+          return Err(ContainerError.SpecValidation("コンテナ間接続のポート番号が不正です。"));
+        }
+        if pc.protocol != "tcp" && pc.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("コンテナ間接続のプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    pc_idx = pc_idx + 1;
   }
 
   // 10. マウント: host パスは許可リストに載ったものに限り、/proc, /sys, デバイスは既定で出さない

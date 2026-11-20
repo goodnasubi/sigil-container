@@ -1,0 +1,980 @@
+module container.network
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_egress_rules;
+use container.limits.max_network_endpoints;
+use container.limits.max_peer_rules;
+use container.limits.max_port_count;
+use container.spec.ContainerSpec;
+use container.spec.EgressRule;
+use container.spec.PeerConnection;
+use container.spec.PortMapping;
+use db.types.Value;
+use db.types.decode_row;
+use db.types.encode_key;
+use db.types.encode_row;
+
+// ADR 0053 決定 3・4 (P5-4): ネットワークと公開の核
+// - コンテナごとの network namespace と、ノード内のブリッジによる接続
+// - 既定は接続なし (省略が接続の許可にならない)
+// - 外向き通信の許可 (宛先・ポート) を宣言し、許可しないものは遮断
+// - 宣言したポートの公開 (待ち受けはループバックまたは宣言した内部アドレスに限定、0.0.0.0 拒否)
+// - ノード内の名前による参照 (名前解決): 宣言したワークロード/インスタンスを指し、宣言に無い名前は解決しない
+// - host network の拒否: host の network namespace を共有する指定は仕様エラーとして拒否
+// - コンテナ間の分離: 宣言した接続の無いコンテナ同士は通信不可、宣言に無い通信は遮断
+
+// ---------------------------------------------------------------------------
+// ネットワーク仕様の型
+// ---------------------------------------------------------------------------
+
+pub struct NetworkSpec {
+  enabled: Bool,
+  ports: List<PortMapping>,
+  egress_rules: List<EgressRule>,
+  peer_connections: List<PeerConnection>,
+}
+
+pub fn new_network_spec(enabled: Bool, ports: List<PortMapping>, egress_rules: List<EgressRule>, peer_connections: List<PeerConnection>) -> NetworkSpec
+  intent "NetworkSpec を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkSpec { enabled: enabled, ports: ports, egress_rules: egress_rules, peer_connections: peer_connections };
+}
+
+pub fn default_disabled_network_spec() -> NetworkSpec
+  intent "既定拒否 (接続なし) の NetworkSpec を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkSpec { enabled: false, ports: List.new(), egress_rules: List.new(), peer_connections: List.new() };
+}
+
+pub fn spec_to_network_spec(spec: &ContainerSpec) -> NetworkSpec
+  intent "ContainerSpec から NetworkSpec を抽出する"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkSpec { enabled: spec.network_enabled, ports: spec.ports.clone(), egress_rules: spec.egress_rules.clone(), peer_connections: spec.peer_connections.clone() };
+}
+
+pub fn validate_network_spec(spec: &NetworkSpec) -> Result<Bool, ContainerError>
+  intent "ネットワーク仕様を既定拒否の規則に基づいて検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if !spec.enabled {
+    if spec.ports.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでポートマッピングを宣言することはできません。"));
+    }
+    if spec.egress_rules.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナで外向き通信の許可を宣言することはできません。"));
+    }
+    if spec.peer_connections.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでコンテナ間接続を宣言することはできません。"));
+    }
+    return Ok(true);
+  }
+
+  // 1. ポート公開の検証
+  if spec.ports.len() > max_port_count() {
+    return Err(ContainerError.LimitExceeded("宣言されたポートマッピング数が上限を超過しています。"));
+  }
+  let mut p_idx = 0;
+  while p_idx < spec.ports.len() {
+    match spec.ports.get(p_idx) {
+      Some(p) => {
+        if p.container_port <= 0 || p.container_port > 65535 {
+          return Err(ContainerError.SpecValidation("コンテナポート番号が不正です。"));
+        }
+        if p.host_port <= 0 || p.host_port > 65535 {
+          return Err(ContainerError.SpecValidation("ホストポート番号が不正です。"));
+        }
+        if p.protocol != "tcp" && p.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("ポートマッピングのプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+        // 初版は外部公開しないため、host_ip は 127.0.0.1 または宣言された内部アドレスのみ
+        if p.host_ip == "0.0.0.0" {
+          return Err(ContainerError.SpecValidation("ポートの全方位公開 (0.0.0.0) は拒否されます。ループバックまたは宣言された内部アドレスに限定してください。"));
+        }
+      }
+      None => {}
+    }
+    p_idx = p_idx + 1;
+  }
+
+  // 2. 外向き通信規則の検証
+  if spec.egress_rules.len() > max_egress_rules() {
+    return Err(ContainerError.LimitExceeded("宣言された外向き通信許可規則数が上限を超過しています。"));
+  }
+  let mut eg_idx = 0;
+  while eg_idx < spec.egress_rules.len() {
+    match spec.egress_rules.get(eg_idx) {
+      Some(eg) => {
+        if eg.destination.len() == 0 {
+          return Err(ContainerError.SpecValidation("外向き通信許可の宛先が空です。"));
+        }
+        if eg.port <= 0 || eg.port > 65535 {
+          return Err(ContainerError.SpecValidation("外向き通信許可のポート番号が不正です。"));
+        }
+        if eg.protocol != "tcp" && eg.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("外向き通信許可のプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    eg_idx = eg_idx + 1;
+  }
+
+  // 3. コンテナ間接続規則の検証
+  if spec.peer_connections.len() > max_peer_rules() {
+    return Err(ContainerError.LimitExceeded("宣言されたコンテナ間接続規則数が上限を超過しています。"));
+  }
+  let mut pc_idx = 0;
+  while pc_idx < spec.peer_connections.len() {
+    match spec.peer_connections.get(pc_idx) {
+      Some(pc) => {
+        if pc.target_workload.len() == 0 {
+          return Err(ContainerError.SpecValidation("コンテナ間接続の対象ワークロード名が空です。"));
+        }
+        if pc.port <= 0 || pc.port > 65535 {
+          return Err(ContainerError.SpecValidation("コンテナ間接続のポート番号が不正です。"));
+        }
+        if pc.protocol != "tcp" && pc.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("コンテナ間接続のプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    pc_idx = pc_idx + 1;
+  }
+
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// ブリッジネットワークとエンドポイント
+// ---------------------------------------------------------------------------
+
+pub struct BridgeConfig {
+  bridge_name: String,
+  subnet_cidr: String,
+  gateway_ip: String,
+  subnet_prefix: String,
+}
+
+pub struct NetworkEndpoint {
+  endpoint_id: String,
+  instance_id: String,
+  workload_id: String,
+  ip_address: String,
+  mac_address: String,
+  netns_path: String,
+  veth_host: String,
+  veth_container: String,
+  spec: NetworkSpec,
+}
+
+pub fn new_network_endpoint(endpoint_id: String, instance_id: String, workload_id: String, ip_address: String, mac_address: String, netns_path: String, veth_host: String, veth_container: String, spec: NetworkSpec) -> NetworkEndpoint
+  intent "NetworkEndpoint を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkEndpoint { endpoint_id: endpoint_id, instance_id: instance_id, workload_id: workload_id, ip_address: ip_address, mac_address: mac_address, netns_path: netns_path, veth_host: veth_host, veth_container: veth_container, spec: spec };
+}
+
+pub fn default_endpoint() -> NetworkEndpoint
+  intent "空の初期化用 NetworkEndpoint を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkEndpoint { endpoint_id: "", instance_id: "", workload_id: "", ip_address: "", mac_address: "", netns_path: "", veth_host: "", veth_container: "", spec: default_disabled_network_spec() };
+}
+
+pub struct BridgeNetwork {
+  config: BridgeConfig,
+  endpoints: List<NetworkEndpoint>,
+  next_ip_host: Int,
+}
+
+pub fn default_bridge_config() -> BridgeConfig
+  intent "単一ノード内の標準ブリッジ設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return BridgeConfig { bridge_name: "sigil0", subnet_cidr: "10.244.0.0/24", gateway_ip: "10.244.0.1", subnet_prefix: "10.244.0." };
+}
+
+pub fn new_bridge_network(config: BridgeConfig) -> BridgeNetwork
+  intent "BridgeNetwork を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return BridgeNetwork { config: config, endpoints: List.new(), next_ip_host: 2 };
+}
+
+fn int_to_str(val: Int) -> String
+  intent "非負整数を 10 進文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if val <= 0 {
+    return "0";
+  }
+  let mut n = val;
+  let mut digits = List.new();
+  while n > 0 {
+    let d = n % 10;
+    digits.push(d);
+    n = n / 10;
+  }
+  let mut buf = Bytes.new();
+  let mut i = digits.len();
+  while i > 0 {
+    i = i - 1;
+    match digits.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+  }
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "0",
+  };
+}
+
+fn concat_str(prefix: &String, s: &String) -> String
+  intent "接頭辞と文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.extend(&prefix.as_bytes());
+  buf.extend(&s.as_bytes());
+  return match buf.to_string_utf8() {
+    Ok(res) => res,
+    Err(_) => "",
+  };
+}
+
+pub fn attach_container(bridge: &mut BridgeNetwork, instance_id: String, workload_id: String, spec: NetworkSpec, share_host_net: Bool) -> Result<NetworkEndpoint, ContainerError>
+  intent "コンテナをブリッジネットワークに接続し、ネットワークエンドポイントと IP を割り当てる"
+  requires none
+  ensures none
+  effects none
+{
+  // 決定 3・4: host network の共有は禁止
+  if share_host_net {
+    return Err(ContainerError.SpecValidation("host network namespace の共有は禁止されています (決定 3・4)。"));
+  }
+
+  // 既定拒否: ネットワークが無効化されているコンテナはブリッジに接続できない
+  if !spec.enabled {
+    return Err(ContainerError.SpecValidation("ネットワークが無効なコンテナはブリッジに接続できません (完全隔離)。"));
+  }
+
+  // 上限検査
+  if bridge.endpoints.len() >= max_network_endpoints() {
+    return Err(ContainerError.LimitExceeded("ブリッジ上のエンドポイント数が上限を超過しています。"));
+  }
+  if bridge.next_ip_host > 254 {
+    return Err(ContainerError.LimitExceeded("ブリッジの IP サブネット容量を超過しました。"));
+  }
+
+  // 仕様の検証
+  match validate_network_spec(&spec) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  let host_num_str = int_to_str(bridge.next_ip_host);
+  let ip = concat_str(&bridge.config.subnet_prefix, &host_num_str);
+  bridge.next_ip_host = bridge.next_ip_host + 1;
+
+  let ep_id = concat_str(&"ep-", &instance_id);
+  let veth_h = concat_str(&"veth-h-", &instance_id);
+  let netns = concat_str(&"/var/run/netns/", &instance_id);
+  let mac = concat_str(&"02:42:0a:f4:00:", &host_num_str);
+
+  let endpoint = NetworkEndpoint { endpoint_id: ep_id, instance_id: instance_id, workload_id: workload_id, ip_address: ip, mac_address: mac, netns_path: netns, veth_host: veth_h, veth_container: "eth0", spec: spec };
+
+  bridge.endpoints.push(endpoint.clone());
+  return Ok(endpoint);
+}
+
+pub fn detach_container(bridge: &mut BridgeNetwork, instance_id: &String) -> Result<Bool, ContainerError>
+  intent "指定されたインスタンスのエンドポイントをブリッジから切り離す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut new_eps = List.new();
+  let mut found = false;
+  let mut i = 0;
+  while i < bridge.endpoints.len() {
+    match bridge.endpoints.get(i) {
+      Some(ep) => {
+        if ep.instance_id == instance_id {
+          found = true;
+        } else {
+          new_eps.push(ep.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  bridge.endpoints = new_eps;
+  return Ok(found);
+}
+
+pub fn find_endpoint(endpoints: &List<NetworkEndpoint>, instance_id: &String) -> Option<NetworkEndpoint>
+  intent "インスタンス ID からエンドポイントを検索する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < endpoints.len() {
+    match endpoints.get(i) {
+      Some(ep) => {
+        if ep.instance_id == instance_id {
+          return Some(ep.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+pub fn find_endpoint_by_ip(endpoints: &List<NetworkEndpoint>, ip: &String) -> Option<NetworkEndpoint>
+  intent "IP アドレスからエンドポイントを検索する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < endpoints.len() {
+    match endpoints.get(i) {
+      Some(ep) => {
+        if ep.ip_address == ip {
+          return Some(ep.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+// ---------------------------------------------------------------------------
+// ノード内の名前解決
+// ---------------------------------------------------------------------------
+
+pub struct DnsEntry {
+  name: String,
+  ip_address: String,
+  target_kind: String,  // "workload" / "instance"
+}
+
+pub struct NameResolver {
+  entries: List<DnsEntry>,
+}
+
+fn empty_dns_entries() -> List<DnsEntry>
+  intent "空の DnsEntry リストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return List.new();
+}
+
+pub fn build_resolver(endpoints: &List<NetworkEndpoint>) -> NameResolver
+  intent "登録されたエンドポイントからノード内名前解決テーブルを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut entries = empty_dns_entries();
+  let mut i = 0;
+  while i < endpoints.len() {
+    match endpoints.get(i) {
+      Some(ep) => {
+        // ワークロード名による参照の登録 (最初のインスタンス、または代表 IP)
+        let mut wl_exists = false;
+        let mut k = 0;
+        while k < entries.len() {
+          match entries.get(k) {
+            Some(e) => {
+              if e.name == ep.workload_id {
+                wl_exists = true;
+              }
+            }
+            None => {}
+          }
+          k = k + 1;
+        }
+        if !wl_exists {
+          entries.push(DnsEntry { name: ep.workload_id.clone(), ip_address: ep.ip_address.clone(), target_kind: "workload" });
+        }
+
+        // インスタンス名による参照の登録
+        entries.push(DnsEntry { name: ep.instance_id.clone(), ip_address: ep.ip_address.clone(), target_kind: "instance" });
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return NameResolver { entries: entries };
+}
+
+pub fn resolve_name(resolver: &NameResolver, query_name: &String) -> Result<String, ContainerError>
+  intent "ノード内の宣言されたワークロード名またはインスタンス名を内部 IP に解決する。宣言にない名前は解決しない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < resolver.entries.len() {
+    match resolver.entries.get(i) {
+      Some(entry) => {
+        if entry.name == query_name {
+          return Ok(entry.ip_address.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(ContainerError.SpecValidation("ノード内名前解決に失敗しました: 宣言にない名前は解決しません。"));
+}
+
+// ---------------------------------------------------------------------------
+// IP / CIDR マッチング判定
+// ---------------------------------------------------------------------------
+
+fn power2(exp: Int) -> Int
+  intent "2 の exp 乗を計算する (0 <= exp <= 31)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut res = 1;
+  let mut i = 0;
+  while i < exp {
+    res = res * 2;
+    i = i + 1;
+  }
+  return res;
+}
+
+fn parse_ipv4_octets(ip_str: &String) -> Option<List<Int>>
+  intent "IPv4 文字列を 4 つのオクテット (0..255) の List に分解する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = ip_str.as_bytes();
+  let mut octets = List.new();
+  let mut cur = 0;
+  let mut has_digit = false;
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes.get(i).unwrap_or(0);
+    if b >= 48 && b <= 57 {
+      cur = cur * 10 + (b - 48);
+      has_digit = true;
+      if cur > 255 {
+        return None;
+      }
+    } else if b == 46 {  // '.'
+      if !has_digit {
+        return None;
+      }
+      octets.push(cur);
+      cur = 0;
+      has_digit = false;
+    } else {
+      return None;
+    }
+    i = i + 1;
+  }
+  if !has_digit {
+    return None;
+  }
+  octets.push(cur);
+  if octets.len() != 4 {
+    return None;
+  }
+  return Some(octets);
+}
+
+fn get_octet(octets: &List<Int>, i: Int) -> Int
+  intent "List<Int> から i 番目のオクテットを取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match octets.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+pub fn match_ip_or_cidr(rule_dest: &String, target_ip: &String) -> Bool
+  intent "宛先ルール (IP または CIDR) がターゲット IP と合致するかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if rule_dest == target_ip {
+    return true;
+  }
+  let bytes = rule_dest.as_bytes();
+  let mut slash_pos = 0 - 1;
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes.get(i).unwrap_or(0) == 47 {  // '/'
+      slash_pos = i;
+    }
+    i = i + 1;
+  }
+  if slash_pos < 0 {
+    return false;
+  }
+  let ip_slice = bytes.slice(0, slash_pos).unwrap_or(Bytes.new());
+  let mask_slice = bytes.slice(slash_pos + 1, bytes.len()).unwrap_or(Bytes.new());
+  let mut base_ip_str = "";
+  match ip_slice.to_string_utf8() {
+    Ok(s) => {
+      base_ip_str = s;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let mut mask_bits = 0;
+  let mut m_idx = 0;
+  while m_idx < mask_slice.len() {
+    let mb = mask_slice.get(m_idx).unwrap_or(0);
+    if mb >= 48 && mb <= 57 {
+      mask_bits = mask_bits * 10 + (mb - 48);
+    } else {
+      return false;
+    }
+    m_idx = m_idx + 1;
+  }
+  if mask_bits < 0 || mask_bits > 32 {
+    return false;
+  }
+  let mut base_octs = List.new();
+  match parse_ipv4_octets(&base_ip_str) {
+    Some(octs) => {
+      base_octs = octs;
+    }
+    None => {
+      return false;
+    }
+  }
+  let mut target_octs = List.new();
+  match parse_ipv4_octets(&target_ip) {
+    Some(octs) => {
+      target_octs = octs;
+    }
+    None => {
+      return false;
+    }
+  }
+  let base_val = get_octet(&base_octs, 0) * 16777216 + get_octet(&base_octs, 1) * 65536 + get_octet(&base_octs, 2) * 256 + get_octet(&base_octs, 3);
+  let target_val = get_octet(&target_octs, 0) * 16777216 + get_octet(&target_octs, 1) * 65536 + get_octet(&target_octs, 2) * 256 + get_octet(&target_octs, 3);
+  let mut mask = 0;
+  let mut b = 0;
+  while b < mask_bits {
+    mask = mask + power2(31 - b);
+    b = b + 1;
+  }
+  return (base_val & mask) == (target_val & mask);
+}
+
+// ---------------------------------------------------------------------------
+// コンテナ間の分離
+// ---------------------------------------------------------------------------
+
+pub fn can_communicate_containers(src_endpoint: &NetworkEndpoint, dst_endpoint: &NetworkEndpoint, dst_port: Int, protocol: &String) -> Bool
+  intent "2 つのコンテナ間で通信が可能かを判定する (宣言した接続のないコンテナ同士は通信不可)"
+  requires none
+  ensures none
+  effects none
+{
+  if !src_endpoint.spec.enabled || !dst_endpoint.spec.enabled {
+    return false;
+  }
+  let mut i = 0;
+  while i < src_endpoint.spec.peer_connections.len() {
+    match src_endpoint.spec.peer_connections.get(i) {
+      Some(pc) => {
+        if pc.target_workload == dst_endpoint.workload_id && pc.port == dst_port && pc.protocol == protocol {
+          return true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// 外向き通信の許可と遮断
+// ---------------------------------------------------------------------------
+
+pub fn can_egress(endpoint: &NetworkEndpoint, dst_ip: &String, dst_port: Int, protocol: &String) -> Bool
+  intent "コンテナから外向きの通信が可能かを判定する (許可宣言のない通信は遮断)"
+  requires none
+  ensures none
+  effects none
+{
+  if !endpoint.spec.enabled {
+    return false;
+  }
+  if endpoint.spec.egress_rules.len() == 0 {
+    return false;
+  }
+  let mut i = 0;
+  while i < endpoint.spec.egress_rules.len() {
+    match endpoint.spec.egress_rules.get(i) {
+      Some(eg) => {
+        if eg.port == dst_port && eg.protocol == protocol {
+          if match_ip_or_cidr(&eg.destination, &dst_ip) {
+            return true;
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// ポートの公開
+// ---------------------------------------------------------------------------
+
+pub struct PublishedPort {
+  host_ip: String,
+  host_port: Int,
+  container_ip: String,
+  container_port: Int,
+  protocol: String,
+  instance_id: String,
+}
+
+pub fn publish_ports(endpoint: &NetworkEndpoint) -> Result<List<PublishedPort>, ContainerError>
+  intent "エンドポイントのポートマッピングからホスト上で公開するポート定義を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  if !endpoint.spec.enabled {
+    return Ok(List.new());
+  }
+  let mut published = List.new();
+  let mut i = 0;
+  while i < endpoint.spec.ports.len() {
+    match endpoint.spec.ports.get(i) {
+      Some(p) => {
+        if p.host_ip == "0.0.0.0" {
+          return Err(ContainerError.SpecValidation("ポートの全方位公開 (0.0.0.0) は拒否されます。ループバックまたは宣言された内部アドレスに限定してください。"));
+        }
+        published.push(PublishedPort { host_ip: p.host_ip.clone(), host_port: p.host_port, container_ip: endpoint.ip_address.clone(), container_port: p.container_port, protocol: p.protocol.clone(), instance_id: endpoint.instance_id.clone() });
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(published);
+}
+
+pub fn route_inbound_port(published_list: &List<PublishedPort>, host_ip: &String, host_port: Int, protocol: &String) -> Result<PublishedPort, ContainerError>
+  intent "ホスト宛ての着信ポートが公開リストにあるかを検索し転送先を返す。未宣言ポートは拒否"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < published_list.len() {
+    match published_list.get(i) {
+      Some(p) => {
+        if p.host_ip == host_ip && p.host_port == host_port && p.protocol == protocol {
+          return Ok(p.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(ContainerError.SpecValidation("未公開のポートへの着信通信は拒否されます。"));
+}
+
+// ---------------------------------------------------------------------------
+// パケット評価・統合ファイアウォール判定
+// ---------------------------------------------------------------------------
+
+pub struct PacketDecision {
+  allowed: Bool,
+  reason: String,
+  resolved_ip: String,
+}
+
+pub fn evaluate_packet(bridge: &BridgeNetwork, resolver: &NameResolver, src_instance_id: &String, dst_target: &String, dst_port: Int, protocol: &String) -> PacketDecision
+  intent "コンテナから送信されたパケットの許可/遮断を決定論的に判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut src = default_endpoint();
+  match find_endpoint(&bridge.endpoints, &src_instance_id) {
+    Some(ep) => {
+      src = ep;
+    }
+    None => {
+      return PacketDecision { allowed: false, reason: "送信元コンテナのネットワークが無効またはエンドポイントが存在しません", resolved_ip: "" };
+    }
+  }
+
+  if !src.spec.enabled {
+    return PacketDecision { allowed: false, reason: "送信元コンテナのネットワークが無効です", resolved_ip: "" };
+  }
+
+  // 1. ノード内名前解決を試行
+  match resolve_name(&resolver, &dst_target) {
+    Ok(resolved_ip) => {
+      // 内部の別コンテナ宛ての通信
+      let mut dst_opt = find_endpoint_by_ip(&bridge.endpoints, &resolved_ip);
+      match dst_opt {
+        Some(dst) => {
+          if can_communicate_containers(&src, &dst, dst_port, &protocol) {
+            return PacketDecision { allowed: true, reason: "コンテナ間接続規則により許可", resolved_ip: resolved_ip };
+          } else {
+            return PacketDecision { allowed: false, reason: "コンテナ間分離: 宣言にないコンテナ間通信は遮断されます", resolved_ip: resolved_ip };
+          }
+        }
+        None => {
+          return PacketDecision { allowed: false, reason: "宛先エンドポイントがブリッジ上に存在しません", resolved_ip: resolved_ip };
+        }
+      }
+    }
+    Err(_) => {}
+  }
+
+  // 2. 宛先が直接の IP アドレスか判定
+  let mut direct_dst_opt = find_endpoint_by_ip(&bridge.endpoints, &dst_target);
+  match direct_dst_opt {
+    Some(dst) => {
+      // ブリッジ内部の別コンテナの IP
+      if can_communicate_containers(&src, &dst, dst_port, &protocol) {
+        return PacketDecision { allowed: true, reason: "コンテナ間接続規則により許可", resolved_ip: dst_target.clone() };
+      } else {
+        return PacketDecision { allowed: false, reason: "コンテナ間分離: 宣言にないコンテナ間通信は遮断されます", resolved_ip: dst_target.clone() };
+      }
+    }
+    None => {}
+  }
+
+  // 3. 直接の外部 IP か判定
+  match parse_ipv4_octets(&dst_target) {
+    Some(_) => {
+      // 外部 IP 宛ての外向き通信
+      if can_egress(&src, &dst_target, dst_port, &protocol) {
+        return PacketDecision { allowed: true, reason: "外向き通信規則により許可", resolved_ip: dst_target.clone() };
+      } else {
+        return PacketDecision { allowed: false, reason: "外向き通信遮断: 許可宣言のない宛先・ポートへの通信は遮断されます", resolved_ip: "" };
+      }
+    }
+    None => {}
+  }
+
+  // 4. 宣言にない名前は解決せず遮断
+  return PacketDecision { allowed: false, reason: "ノード内名前解決に失敗しました: 宣言にない名前は解決しません", resolved_ip: "" };
+}
+
+// ---------------------------------------------------------------------------
+// P4 データベース保存形式 (状態の核)
+// ---------------------------------------------------------------------------
+
+pub struct NetworkEndpointRecord {
+  instance_id: String,
+  workload_id: String,
+  ip_address: String,
+  mac_address: String,
+  network_enabled: Bool,
+  published_port_count: Int,
+  egress_rule_count: Int,
+  peer_rule_count: Int,
+}
+
+pub fn new_network_endpoint_record(instance_id: String, workload_id: String, ip_address: String, mac_address: String, network_enabled: Bool, published_port_count: Int, egress_rule_count: Int, peer_rule_count: Int) -> NetworkEndpointRecord
+  intent "NetworkEndpointRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkEndpointRecord { instance_id: instance_id, workload_id: workload_id, ip_address: ip_address, mac_address: mac_address, network_enabled: network_enabled, published_port_count: published_port_count, egress_rule_count: egress_rule_count, peer_rule_count: peer_rule_count };
+}
+
+pub fn encode_endpoint_key(instance_id: &String) -> Result<Bytes, ContainerError>
+  intent "NetworkEndpoint のキー ('net:ep:' + instance_id) を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let k = Value.StrVal(concat_str(&"net:ep:", &instance_id));
+  return match encode_key(&k) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("エンドポイントキーの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_endpoint_record(rec: &NetworkEndpointRecord) -> Result<Bytes, ContainerError>
+  intent "NetworkEndpointRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(rec.instance_id.clone()));
+  row.push(Value.StrVal(rec.workload_id.clone()));
+  row.push(Value.StrVal(rec.ip_address.clone()));
+  row.push(Value.StrVal(rec.mac_address.clone()));
+  row.push(Value.BoolVal(rec.network_enabled));
+  row.push(Value.IntVal(rec.published_port_count));
+  row.push(Value.IntVal(rec.egress_rule_count));
+  row.push(Value.IntVal(rec.peer_rule_count));
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("エンドポイントレコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn decode_endpoint_record(bytes: &Bytes) -> Result<NetworkEndpointRecord, ContainerError>
+  intent "P4 行形式バイト列から NetworkEndpointRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("エンドポイントレコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != 8 {
+    return Err(ContainerError.StateError("エンドポイント行の列数が一致しません。"));
+  }
+
+  let mut instance_id = "";
+  match row.get(0) {
+    Some(Value.StrVal(s)) => {
+      instance_id = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("instance_id の型不一致"));
+    }
+  }
+
+  let mut workload_id = "";
+  match row.get(1) {
+    Some(Value.StrVal(s)) => {
+      workload_id = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("workload_id の型不一致"));
+    }
+  }
+
+  let mut ip_address = "";
+  match row.get(2) {
+    Some(Value.StrVal(s)) => {
+      ip_address = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("ip_address の型不一致"));
+    }
+  }
+
+  let mut mac_address = "";
+  match row.get(3) {
+    Some(Value.StrVal(s)) => {
+      mac_address = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("mac_address の型不一致"));
+    }
+  }
+
+  let mut network_enabled = false;
+  match row.get(4) {
+    Some(Value.BoolVal(b)) => {
+      network_enabled = b;
+    }
+    _ => {
+      return Err(ContainerError.StateError("network_enabled の型不一致"));
+    }
+  }
+
+  let mut published_port_count = 0;
+  match row.get(5) {
+    Some(Value.IntVal(n)) => {
+      published_port_count = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("published_port_count の型不一致"));
+    }
+  }
+
+  let mut egress_rule_count = 0;
+  match row.get(6) {
+    Some(Value.IntVal(n)) => {
+      egress_rule_count = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("egress_rule_count の型不一致"));
+    }
+  }
+
+  let mut peer_rule_count = 0;
+  match row.get(7) {
+    Some(Value.IntVal(n)) => {
+      peer_rule_count = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("peer_rule_count の型不一致"));
+    }
+  }
+
+  return Ok(NetworkEndpointRecord { instance_id: instance_id, workload_id: workload_id, ip_address: ip_address, mac_address: mac_address, network_enabled: network_enabled, published_port_count: published_port_count, egress_rule_count: egress_rule_count, peer_rule_count: peer_rule_count });
+}
