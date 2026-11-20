@@ -126,14 +126,14 @@ pub fn max_peer_rules() -> Int
   return 64;
 }
 
-// 1 つのブリッジネットワークが収容可能な最大エンドポイント数: 1024
+// 1 つのブリッジネットワークが収容可能な最大エンドポイント数: 253 (/24 サブネット 10.244.0.0/24 のホスト範囲 2..254)
 pub fn max_network_endpoints() -> Int
-  intent "ブリッジ上の最大エンドポイント数 (1024) を返す"
+  intent "ブリッジ上の最大エンドポイント数 (253) を返す"
   requires none
-  ensures result == 1024
+  ensures result == 253
   effects none
 {
-  return 1024;
+  return 253;
 }
 
 // 宣言可能なマウントの最大数: 32

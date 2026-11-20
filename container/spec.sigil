@@ -491,6 +491,426 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
 }
 
 // ---------------------------------------------------------------------------
+// ネットワーク構文検証・許可リスト判定 (ADR 0053 決定 4・6)
+// ---------------------------------------------------------------------------
+
+fn power2(exp: Int) -> Int
+  intent "2 の exp 乗を計算する (0 <= exp <= 31)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut res = 1;
+  let mut i = 0;
+  while i < exp {
+    res = res * 2;
+    i = i + 1;
+  }
+  return res;
+}
+
+fn min_int(a: Int, b: Int) -> Int
+  intent "2 つの整数の最小値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn calc_mask(prefix_len: Int) -> Int
+  intent "プレフィックス長から 32 ビットのビットマスクを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut mask = 0;
+  let mut b = 0;
+  while b < prefix_len {
+    mask = mask + power2(31 - b);
+    b = b + 1;
+  }
+  return mask;
+}
+
+fn cidrs_overlap(base_a: Int, len_a: Int, base_b: Int, len_b: Int) -> Bool
+  intent "2 つの IPv4 CIDR ブロック (または IP) が重複・包含関係にあるかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let min_len = min_int(len_a, len_b);
+  let mask = calc_mask(min_len);
+  return (base_a & mask) == (base_b & mask);
+}
+
+pub fn parse_strict_ipv4(ip_str: &String) -> Option<List<Int>>
+  intent "IPv4 文字列を厳格に検証し、4 つのオクテット (0..255) の List に分解する。空、空白、先頭ゼロ、ホスト名等は None を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = ip_str.as_bytes();
+  if bytes.len() < 7 || bytes.len() > 15 {
+    return None;
+  }
+  let mut octets = List.new();
+  let mut seg_start = 0;
+  let mut i = 0;
+  while i <= bytes.len() {
+    let mut is_delim = false;
+    if i == bytes.len() {
+      is_delim = true;
+    } else {
+      if bytes.get(i).unwrap_or(0) == 46 {
+        is_delim = true;
+      }
+    }
+    if is_delim {
+      let seg_len = i - seg_start;
+      if seg_len < 1 || seg_len > 3 {
+        return None;
+      }
+      // 先頭ゼロの拒否: 長さが2以上かつ先頭が '0' (48) なら不正
+      if seg_len > 1 && bytes.get(seg_start).unwrap_or(0) == 48 {
+        return None;
+      }
+      let mut val = 0;
+      let mut j = seg_start;
+      while j < i {
+        let b = bytes.get(j).unwrap_or(0);
+        if b < 48 || b > 57 {
+          return None;
+        }
+        val = val * 10 + (b - 48);
+        j = j + 1;
+      }
+      if val > 255 {
+        return None;
+      }
+      octets.push(val);
+      seg_start = i + 1;
+    }
+    i = i + 1;
+  }
+  if octets.len() != 4 {
+    return None;
+  }
+  return Some(octets);
+}
+
+fn get_octet(octets: &List<Int>, i: Int) -> Int
+  intent "List<Int> から i 番目のオクテットを取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match octets.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+pub fn is_allowed_host_ip(ip_str: &String) -> Bool
+  intent "ホストバインド用 IP アドレスが許可リスト (127.0.0.0/8 または RFC 1918 内部アドレス) に合致するかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut octs = List.new();
+  match parse_strict_ipv4(&ip_str) {
+    Some(o) => {
+      octs = o;
+    }
+    None => {
+      return false;
+    }
+  }
+  let o0 = get_octet(&octs, 0);
+  let o1 = get_octet(&octs, 1);
+  // 127.0.0.0/8 (ループバック)
+  if o0 == 127 {
+    return true;
+  }
+  // 10.0.0.0/8 (RFC 1918 プライベート)
+  if o0 == 10 {
+    return true;
+  }
+  // 172.16.0.0/12 (RFC 1918 プライベート)
+  if o0 == 172 && o1 >= 16 && o1 <= 31 {
+    return true;
+  }
+  // 192.168.0.0/16 (RFC 1918 プライベート)
+  if o0 == 192 && o1 == 168 {
+    return true;
+  }
+  return false;
+}
+
+pub fn validate_network_identifier(id: &String) -> Result<Bool, ContainerError>
+  intent "ネットワーク識別子 (instance_id, workload_id) を英小文字・数字・ハイフンの 1〜8 文字で厳格に検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = id.as_bytes();
+  if bytes.len() < 1 || bytes.len() > 8 {
+    return Err(ContainerError.SpecValidation("識別子の長さは 1〜8 文字である必要があります (Linux IFNAMSIZ 制約および安全のため)。"));
+  }
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes.get(i).unwrap_or(0);
+    let is_lower = b >= 97 && b <= 122;  // 'a'..'z'
+    let is_digit = b >= 48 && b <= 57;  // '0'..'9'
+    let is_hyphen = b == 45;  // '-'
+    if !is_lower && !is_digit && !is_hyphen {
+      return Err(ContainerError.SpecValidation("識別子には英小文字、数字、ハイフンのみ使用できます (ドットやスラッシュは禁止)。"));
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+pub fn validate_destination_cidr_or_ip(dest: &String) -> Result<Bool, ContainerError>
+  intent "外向き通信規則の宛先 (IPv4 または CIDR) の構文と安全性を厳格に検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if dest.len() == 0 {
+    return Err(ContainerError.SpecValidation("外向き通信許可の宛先が空です。"));
+  }
+  let bytes = dest.as_bytes();
+  let mut slash_pos = 0 - 1;
+  let mut slash_count = 0;
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes.get(i).unwrap_or(0) == 47 {  // '/'
+      slash_pos = i;
+      slash_count = slash_count + 1;
+    }
+    i = i + 1;
+  }
+  if slash_count > 1 {
+    return Err(ContainerError.SpecValidation("CIDR の構文が不正です: 複数のスラッシュが含まれています。"));
+  }
+
+  let mut base_ip_str = "";
+  let mut prefix_len = 32;
+
+  if slash_count == 1 {
+    if slash_pos == 0 || slash_pos == bytes.len() - 1 {
+      return Err(ContainerError.SpecValidation("CIDR の構文が不正です: スラッシュの前後に値が必要です。"));
+    }
+    let ip_bytes = bytes.slice(0, slash_pos).unwrap_or(Bytes.new());
+    let mask_bytes = bytes.slice(slash_pos + 1, bytes.len()).unwrap_or(Bytes.new());
+    match ip_bytes.to_string_utf8() {
+      Ok(s) => {
+        base_ip_str = s;
+      }
+      Err(_) => {
+        return Err(ContainerError.SpecValidation("CIDR IP アドレス部分が UTF-8 として不正です。"));
+      }
+    }
+    if mask_bytes.len() < 1 || mask_bytes.len() > 2 {
+      return Err(ContainerError.SpecValidation("CIDR プレフィックス長が不正です (1〜32)。"));
+    }
+    if mask_bytes.len() > 1 && mask_bytes.get(0).unwrap_or(0) == 48 {
+      return Err(ContainerError.SpecValidation("CIDR プレフィックス長に先頭ゼロは許可されません。"));
+    }
+    let mut plen = 0;
+    let mut m_idx = 0;
+    while m_idx < mask_bytes.len() {
+      let b = mask_bytes.get(m_idx).unwrap_or(0);
+      if b < 48 || b > 57 {
+        return Err(ContainerError.SpecValidation("CIDR プレフィックス長に数字以外の文字が含まれています。"));
+      }
+      plen = plen * 10 + (b - 48);
+      m_idx = m_idx + 1;
+    }
+    if plen < 1 || plen > 32 {
+      return Err(ContainerError.SpecValidation("CIDR プレフィックス長は 1〜32 の範囲である必要があります (0.0.0.0/0 相当の /0 は拒否されます)。"));
+    }
+    prefix_len = plen;
+  } else {
+    base_ip_str = dest.clone();
+  }
+
+  let mut base_octs = List.new();
+  match parse_strict_ipv4(&base_ip_str) {
+    Some(o) => {
+      base_octs = o;
+    }
+    None => {
+      return Err(ContainerError.SpecValidation("宛先 IPv4 アドレスの構文が不正です (先頭ゼロ、ホスト名等は拒否されます)。"));
+    }
+  }
+
+  let b0 = get_octet(&base_octs, 0);
+  let b1 = get_octet(&base_octs, 1);
+  let b2 = get_octet(&base_octs, 2);
+  let b3 = get_octet(&base_octs, 3);
+  let base_u32 = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
+
+  // 危険な規則の検査:
+  // 1. 全 IPv4 / 0.0.0.0 宛て
+  if base_u32 == 0 {
+    return Err(ContainerError.SpecValidation("0.0.0.0 を含む全方位外向き規則は拒否されます。"));
+  }
+
+  // 2. ゲートウェイ 10.244.0.1 (10.244.0.1/32)
+  let gw_u32 = 10 * 16777216 + 244 * 65536 + 0 * 256 + 1;
+  if cidrs_overlap(base_u32, prefix_len, gw_u32, 32) {
+    return Err(ContainerError.SpecValidation("ゲートウェイ (10.244.0.1) を含む外向き通信規則は拒否されます。"));
+  }
+
+  // 3. ブリッジサブネット 10.244.0.0/24
+  let br_u32 = 10 * 16777216 + 244 * 65536 + 0 * 256 + 0;
+  if cidrs_overlap(base_u32, prefix_len, br_u32, 24) {
+    return Err(ContainerError.SpecValidation("ブリッジのサブネット (10.244.0.0/24) を含む外向き通信規則は拒否されます。"));
+  }
+
+  // 4. リンクローカル 169.254.0.0/16
+  let ll_u32 = 169 * 16777216 + 254 * 65536 + 0 * 256 + 0;
+  if cidrs_overlap(base_u32, prefix_len, ll_u32, 16) {
+    return Err(ContainerError.SpecValidation("リンクローカル (169.254.0.0/16) を含む外向き通信規則は拒否されます。"));
+  }
+
+  return Ok(true);
+}
+
+pub fn validate_network_components(network_enabled: Bool, ports: &List<PortMapping>, egress_rules: &List<EgressRule>, peer_connections: &List<PeerConnection>) -> Result<Bool, ContainerError>
+  intent "ネットワーク構成要素 (ポート公開、外向き規則、コンテナ間接続) を既定拒否の規則に基づいて統合検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if !network_enabled {
+    if ports.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでポートマッピングを宣言することはできません。"));
+    }
+    if egress_rules.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナで外向き通信の許可を宣言することはできません。"));
+    }
+    if peer_connections.len() > 0 {
+      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでコンテナ間接続を宣言することはできません。"));
+    }
+    return Ok(true);
+  }
+
+  // 1. ポート公開の検証
+  if ports.len() > max_port_count() {
+    return Err(ContainerError.LimitExceeded("宣言されたポートマッピング数が上限を超過しています。"));
+  }
+  let mut p_idx = 0;
+  while p_idx < ports.len() {
+    match ports.get(p_idx) {
+      Some(p) => {
+        if p.container_port <= 0 || p.container_port > 65535 {
+          return Err(ContainerError.SpecValidation("コンテナポート番号が不正です。"));
+        }
+        if p.host_port <= 0 || p.host_port > 65535 {
+          return Err(ContainerError.SpecValidation("ホストポート番号が不正です。"));
+        }
+        // 特権ポート (< 1024) の拒否 (非 root 実行環境の制約および安全のため)
+        if p.host_port < 1024 {
+          return Err(ContainerError.SpecValidation("ホストポートには 1024 以上の非特権ポートを指定する必要があります (1024 未満の特権ポートは非 root 実行環境の制約および安全のため拒否されます)。"));
+        }
+        if p.protocol != "tcp" && p.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("ポートマッピングのプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+        // ホスト IP: 許可リスト方式 (127.0.0.0/8 または RFC 1918 内部アドレスのみ)
+        if !is_allowed_host_ip(&p.host_ip) {
+          return Err(ContainerError.SpecValidation("ホスト公開アドレスはループバック (127.0.0.0/8) または宣言された内部アドレス (RFC 1918) である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    p_idx = p_idx + 1;
+  }
+
+  // 同一仕様内でのホストポート重複検査 (host_ip, host_port, protocol)
+  let mut p_i = 0;
+  while p_i < ports.len() {
+    match ports.get(p_i) {
+      Some(pi) => {
+        let mut p_j = p_i + 1;
+        while p_j < ports.len() {
+          match ports.get(p_j) {
+            Some(pj) => {
+              if pi.host_ip == pj.host_ip && pi.host_port == pj.host_port && pi.protocol == pj.protocol {
+                return Err(ContainerError.SpecValidation("同一仕様内で同一のホストポートマッピング (host_ip, host_port, protocol) が重複して宣言されています。"));
+              }
+            }
+            None => {}
+          }
+          p_j = p_j + 1;
+        }
+      }
+      None => {}
+    }
+    p_i = p_i + 1;
+  }
+
+  // 2. 外向き通信規則の検証
+  if egress_rules.len() > max_egress_rules() {
+    return Err(ContainerError.LimitExceeded("宣言された外向き通信許可規則数が上限を超過しています。"));
+  }
+  let mut eg_idx = 0;
+  while eg_idx < egress_rules.len() {
+    match egress_rules.get(eg_idx) {
+      Some(eg) => {
+        match validate_destination_cidr_or_ip(&eg.destination) {
+          Ok(_) => {}
+          Err(e) => {
+            return Err(e);
+          }
+        }
+        if eg.port <= 0 || eg.port > 65535 {
+          return Err(ContainerError.SpecValidation("外向き通信許可のポート番号が不正です。"));
+        }
+        if eg.protocol != "tcp" && eg.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("外向き通信許可のプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    eg_idx = eg_idx + 1;
+  }
+
+  // 3. コンテナ間接続規則の検証
+  if peer_connections.len() > max_peer_rules() {
+    return Err(ContainerError.LimitExceeded("宣言されたコンテナ間接続規則数が上限を超過しています。"));
+  }
+  let mut pc_idx = 0;
+  while pc_idx < peer_connections.len() {
+    match peer_connections.get(pc_idx) {
+      Some(pc) => {
+        match validate_network_identifier(&pc.target_workload) {
+          Ok(_) => {}
+          Err(_) => {
+            return Err(ContainerError.SpecValidation("コンテナ間接続の対象ワークロード名が不正です (1〜8文字の英小文字・数字・ハイフン)。"));
+          }
+        }
+        if pc.port <= 0 || pc.port > 65535 {
+          return Err(ContainerError.SpecValidation("コンテナ間接続のポート番号が不正です。"));
+        }
+        if pc.protocol != "tcp" && pc.protocol != "udp" {
+          return Err(ContainerError.SpecValidation("コンテナ間接続のプロトコルは 'tcp' または 'udp' である必要があります。"));
+        }
+      }
+      None => {}
+    }
+    pc_idx = pc_idx + 1;
+  }
+
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
 // 既定拒否の安全な Isolation 生成ヘルパー
 // ---------------------------------------------------------------------------
 
@@ -596,84 +1016,12 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
     return Err(ContainerError.LimitExceeded("ログ量上限がシステム最大許容値を超過しています。"));
   }
 
-  // 9. ネットワーク: 既定で接続なし。無効時のポート公開・外向き通信・ピア接続は拒否
-  if !spec.network_enabled {
-    if spec.ports.len() > 0 {
-      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでポートマッピングを宣言することはできません。"));
+  // 9. ネットワーク: 既定で接続なし。無効時のポート公開・外向き通信・ピア接続は拒否 (ADR 0053 決定 4・6)
+  match validate_network_components(spec.network_enabled, &spec.ports, &spec.egress_rules, &spec.peer_connections) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
     }
-    if spec.egress_rules.len() > 0 {
-      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナで外向き通信の許可を宣言することはできません。"));
-    }
-    if spec.peer_connections.len() > 0 {
-      return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでコンテナ間接続を宣言することはできません。"));
-    }
-  }
-  if spec.ports.len() > max_port_count() {
-    return Err(ContainerError.LimitExceeded("宣言されたポートマッピング数が上限を超過しています。"));
-  }
-  let mut p_idx = 0;
-  while p_idx < spec.ports.len() {
-    match spec.ports.get(p_idx) {
-      Some(p) => {
-        if p.container_port <= 0 || p.container_port > 65535 {
-          return Err(ContainerError.SpecValidation("コンテナポート番号が不正です。"));
-        }
-        if p.host_port <= 0 || p.host_port > 65535 {
-          return Err(ContainerError.SpecValidation("ホストポート番号が不正です。"));
-        }
-        if p.protocol != "tcp" && p.protocol != "udp" {
-          return Err(ContainerError.SpecValidation("ポートマッピングのプロトコルは 'tcp' または 'udp' である必要があります。"));
-        }
-        // 初版は外部公開しないため、host_ip は 127.0.0.1 または内部アドレスのみ
-        if p.host_ip == "0.0.0.0" {
-          return Err(ContainerError.SpecValidation("ポートの全方位公開 (0.0.0.0) は拒否されます。ループバックまたは宣言された内部アドレスに限定してください。"));
-        }
-      }
-      None => {}
-    }
-    p_idx = p_idx + 1;
-  }
-  if spec.egress_rules.len() > max_egress_rules() {
-    return Err(ContainerError.LimitExceeded("宣言された外向き通信許可規則数が上限を超過しています。"));
-  }
-  let mut eg_idx = 0;
-  while eg_idx < spec.egress_rules.len() {
-    match spec.egress_rules.get(eg_idx) {
-      Some(eg) => {
-        if eg.destination.len() == 0 {
-          return Err(ContainerError.SpecValidation("外向き通信許可の宛先が空です。"));
-        }
-        if eg.port <= 0 || eg.port > 65535 {
-          return Err(ContainerError.SpecValidation("外向き通信許可のポート番号が不正です。"));
-        }
-        if eg.protocol != "tcp" && eg.protocol != "udp" {
-          return Err(ContainerError.SpecValidation("外向き通信許可のプロトコルは 'tcp' または 'udp' である必要があります。"));
-        }
-      }
-      None => {}
-    }
-    eg_idx = eg_idx + 1;
-  }
-  if spec.peer_connections.len() > max_peer_rules() {
-    return Err(ContainerError.LimitExceeded("宣言されたコンテナ間接続規則数が上限を超過しています。"));
-  }
-  let mut pc_idx = 0;
-  while pc_idx < spec.peer_connections.len() {
-    match spec.peer_connections.get(pc_idx) {
-      Some(pc) => {
-        if pc.target_workload.len() == 0 {
-          return Err(ContainerError.SpecValidation("コンテナ間接続の対象ワークロード名が空です。"));
-        }
-        if pc.port <= 0 || pc.port > 65535 {
-          return Err(ContainerError.SpecValidation("コンテナ間接続のポート番号が不正です。"));
-        }
-        if pc.protocol != "tcp" && pc.protocol != "udp" {
-          return Err(ContainerError.SpecValidation("コンテナ間接続のプロトコルは 'tcp' または 'udp' である必要があります。"));
-        }
-      }
-      None => {}
-    }
-    pc_idx = pc_idx + 1;
   }
 
   // 10. マウント: host パスは許可リストに載ったものに限り、/proc, /sys, デバイスは既定で出さない
