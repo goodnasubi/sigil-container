@@ -1,0 +1,568 @@
+module container.reconcile_state
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_health_interval_ms;
+use container.limits.max_health_retries;
+use container.limits.max_health_timeout_ms;
+use container.limits.max_restart_backoff_ms;
+use container.limits.max_restart_count;
+use container.limits.min_health_interval_ms;
+use container.limits.min_restart_backoff_ms;
+use db.types.Value;
+use db.types.decode_row;
+use db.types.encode_row;
+
+// ADR 0053 決定 2・6 (P5-3): 調整ループが使う状態の保存形式。
+// 望ましい状態 (宣言のポリシー) と観測した状態 (再起動の経過・操作の記録) を分けて保存する。
+// 観測した状態は参考情報であり、実行環境から取り直した観測を常に優先する (保存した状態を鵜呑みにしない)。
+
+// 宣言したヘルスチェック。失敗を黙って成功にしない。
+pub struct HealthCheckSpec {
+  enabled: Bool,
+  interval_ms: Int,
+  timeout_ms: Int,
+  failure_threshold: Int,  // 連続失敗がこの回数に達したら不健全と判定する
+  start_period_ms: Int,  // 起動直後の猶予 (この間の失敗は数えない)
+}
+
+// ワークロードごとの宣言ポリシー (望ましい状態の一部)。
+// restart_kind: "no" / "always" / "on_failure"
+pub struct PolicyRecord {
+  workload_id: String,
+  restart_kind: String,
+  max_retries: Int,
+  backoff_ms: Int,
+  health: HealthCheckSpec,
+}
+
+// 再起動の経過 (観測した状態)。phase: "Running" / "Backoff" / "GaveUp"
+pub struct RestartStateRecord {
+  instance_id: String,
+  restart_count: Int,
+  next_restart_at_ms: Int,
+  last_exit_code: Int,
+  phase: String,
+  last_error: String,
+}
+
+// 調整操作の記録 (冪等性と再開のための先行記録)。
+// status: "Pending" / "Done" / "Failed"
+pub struct OperationRecord {
+  op_id: String,
+  instance_id: String,
+  kind: String,  // "create" / "start" / "stop" / "delete"
+  status: String,
+  attempts: Int,
+  last_error: String,
+}
+
+pub fn new_health_check_spec(enabled: Bool, interval_ms: Int, timeout_ms: Int, failure_threshold: Int, start_period_ms: Int) -> HealthCheckSpec
+  intent "HealthCheckSpec を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return HealthCheckSpec { enabled: enabled, interval_ms: interval_ms, timeout_ms: timeout_ms, failure_threshold: failure_threshold, start_period_ms: start_period_ms };
+}
+
+pub fn disabled_health_check() -> HealthCheckSpec
+  intent "ヘルスチェックなしの宣言を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return HealthCheckSpec { enabled: false, interval_ms: 0, timeout_ms: 0, failure_threshold: 0, start_period_ms: 0 };
+}
+
+pub fn new_policy_record(workload_id: String, restart_kind: String, max_retries: Int, backoff_ms: Int, health: HealthCheckSpec) -> PolicyRecord
+  intent "PolicyRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return PolicyRecord { workload_id: workload_id, restart_kind: restart_kind, max_retries: max_retries, backoff_ms: backoff_ms, health: health };
+}
+
+pub fn new_restart_state_record(instance_id: String, restart_count: Int, next_restart_at_ms: Int, last_exit_code: Int, phase: String, last_error: String) -> RestartStateRecord
+  intent "RestartStateRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return RestartStateRecord { instance_id: instance_id, restart_count: restart_count, next_restart_at_ms: next_restart_at_ms, last_exit_code: last_exit_code, phase: phase, last_error: last_error };
+}
+
+pub fn new_operation_record(op_id: String, instance_id: String, kind: String, status: String, attempts: Int, last_error: String) -> OperationRecord
+  intent "OperationRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return OperationRecord { op_id: op_id, instance_id: instance_id, kind: kind, status: status, attempts: attempts, last_error: last_error };
+}
+
+// ---------------------------------------------------------------------------
+// 検証 (読み込む前に上限を効かせる。超過は黙って切り捨てず明示的に失敗する)
+// ---------------------------------------------------------------------------
+
+pub fn validate_health_check(h: &HealthCheckSpec) -> Result<Bool, ContainerError>
+  intent "ヘルスチェックの宣言が上限内であることを検証する。無効 (enabled=false) のときは値を 0 に限る"
+  requires none
+  ensures none
+  effects none
+{
+  if !h.enabled {
+    if h.interval_ms != 0 || h.timeout_ms != 0 || h.failure_threshold != 0 || h.start_period_ms != 0 {
+      return Err(ContainerError.SpecValidation("ヘルスチェックが無効のときは値を 0 にしてください。"));
+    }
+    return Ok(true);
+  }
+  if h.interval_ms < min_health_interval_ms() || h.interval_ms > max_health_interval_ms() {
+    return Err(ContainerError.LimitExceeded("ヘルスチェック間隔が許容範囲 (1 秒〜1 時間) の外です。"));
+  }
+  if h.timeout_ms <= 0 || h.timeout_ms > max_health_timeout_ms() || h.timeout_ms > h.interval_ms {
+    return Err(ContainerError.LimitExceeded("ヘルスチェックの時間切れが許容範囲の外、または間隔を超えています。"));
+  }
+  if h.failure_threshold < 1 || h.failure_threshold > max_health_retries() {
+    return Err(ContainerError.LimitExceeded("ヘルスチェックの連続失敗回数が許容範囲 (1〜10) の外です。"));
+  }
+  if h.start_period_ms < 0 || h.start_period_ms > max_health_interval_ms() {
+    return Err(ContainerError.LimitExceeded("ヘルスチェックの起動猶予が許容範囲の外です。"));
+  }
+  return Ok(true);
+}
+
+pub fn validate_policy(p: &PolicyRecord) -> Result<Bool, ContainerError>
+  intent "再起動の方針とヘルスチェックの宣言を検証する。無制限の再起動ループになる値を拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  if p.workload_id.len() == 0 {
+    return Err(ContainerError.SpecValidation("ワークロード ID が空です。"));
+  }
+  if p.restart_kind == "no" {
+    if p.max_retries != 0 || p.backoff_ms != 0 {
+      return Err(ContainerError.SpecValidation("再起動しない方針では回数・間隔を 0 にしてください。"));
+    }
+  } else if p.restart_kind == "always" || p.restart_kind == "on_failure" {
+    if p.max_retries < 1 || p.max_retries > max_restart_count() {
+      return Err(ContainerError.LimitExceeded("再起動の回数が許容範囲 (1〜10) の外です。無制限の再起動は認めません。"));
+    }
+    if p.backoff_ms < min_restart_backoff_ms() || p.backoff_ms > max_restart_backoff_ms() {
+      return Err(ContainerError.LimitExceeded("再起動の間隔が許容範囲 (1 秒〜1 時間) の外です。"));
+    }
+  } else {
+    return Err(ContainerError.SpecValidation("未対応の再起動の方針です ('no' / 'always' / 'on_failure')。"));
+  }
+  return validate_health_check(&p.health);
+}
+
+// ---------------------------------------------------------------------------
+// 符号化と復号
+// ---------------------------------------------------------------------------
+
+fn col_str(row: &List<Value>, i: Int) -> Result<String, ContainerError>
+  intent "行の i 列目を文字列として取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = "";
+  match row.get(i) {
+    Some(Value.StrVal(s)) => {
+      out = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("列の型が一致しません (文字列を期待)。"));
+    }
+  }
+  return Ok(out);
+}
+
+fn col_int(row: &List<Value>, i: Int) -> Result<Int, ContainerError>
+  intent "行の i 列目を整数として取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = 0;
+  match row.get(i) {
+    Some(Value.IntVal(n)) => {
+      out = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("列の型が一致しません (整数を期待)。"));
+    }
+  }
+  return Ok(out);
+}
+
+fn col_bool(row: &List<Value>, i: Int) -> Result<Bool, ContainerError>
+  intent "行の i 列目を真偽値として取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = false;
+  match row.get(i) {
+    Some(Value.BoolVal(b)) => {
+      out = b;
+    }
+    _ => {
+      return Err(ContainerError.StateError("列の型が一致しません (真偽値を期待)。"));
+    }
+  }
+  return Ok(out);
+}
+
+fn decode_cols(bytes: &Bytes, expected: Int) -> Result<List<Value>, ContainerError>
+  intent "行を復号し、列数を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("レコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != expected {
+    return Err(ContainerError.StateError("レコードの列数が一致しません。"));
+  }
+  return Ok(row);
+}
+
+fn finish_row(row: &List<Value>) -> Result<Bytes, ContainerError>
+  intent "行を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("レコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_policy_record(p: &PolicyRecord) -> Result<Bytes, ContainerError>
+  intent "PolicyRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(p.workload_id.clone()));
+  row.push(Value.StrVal(p.restart_kind.clone()));
+  row.push(Value.IntVal(p.max_retries));
+  row.push(Value.IntVal(p.backoff_ms));
+  row.push(Value.BoolVal(p.health.enabled));
+  row.push(Value.IntVal(p.health.interval_ms));
+  row.push(Value.IntVal(p.health.timeout_ms));
+  row.push(Value.IntVal(p.health.failure_threshold));
+  row.push(Value.IntVal(p.health.start_period_ms));
+  return finish_row(&row);
+}
+
+pub fn decode_policy_record(bytes: &Bytes) -> Result<PolicyRecord, ContainerError>
+  intent "P4 行形式から PolicyRecord を復号し、検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_cols(&bytes, 9) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut wid = "";
+  let mut kind = "";
+  let mut max_retries = 0;
+  let mut backoff = 0;
+  let mut enabled = false;
+  let mut interval = 0;
+  let mut timeout = 0;
+  let mut threshold = 0;
+  let mut start_period = 0;
+  match col_str(&row, 0) {
+    Ok(v) => {
+      wid = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 1) {
+    Ok(v) => {
+      kind = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 2) {
+    Ok(v) => {
+      max_retries = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 3) {
+    Ok(v) => {
+      backoff = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_bool(&row, 4) {
+    Ok(v) => {
+      enabled = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 5) {
+    Ok(v) => {
+      interval = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 6) {
+    Ok(v) => {
+      timeout = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 7) {
+    Ok(v) => {
+      threshold = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 8) {
+    Ok(v) => {
+      start_period = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let p = PolicyRecord { workload_id: wid, restart_kind: kind, max_retries: max_retries, backoff_ms: backoff, health: HealthCheckSpec { enabled: enabled, interval_ms: interval, timeout_ms: timeout, failure_threshold: threshold, start_period_ms: start_period } };
+  match validate_policy(&p) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  return Ok(p);
+}
+
+pub fn encode_restart_state_record(r: &RestartStateRecord) -> Result<Bytes, ContainerError>
+  intent "RestartStateRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(r.instance_id.clone()));
+  row.push(Value.IntVal(r.restart_count));
+  row.push(Value.IntVal(r.next_restart_at_ms));
+  row.push(Value.IntVal(r.last_exit_code));
+  row.push(Value.StrVal(r.phase.clone()));
+  row.push(Value.StrVal(r.last_error.clone()));
+  return finish_row(&row);
+}
+
+pub fn decode_restart_state_record(bytes: &Bytes) -> Result<RestartStateRecord, ContainerError>
+  intent "P4 行形式から RestartStateRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_cols(&bytes, 6) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut iid = "";
+  let mut count = 0;
+  let mut next_at = 0;
+  let mut code = 0;
+  let mut phase = "";
+  let mut last_error = "";
+  match col_str(&row, 0) {
+    Ok(v) => {
+      iid = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 1) {
+    Ok(v) => {
+      count = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 2) {
+    Ok(v) => {
+      next_at = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 3) {
+    Ok(v) => {
+      code = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 4) {
+    Ok(v) => {
+      phase = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 5) {
+    Ok(v) => {
+      last_error = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  if count < 0 || count > max_restart_count() {
+    return Err(ContainerError.Corrupt("再起動回数が範囲外です。"));
+  }
+  if phase != "Running" && phase != "Backoff" && phase != "GaveUp" {
+    return Err(ContainerError.Corrupt("再起動の段階が不正です。"));
+  }
+  return Ok(RestartStateRecord { instance_id: iid, restart_count: count, next_restart_at_ms: next_at, last_exit_code: code, phase: phase, last_error: last_error });
+}
+
+pub fn encode_operation_record(o: &OperationRecord) -> Result<Bytes, ContainerError>
+  intent "OperationRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(o.op_id.clone()));
+  row.push(Value.StrVal(o.instance_id.clone()));
+  row.push(Value.StrVal(o.kind.clone()));
+  row.push(Value.StrVal(o.status.clone()));
+  row.push(Value.IntVal(o.attempts));
+  row.push(Value.StrVal(o.last_error.clone()));
+  return finish_row(&row);
+}
+
+pub fn decode_operation_record(bytes: &Bytes) -> Result<OperationRecord, ContainerError>
+  intent "P4 行形式から OperationRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_cols(&bytes, 6) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut op_id = "";
+  let mut iid = "";
+  let mut kind = "";
+  let mut status = "";
+  let mut attempts = 0;
+  let mut last_error = "";
+  match col_str(&row, 0) {
+    Ok(v) => {
+      op_id = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 1) {
+    Ok(v) => {
+      iid = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 2) {
+    Ok(v) => {
+      kind = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 3) {
+    Ok(v) => {
+      status = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_int(&row, 4) {
+    Ok(v) => {
+      attempts = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match col_str(&row, 5) {
+    Ok(v) => {
+      last_error = v;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  if status != "Pending" && status != "Done" && status != "Failed" {
+    return Err(ContainerError.Corrupt("操作の状態が不正です。"));
+  }
+  if kind != "create" && kind != "start" && kind != "stop" && kind != "delete" {
+    return Err(ContainerError.Corrupt("操作の種別が不正です。"));
+  }
+  if attempts < 0 {
+    return Err(ContainerError.Corrupt("操作の試行回数が負です。"));
+  }
+  return Ok(OperationRecord { op_id: op_id, instance_id: iid, kind: kind, status: status, attempts: attempts, last_error: last_error });
+}
