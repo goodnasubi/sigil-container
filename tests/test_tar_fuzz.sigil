@@ -3,9 +3,137 @@ module tests.test_tar_fuzz
   trust none
 
 use container.error.error_kind_name;
+use container.image_layout.extract_cstring;
 use container.image_layout.inspect_tar_header;
 use container.image_layout.validate_path;
 use container.image_layout.validate_tar_archive;
+
+fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: Int, link_bytes: &Bytes, prefix_bytes: &Bytes) -> Bytes
+  intent "テスト用の 512 バイト Tar ヘッダを任意のバイト列 (prefix 含む) から構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let mut i = 0;
+  while i < 100 {
+    if i < name_bytes.len() {
+      bytes.push(name_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode ("0000644" + 0)
+  let mode_b = "0000644".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid ("0000000" + 0)
+  let uid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid ("0000000" + 0)
+  let gid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size (12 bytes, 8進数 ASCII + 空白)
+  let size_b = size_octal.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < size_b.len() {
+      bytes.push(size_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 136..148: mtime ("00000000000" + 0)
+  let mtime_b = "00000000000".as_bytes();
+  i = 0;
+  while i < 11 {
+    bytes.push(mtime_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum ("0000000" + 0)
+  let chk_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(chk_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname
+  i = 0;
+  while i < 100 {
+    if i < link_bytes.len() {
+      bytes.push(link_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 257..263: magic ("ustar\0")
+  let magic_b = "ustar".as_bytes();
+  i = 0;
+  while i < 5 {
+    bytes.push(magic_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 263..265: version ("00")
+  bytes.push(48);
+  bytes.push(48);
+
+  // 265..345: ゼロ埋め
+  while bytes.len() < 345 {
+    bytes.push(0);
+  }
+
+  // 345..500: prefix (155 bytes)
+  i = 0;
+  while i < 155 {
+    if i < prefix_bytes.len() {
+      bytes.push(prefix_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 500..512: ゼロ埋め
+  while bytes.len() < 512 {
+    bytes.push(0);
+  }
+
+  return bytes;
+}
 
 fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: Int, linkname: String) -> Bytes
   intent "テスト用の 512 バイト Tar ヘッダを構築する"
@@ -372,6 +500,115 @@ pub fn run_tar_fuzz_tests() -> Bool
   pax_escape_tar.extend(&zero_b);
 
   match validate_tar_archive(&pax_escape_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 18. 回帰テスト (再レビュー指摘 1): 不正な UTF-8 を含む tar パスの prefix / name / linkname の拒否
+  let empty_bytes = Bytes.new();
+
+  // (1) USTAR ヘッダで name が "safe"、prefix に "../\xff" のような不正な UTF-8 を含む場合の拒否
+  let mut invalid_prefix = Bytes.new();
+  invalid_prefix.push(46);  // '.'
+  invalid_prefix.push(46);  // '.'
+  invalid_prefix.push(47);  // '/'
+  invalid_prefix.push(255);  // 0xff: 不正な UTF-8 バイト
+  let bad_prefix_h = create_tar_header_raw(&"safe".as_bytes(), "00000000100 ", 48, &empty_bytes, &invalid_prefix);
+  match inspect_tar_header(&bad_prefix_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) prefix に不正な UTF-8 を含むヘッダがアーカイブ検査 (validate_tar_archive) でも拒否されること
+  let mut bad_prefix_tar = Bytes.new();
+  bad_prefix_tar.extend(&bad_prefix_h);
+  let mut dummy_payload = Bytes.with_capacity(512);
+  while dummy_payload.len() < 512 {
+    dummy_payload.push(0);
+  }
+  bad_prefix_tar.extend(&dummy_payload);
+  bad_prefix_tar.extend(&zero_b);
+  match validate_tar_archive(&bad_prefix_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (3) name に不正な UTF-8 を含むヘッダの拒否
+  let mut invalid_name = Bytes.new();
+  invalid_name.push(115);  // 's'
+  invalid_name.push(97);  // 'a'
+  invalid_name.push(102);  // 'f'
+  invalid_name.push(101);  // 'e'
+  invalid_name.push(255);  // 0xff
+  let bad_name_h = create_tar_header_raw(&invalid_name, "00000000100 ", 48, &empty_bytes, &empty_bytes);
+  match inspect_tar_header(&bad_name_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) linkname に不正な UTF-8 を含むシンボリックリンクの拒否
+  let mut invalid_link = Bytes.new();
+  invalid_link.push(116);  // 't'
+  invalid_link.push(97);  // 'a'
+  invalid_link.push(114);  // 'r'
+  invalid_link.push(103);  // 'g'
+  invalid_link.push(101);  // 'e'
+  invalid_link.push(116);  // 't'
+  invalid_link.push(255);  // 0xff
+  let bad_link_h = create_tar_header_raw(&"link_name".as_bytes(), "00000000000 ", 50, &invalid_link, &empty_bytes);
+  match inspect_tar_header(&bad_link_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (5) 正常な prefix ("subdir") と name ("app") の結合 ("subdir/app") が受理されること
+  let valid_prefix_h = create_tar_header_raw(&"app".as_bytes(), "00000000100 ", 48, &empty_bytes, &"subdir".as_bytes());
+  match inspect_tar_header(&valid_prefix_h) {
+    Ok(entry) => {
+      if entry.path != "subdir/app" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (6) extract_cstring 単体で無効な UTF-8 が Err(LayerValidation) を返すこと
+  let mut bad_utf8_bytes = Bytes.new();
+  bad_utf8_bytes.push(255);
+  bad_utf8_bytes.push(0);
+  match extract_cstring(&bad_utf8_bytes, 0, 10) {
     Ok(_) => {
       return false;
     }

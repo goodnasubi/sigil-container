@@ -60,8 +60,8 @@ pub fn parse_octal(bytes: &Bytes, start: Int, len: Int) -> Result<Int, Container
 // Null 終端文字列の抽出
 // ---------------------------------------------------------------------------
 
-pub fn extract_cstring(bytes: &Bytes, start: Int, max_len: Int) -> String
-  intent "バイト列から null 終端または最大長までの UTF-8 文字列を取り出す"
+pub fn extract_cstring(bytes: &Bytes, start: Int, max_len: Int) -> Result<String, ContainerError>
+  intent "バイト列から null 終端または最大長までの UTF-8 文字列を取り出す。無効な UTF-8 シーケンスが含まれる場合はエラーを返す"
   requires none
   ensures none
   effects none
@@ -77,12 +77,12 @@ pub fn extract_cstring(bytes: &Bytes, start: Int, max_len: Int) -> String
     }
   }
   if len == 0 {
-    return "";
+    return Ok("");
   }
   let slice = bytes.slice(start, start + len).unwrap_or(Bytes.new());
   return match slice.to_string_utf8() {
-    Ok(s) => s,
-    Err(_) => "",
+    Ok(s) => Ok(s),
+    Err(_) => Err(ContainerError.LayerValidation("Tar ヘッダの文字列フィールドに無効な UTF-8 シーケンスが含まれています。")),
   };
 }
 
@@ -203,18 +203,38 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
   }
 
   // 2. ファイル名抽出 (0..100) と prefix (345..500)
-  let name_part = extract_cstring(&header, 0, 100);
-  let prefix_part = extract_cstring(&header, 345, 155);
+  let mut name_part = "";
+  match extract_cstring(&header, 0, 100) {
+    Ok(s) => {
+      name_part = s;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut prefix_part = "";
+  match extract_cstring(&header, 345, 155) {
+    Ok(s) => {
+      prefix_part = s;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
   let mut full_path = name_part.clone();
   if prefix_part.len() > 0 {
     let mut p_buf = Bytes.new();
     p_buf.extend(&prefix_part.as_bytes());
     p_buf.push(47);  // '/'
     p_buf.extend(&name_part.as_bytes());
-    full_path = match p_buf.to_string_utf8() {
-      Ok(s) => s,
-      Err(_) => "",
-    };
+    match p_buf.to_string_utf8() {
+      Ok(s) => {
+        full_path = s;
+      }
+      Err(_) => {
+        return Err(ContainerError.LayerValidation("パスの結合結果が無効な UTF-8 シーケンスです。"));
+      }
+    }
   }
 
   // パスの安全性検査
@@ -244,7 +264,14 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
   // 4. linkname (157..257) - シンボリックリンク / ハードリンク
   let mut linkname = "";
   if typeflag == 49 || typeflag == 50 {  // '1' (hardlink) または '2' (symlink)
-    linkname = extract_cstring(&header, 157, 100);
+    match extract_cstring(&header, 157, 100) {
+      Ok(s) => {
+        linkname = s;
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
     // リンク先のトラバーサル検査: 絶対パスまたは上位参照 .. の拒否
     match validate_path(&linkname) {
       Ok(_) => {}
