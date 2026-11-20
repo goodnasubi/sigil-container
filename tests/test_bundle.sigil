@@ -266,5 +266,35 @@ pub fn run_bundle_tests() -> Bool
     return false;
   }
 
+  // 9. 回帰テスト (指摘 3): 要求された UID/GID を覆う uidMappings/gidMappings の size 生成
+  // 既定 spec では最低限の 65536 のままであること
+  if !bytes_contains(&json1.as_bytes(), &"\"uidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":65536}]".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"gidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":65536}]".as_bytes()) {
+    return false;
+  }
+
+  // UID 70000 / GID 70001 の spec で生成 JSON に "size":70002 が含まれること (size = max(uid, gid) + 1)
+  let mut custom_id_spec = create_sample_spec();
+  custom_id_spec.isolation.uid = 70000;
+  custom_id_spec.isolation.gid = 70001;
+  match generate_oci_config_json(&custom_id_spec) {
+    Ok(j_custom) => {
+      if !bytes_contains(&j_custom.as_bytes(), &"\"size\":70002".as_bytes()) {
+        return false;
+      }
+      if !bytes_contains(&j_custom.as_bytes(), &"\"uidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":70002}]".as_bytes()) {
+        return false;
+      }
+      if !bytes_contains(&j_custom.as_bytes(), &"\"gidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":70002}]".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
   return true;
 }

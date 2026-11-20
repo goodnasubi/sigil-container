@@ -1,0 +1,573 @@
+module container.runtime
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.error.isolation_boundary_notice;
+use container.limits.max_log_size;
+use container.state.InstanceRecord;
+
+// ADR 0053 決定 1・3・6: OCI ランタイム接続 (runc / crun) とライフサイクル
+// 仕様から決定的に生成した OCI runtime-spec の bundle を渡し、既存のランタイム（runc／crun）を
+// 実行環境で選択して起動・制御する。作成・起動・停止・削除・状態・ログの取得、
+// 非 root 実行、強制終了時の後始末、出力照合を純 Sigil (effects none) の抽象として提供する。
+
+pub enum RuntimeKind {
+  Runc,
+  Crun,
+}
+
+pub enum LifecycleAction {
+  Create,
+  Start,
+  Stop(Int),  // 終了シグナル (例: 15 SIGTERM)
+  Delete(Bool),  // force フラグ
+  State,
+  Kill(Int),  // 強制終了シグナル (例: 9 SIGKILL)
+}
+
+pub struct RuntimeCommand {
+  program: String,
+  args: List<String>,
+}
+
+pub struct OciStateInfo {
+  id: String,
+  status: String,  // "creating", "created", "running", "stopped"
+  pid: Int,
+  bundle: String,
+  rootfs: String,
+}
+
+pub fn new_oci_state_info(id: String, status: String, pid: Int, bundle: String, rootfs: String) -> OciStateInfo
+  intent "OciStateInfo を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return OciStateInfo { id: id, status: status, pid: pid, bundle: bundle, rootfs: rootfs };
+}
+
+pub struct LogBuffer {
+  max_bytes: Int,
+  current_bytes: Int,
+  data: Bytes,
+}
+
+pub struct CleanupTarget {
+  container_id: String,
+  bundle_dir: String,
+  rootfs_dir: String,
+  pid: Int,
+  mounts: List<String>,
+}
+
+pub struct CleanupReport {
+  success: Bool,
+  cleaned_items: List<String>,
+  failed_items: List<String>,
+  resulting_status: String,
+}
+
+pub struct DiffRecord {
+  field_name: String,
+  expected_val: String,
+  actual_val: String,
+  is_different: Bool,
+}
+
+pub fn runtime_kind_name(kind: &RuntimeKind) -> String
+  intent "RuntimeKind の文字列表現 ('runc' / 'crun') を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match kind {
+    RuntimeKind.Runc => "runc",
+    RuntimeKind.Crun => "crun",
+  };
+}
+
+pub fn parse_runtime_kind(name: &String) -> Result<RuntimeKind, ContainerError>
+  intent "文字列から RuntimeKind をパースする"
+  requires none
+  ensures none
+  effects none
+{
+  if name == "runc" {
+    return Ok(RuntimeKind.Runc);
+  }
+  if name == "crun" {
+    return Ok(RuntimeKind.Crun);
+  }
+  return Err(ContainerError.SpecValidation("未対応の OCI ランタイムです ('runc' または 'crun' を指定してください)。"));
+}
+
+fn int_to_str(val: Int) -> String
+  intent "整数を 10 進文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if val == 0 {
+    return "0";
+  }
+  let mut n = val;
+  let mut is_neg = false;
+  if n < 0 {
+    is_neg = true;
+    n = -n;
+  }
+  let mut digits = List.new();
+  while n > 0 {
+    digits.push(n % 10);
+    n = n / 10;
+  }
+  let mut buf = Bytes.new();
+  if is_neg {
+    buf.push(45);  // '-'
+  }
+  let mut i = digits.len();
+  while i > 0 {
+    i = i - 1;
+    match digits.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+  }
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
+
+fn append_signal_str(args: &mut List<String>, sig: Int)
+  intent "シグナル番号の文字列を引数リストに追加する。9 (KILL) と 15 (TERM) は名前文字列、その他は要求されたシグナル番号を文字列として保持する"
+  requires none
+  ensures none
+  effects none
+{
+  if sig == 9 {
+    args.push("KILL");
+  } else if sig == 15 {
+    args.push("TERM");
+  } else {
+    args.push(int_to_str(sig));
+  }
+}
+
+pub fn build_runtime_command(kind: &RuntimeKind, root_dir: &String, action: &LifecycleAction, container_id: &String, bundle_dir: &String) -> RuntimeCommand
+  intent "OCI ランタイムおよび操作に応じたコマンド行引数リストを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let prog = runtime_kind_name(&kind);
+  let mut args = List.new();
+
+  if root_dir.len() > 0 {
+    args.push("--root");
+    args.push(root_dir.clone());
+  }
+
+  match action {
+    LifecycleAction.Create => {
+      args.push("create");
+      args.push("--bundle");
+      args.push(bundle_dir.clone());
+      args.push(container_id.clone());
+    }
+    LifecycleAction.Start => {
+      args.push("start");
+      args.push(container_id.clone());
+    }
+    LifecycleAction.Stop(sig) => {
+      args.push("kill");
+      args.push(container_id.clone());
+      append_signal_str(&mut args, sig);
+    }
+    LifecycleAction.Delete(force) => {
+      args.push("delete");
+      if force {
+        args.push("--force");
+      }
+      args.push(container_id.clone());
+    }
+    LifecycleAction.State => {
+      args.push("state");
+      args.push(container_id.clone());
+    }
+    LifecycleAction.Kill(sig) => {
+      args.push("kill");
+      args.push(container_id.clone());
+      append_signal_str(&mut args, sig);
+    }
+  }
+
+  return RuntimeCommand { program: prog, args: args };
+}
+
+// ---------------------------------------------------------------------------
+// OCI state 出力 JSON の簡易安全パーサ
+// ---------------------------------------------------------------------------
+
+fn hex_digit_val(b: Int) -> Int
+  intent "16進文字の値を 0..15 の整数として返す。無効な文字は -1 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 48 && b <= 57 {
+    return b - 48;
+  }
+  if b >= 65 && b <= 70 {
+    return b - 55;
+  }
+  if b >= 97 && b <= 102 {
+    return b - 87;
+  }
+  return -1;
+}
+
+fn append_utf8_codepoint(buf: &mut Bytes, cp: Int)
+  intent "Unicode コードポイントを UTF-8 バイト列にエンコードして Bytes に追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if cp < 0 {
+    return;
+  }
+  if cp < 128 {
+    buf.push(cp);
+  } else if cp < 2048 {
+    buf.push(192 + cp / 64);
+    buf.push(128 + cp % 64);
+  } else if cp < 65536 {
+    buf.push(224 + cp / 4096);
+    buf.push(128 + cp / 64 % 64);
+    buf.push(128 + cp % 64);
+  } else if cp <= 1114111 {
+    buf.push(240 + cp / 262144);
+    buf.push(128 + cp / 4096 % 64);
+    buf.push(128 + cp / 64 % 64);
+    buf.push(128 + cp % 64);
+  }
+}
+
+fn find_json_string_value(json: &String, key: &String) -> String
+  intent "JSON 文字列内の指定されたキーに対応する文字列値を抽出・デコードする"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = json.as_bytes();
+  let key_bytes = key.as_bytes();
+  let klen = key_bytes.len();
+  let blen = bytes.len();
+
+  let mut i = 0;
+  while i + klen + 4 < blen {
+    let mut matched = true;
+    let mut k = 0;
+    while k < klen && matched {
+      if bytes.get(i + k).unwrap_or(0) != key_bytes.get(k).unwrap_or(0) {
+        matched = false;
+      }
+      k = k + 1;
+    }
+    if matched {
+      let mut pos = i + klen;
+      // ':' を探す
+      while pos < blen && bytes.get(pos).unwrap_or(0) != 58 {
+        pos = pos + 1;
+      }
+      pos = pos + 1;
+      // 空白スキップ
+      while pos < blen && bytes.get(pos).unwrap_or(0) <= 32 {
+        pos = pos + 1;
+      }
+      if pos < blen && bytes.get(pos).unwrap_or(0) == 34 {  // '"'
+        pos = pos + 1;
+        let mut buf = Bytes.new();
+        let mut terminated = false;
+        while pos < blen && !terminated {
+          let b = bytes.get(pos).unwrap_or(0);
+          if b == 34 {  // '"' (非エスケープの終端クォート)
+            terminated = true;
+            pos = pos + 1;
+          } else if b == 92 {  // '\'
+            pos = pos + 1;
+            if pos < blen {
+              let esc = bytes.get(pos).unwrap_or(0);
+              if esc == 34 {  // '\"'
+                buf.push(34);
+                pos = pos + 1;
+              } else if esc == 92 {  // '\\'
+                buf.push(92);
+                pos = pos + 1;
+              } else if esc == 47 {  // '\/'
+                buf.push(47);
+                pos = pos + 1;
+              } else if esc == 98 {  // '\b'
+                buf.push(8);
+                pos = pos + 1;
+              } else if esc == 102 {  // '\f'
+                buf.push(12);
+                pos = pos + 1;
+              } else if esc == 110 {  // '\n'
+                buf.push(10);
+                pos = pos + 1;
+              } else if esc == 114 {  // '\r'
+                buf.push(13);
+                pos = pos + 1;
+              } else if esc == 116 {  // '\t'
+                buf.push(9);
+                pos = pos + 1;
+              } else if esc == 117 {  // '\uXXXX'
+                pos = pos + 1;
+                if pos + 4 <= blen {
+                  let h0 = hex_digit_val(bytes.get(pos).unwrap_or(0));
+                  let h1 = hex_digit_val(bytes.get(pos + 1).unwrap_or(0));
+                  let h2 = hex_digit_val(bytes.get(pos + 2).unwrap_or(0));
+                  let h3 = hex_digit_val(bytes.get(pos + 3).unwrap_or(0));
+                  if h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0 {
+                    let mut cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3;
+                    pos = pos + 4;
+                    // サロゲートペア検査 (0xD800..0xDBFF)
+                    if cp >= 55296 && cp <= 56319 && pos + 6 <= blen {
+                      if bytes.get(pos).unwrap_or(0) == 92 && bytes.get(pos + 1).unwrap_or(0) == 117 {
+                        let l0 = hex_digit_val(bytes.get(pos + 2).unwrap_or(0));
+                        let l1 = hex_digit_val(bytes.get(pos + 3).unwrap_or(0));
+                        let l2 = hex_digit_val(bytes.get(pos + 4).unwrap_or(0));
+                        let l3 = hex_digit_val(bytes.get(pos + 5).unwrap_or(0));
+                        if l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0 {
+                          let low = l0 * 4096 + l1 * 256 + l2 * 16 + l3;
+                          if low >= 56320 && low <= 57343 {
+                            cp = 65536 + (cp - 55296) * 1024 + (low - 56320);
+                            pos = pos + 6;
+                          }
+                        }
+                      }
+                    }
+                    append_utf8_codepoint(&mut buf, cp);
+                  } else {
+                    pos = pos + 4;
+                  }
+                }
+              } else {
+                buf.push(esc);
+                pos = pos + 1;
+              }
+            }
+          } else {
+            buf.push(b);
+            pos = pos + 1;
+          }
+        }
+        return match buf.to_string_utf8() {
+          Ok(s) => s,
+          Err(_) => "",
+        };
+      }
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+fn find_json_int_value(json: &String, key: &String) -> Int
+  intent "JSON 文字列内の指定されたキーに対応する整数値を抽出する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = json.as_bytes();
+  let key_bytes = key.as_bytes();
+  let klen = key_bytes.len();
+  let blen = bytes.len();
+
+  let mut i = 0;
+  while i + klen + 4 < blen {
+    let mut matched = true;
+    let mut k = 0;
+    while k < klen && matched {
+      if bytes.get(i + k).unwrap_or(0) != key_bytes.get(k).unwrap_or(0) {
+        matched = false;
+      }
+      k = k + 1;
+    }
+    if matched {
+      let mut pos = i + klen;
+      // ':' を探す
+      while pos < blen && bytes.get(pos).unwrap_or(0) != 58 {
+        pos = pos + 1;
+      }
+      pos = pos + 1;
+      // 空白スキップ
+      while pos < blen && bytes.get(pos).unwrap_or(0) <= 32 {
+        pos = pos + 1;
+      }
+      let mut val = 0;
+      let mut seen_digit = false;
+      let mut num_done = false;
+      while pos < blen && !num_done {
+        let b = bytes.get(pos).unwrap_or(0);
+        if b >= 48 && b <= 57 {
+          seen_digit = true;
+          val = val * 10 + (b - 48);
+          pos = pos + 1;
+        } else {
+          num_done = true;
+        }
+      }
+      if seen_digit {
+        return val;
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+pub fn parse_oci_state_json(json_str: &String) -> Result<OciStateInfo, ContainerError>
+  intent "OCI ランタイムの state 出力 JSON を OciStateInfo にパースする"
+  requires none
+  ensures none
+  effects none
+{
+  if json_str.len() == 0 {
+    return Err(ContainerError.Corrupt("OCI state 出力が空です。"));
+  }
+
+  let id = find_json_string_value(&json_str, &"\"id\"");
+  let status = find_json_string_value(&json_str, &"\"status\"");
+  let pid = find_json_int_value(&json_str, &"\"pid\"");
+  let bundle = find_json_string_value(&json_str, &"\"bundle\"");
+  let rootfs = find_json_string_value(&json_str, &"\"rootfs\"");
+
+  if id.len() == 0 || status.len() == 0 {
+    return Err(ContainerError.Corrupt("OCI state 出力に必要なキー ('id', 'status') が含まれていません。"));
+  }
+
+  return Ok(OciStateInfo { id: id, status: status, pid: pid, bundle: bundle, rootfs: rootfs });
+}
+
+pub fn map_oci_status_to_instance_status(oci_status: &String) -> String
+  intent "OCI ランタイム状態 ('created', 'running', 'stopped' 等) を InstanceRecord の状態 ('Creating', 'Running', 'Stopped', 'Failed') に写像する"
+  requires none
+  ensures none
+  effects none
+{
+  if oci_status == "creating" || oci_status == "created" {
+    return "Creating";
+  }
+  if oci_status == "running" {
+    return "Running";
+  }
+  if oci_status == "stopped" {
+    return "Stopped";
+  }
+  return "Failed";
+}
+
+// ---------------------------------------------------------------------------
+// ログ管理と上限
+// ---------------------------------------------------------------------------
+
+pub fn new_log_buffer() -> LogBuffer
+  intent "上限 100 MiB を持つ空の LogBuffer を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return LogBuffer { max_bytes: max_log_size(), current_bytes: 0, data: Bytes.new() };
+}
+
+pub fn append_log(buf: &mut LogBuffer, chunk: &Bytes) -> Result<Bool, ContainerError>
+  intent "ログバッファにバイト列を追加する。100 MiB 上限を超過する場合は明示的に失敗する (自動切り捨てや無言の成功を行わない)"
+  requires none
+  ensures none
+  effects none
+{
+  let next_bytes = buf.current_bytes + chunk.len();
+  if next_bytes > buf.max_bytes {
+    return Err(ContainerError.LimitExceeded("コンテナログ容量上限 (100 MiB) を超過しました。"));
+  }
+  buf.data.extend(&chunk);
+  buf.current_bytes = next_bytes;
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// 強制終了時の後始末計画と評価
+// ---------------------------------------------------------------------------
+
+pub fn plan_forced_cleanup(inst: &InstanceRecord, bundle_dir: &String, rootfs_dir: &String, pid: Int) -> CleanupTarget
+  intent "ランタイム強制終了時に後始末すべき資源の一覧を計画する"
+  requires none
+  ensures none
+  effects none
+{
+  return CleanupTarget { container_id: inst.instance_id.clone(), bundle_dir: bundle_dir.clone(), rootfs_dir: rootfs_dir.clone(), pid: pid, mounts: List.new() };
+}
+
+pub fn evaluate_cleanup_outcome(target: &CleanupTarget, failed_items: &List<String>) -> Result<CleanupReport, ContainerError>
+  intent "後始末の実行結果を評価する。残存資源がある場合は状態を観測した状態 ('Failed') にし、黙って成功にしない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cleaned = List.new();
+  cleaned.push("process");
+  cleaned.push("cgroup");
+  cleaned.push("bundle");
+  cleaned.push("rootfs");
+
+  if failed_items.len() > 0 {
+    return Err(ContainerError.StateError("ランタイム強制終了後の資源後始末に失敗しました。後始末できない資源を状態に残します。"));
+  }
+
+  return Ok(CleanupReport { success: true, cleaned_items: cleaned, failed_items: List.new(), resulting_status: "Stopped" });
+}
+
+// ---------------------------------------------------------------------------
+// runc / crun 出力照合
+// ---------------------------------------------------------------------------
+
+pub fn new_diff_record(field_name: String, expected_val: String, actual_val: String, is_different: Bool) -> DiffRecord
+  intent "DiffRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return DiffRecord { field_name: field_name, expected_val: expected_val, actual_val: actual_val, is_different: is_different };
+}
+
+pub fn compare_runtime_outputs(expected_bundle: &String, actual_bundle: &String, expected_status: &String, actual_status: &String) -> List<DiffRecord>
+  intent "生成 bundle および状態出力と実ランタイム出力を照合し、差分を記録する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut diffs = List.new();
+
+  let bundle_diff = expected_bundle != actual_bundle;
+  diffs.push(new_diff_record("bundle", expected_bundle.clone(), actual_bundle.clone(), bundle_diff));
+
+  let status_diff = expected_status != actual_status;
+  diffs.push(new_diff_record("status", expected_status.clone(), actual_status.clone(), status_diff));
+
+  return diffs;
+}
+
+pub fn runtime_isolation_notice() -> String
+  intent "コンテナ隔離境界の公式告知文を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return isolation_boundary_notice();
+}

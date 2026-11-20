@@ -387,3 +387,275 @@ pub fn decode_instance_record(bytes: &Bytes) -> Result<InstanceRecord, Container
 
   return Ok(InstanceRecord { instance_id: iid, workload_id: wid, node_id: nid, status: status, exit_code: code });
 }
+
+// ---------------------------------------------------------------------------
+// RootfsRecord (rootfs 展開先の管理) の符号化と復号
+// ---------------------------------------------------------------------------
+
+pub struct RootfsRecord {
+  rootfs_id: String,
+  workload_id: String,
+  destination_path: String,
+  total_bytes: Int,
+  file_count: Int,
+  status: String,  // "Unpacked", "Failed", "Cleaned"
+}
+
+pub fn new_rootfs_record(rootfs_id: String, workload_id: String, destination_path: String, total_bytes: Int, file_count: Int, status: String) -> RootfsRecord
+  intent "RootfsRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return RootfsRecord { rootfs_id: rootfs_id, workload_id: workload_id, destination_path: destination_path, total_bytes: total_bytes, file_count: file_count, status: status };
+}
+
+pub fn encode_rootfs_key(rootfs_id: &String) -> Result<Bytes, ContainerError>
+  intent "Rootfs のキー (prefix 'rootfs:' + rootfs_id) を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let k = Value.StrVal(concat_str(&"rootfs:", &rootfs_id));
+  return match encode_key(&k) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("rootfs キーの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_rootfs_record(r: &RootfsRecord) -> Result<Bytes, ContainerError>
+  intent "RootfsRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(r.rootfs_id.clone()));
+  row.push(Value.StrVal(r.workload_id.clone()));
+  row.push(Value.StrVal(r.destination_path.clone()));
+  row.push(Value.IntVal(r.total_bytes));
+  row.push(Value.IntVal(r.file_count));
+  row.push(Value.StrVal(r.status.clone()));
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("rootfs レコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn decode_rootfs_record(bytes: &Bytes) -> Result<RootfsRecord, ContainerError>
+  intent "P4 行形式バイト列から RootfsRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("rootfs レコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != 6 {
+    return Err(ContainerError.StateError("rootfs 行の列数が一致しません。"));
+  }
+
+  let mut rid = "";
+  match row.get(0) {
+    Some(Value.StrVal(s)) => {
+      rid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("rootfs_id の型不一致"));
+    }
+  }
+
+  let mut wid = "";
+  match row.get(1) {
+    Some(Value.StrVal(s)) => {
+      wid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("workload_id の型不一致"));
+    }
+  }
+
+  let mut dst = "";
+  match row.get(2) {
+    Some(Value.StrVal(s)) => {
+      dst = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("destination_path の型不一致"));
+    }
+  }
+
+  let mut bytes_cnt = 0;
+  match row.get(3) {
+    Some(Value.IntVal(n)) => {
+      bytes_cnt = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("total_bytes の型不一致"));
+    }
+  }
+
+  let mut files = 0;
+  match row.get(4) {
+    Some(Value.IntVal(n)) => {
+      files = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("file_count の型不一致"));
+    }
+  }
+
+  let mut st = "";
+  match row.get(5) {
+    Some(Value.StrVal(s)) => {
+      st = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("status の型不一致"));
+    }
+  }
+
+  return Ok(RootfsRecord { rootfs_id: rid, workload_id: wid, destination_path: dst, total_bytes: bytes_cnt, file_count: files, status: st });
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeStateRecord (OCI ランタイム観測状態) の符号化と復号
+// ---------------------------------------------------------------------------
+
+pub struct RuntimeStateRecord {
+  instance_id: String,
+  runtime_kind: String,  // "runc", "crun"
+  pid: Int,
+  status: String,  // "created", "running", "stopped", "failed"
+  exit_code: Int,
+  last_error: String,
+}
+
+pub fn new_runtime_state_record(instance_id: String, runtime_kind: String, pid: Int, status: String, exit_code: Int, last_error: String) -> RuntimeStateRecord
+  intent "RuntimeStateRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return RuntimeStateRecord { instance_id: instance_id, runtime_kind: runtime_kind, pid: pid, status: status, exit_code: exit_code, last_error: last_error };
+}
+
+pub fn encode_runtime_state_key(instance_id: &String) -> Result<Bytes, ContainerError>
+  intent "RuntimeState のキー (prefix 'runtime:' + instance_id) を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let k = Value.StrVal(concat_str(&"runtime:", &instance_id));
+  return match encode_key(&k) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("ランタイム状態キーの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_runtime_state_record(record: &RuntimeStateRecord) -> Result<Bytes, ContainerError>
+  intent "RuntimeStateRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(record.instance_id.clone()));
+  row.push(Value.StrVal(record.runtime_kind.clone()));
+  row.push(Value.IntVal(record.pid));
+  row.push(Value.StrVal(record.status.clone()));
+  row.push(Value.IntVal(record.exit_code));
+  row.push(Value.StrVal(record.last_error.clone()));
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("ランタイム状態レコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn decode_runtime_state_record(bytes: &Bytes) -> Result<RuntimeStateRecord, ContainerError>
+  intent "P4 行形式バイト列から RuntimeStateRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("ランタイム状態レコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != 6 {
+    return Err(ContainerError.StateError("ランタイム状態行の列数が一致しません。"));
+  }
+
+  let mut iid = "";
+  match row.get(0) {
+    Some(Value.StrVal(s)) => {
+      iid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("instance_id の型不一致"));
+    }
+  }
+
+  let mut rk = "";
+  match row.get(1) {
+    Some(Value.StrVal(s)) => {
+      rk = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("runtime_kind の型不一致"));
+    }
+  }
+
+  let mut pid = 0;
+  match row.get(2) {
+    Some(Value.IntVal(n)) => {
+      pid = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("pid の型不一致"));
+    }
+  }
+
+  let mut st = "";
+  match row.get(3) {
+    Some(Value.StrVal(s)) => {
+      st = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("status の型不一致"));
+    }
+  }
+
+  let mut code = 0;
+  match row.get(4) {
+    Some(Value.IntVal(n)) => {
+      code = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("exit_code の型不一致"));
+    }
+  }
+
+  let mut err_msg = "";
+  match row.get(5) {
+    Some(Value.StrVal(s)) => {
+      err_msg = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("last_error の型不一致"));
+    }
+  }
+
+  return Ok(RuntimeStateRecord { instance_id: iid, runtime_kind: rk, pid: pid, status: st, exit_code: code, last_error: err_msg });
+}

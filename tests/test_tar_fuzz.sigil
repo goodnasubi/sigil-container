@@ -1043,6 +1043,21 @@ pub fn run_tar_fuzz_tests() -> Bool
     }
   }
 
+  // (3b) parse_octal: 不正な 8 進数 "0000008" は Corrupt により拒否されること
+  let mut invalid_digit_octal = Bytes.new();
+  invalid_digit_octal.extend(&"0000008".as_bytes());
+  invalid_digit_octal.push(0);
+  match parse_octal(&invalid_digit_octal, 0, invalid_digit_octal.len()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
   // (4) 単体ヘッダ検査: size フィールドが NUL + 0000001000 + NUL のヘッダは inspect_tar_header で Corrupt により拒否されること
   let mut malformed_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
   malformed_size_h.set(124, 0);

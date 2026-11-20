@@ -19,8 +19,8 @@ Sigil の P5「コンテナ管理」の実装リポジトリです。
 
 | 段 | 内容 | 状態 |
 |---|---|---|
-| P5-1 | コンテナ仕様と状態の核（仕様の型と検証、OCI runtime-spec の bundle 生成、OCI Image Layout 検査、状態の保存形式） | 本 PR で実装 |
-| P5-2 | ランタイム接続（rootfs の展開、OCI ランタイムの起動・停止・削除・状態・ログ） | 後続 |
+| P5-1 | コンテナ仕様と状態の核（仕様の型と検証、OCI runtime-spec の bundle 生成、OCI Image Layout 検査、状態の保存形式） | 完了（PR #2） |
+| P5-2 | ランタイム接続（rootfs の展開、OCI ランタイムの起動・停止・削除・状態・ログ） | 本 PR で実装 |
 | P5-3 | 調整ループ（望ましい状態への収束、再起動の方針、変更の通知の購読） | 後続 |
 | P5-4 | ネットワークと公開（既定は接続なし、宣言したポートの公開、ノード内の名前解決） | 後続 |
 | P5-5 | 管理 API と検証（認証と権限、宣言の版管理との連携、バックアップと復元） | 後続 |
@@ -39,9 +39,11 @@ Sigil の P5「コンテナ管理」の実装リポジトリです。
 - `container/limits.sigil`: ADR 0053 決定 3・6 に基づくシステム上限値定数（仕様サイズ 64KiB、層サイズ 1GiB、展開後合計 4GiB、ファイル数 100,000、パス長 256B、階層深さ 16、ログ 100MiB、非 root UID/GID 65532 等）
 - `container/error.sigil`: コンテナ核のエラー型（`ContainerError`: `SpecValidation`, `LayerValidation`, `LimitExceeded`, `Corrupt`, `StateError`）と境界告知文
 - `container/spec.sigil`: 純 Sigil・既定拒否のコンテナ仕様型（`ContainerSpec`）および厳格な検証関数（digest固定、非root、特権禁止、host共有禁止、rootfs読み取り専用、資源上限必須、危険なcap禁止等）
-- `container/oci_spec.sigil`: 仕様から OCI runtime-spec (`config.json`) を決定的に生成する純粋関数
+- `container/oci_spec.sigil`: 仕様から OCI runtime-spec (`config.json`) を決定的に生成する純粋関数（user namespace および uid/gid マッピング対応）
 - `container/image_layout.sigil`: ADR 0035 の OCI Image Layout 読み取りと層パスの検査（パストラバーサル、上位参照 `..`、リンク、特殊ファイル拒否、展開爆弾防止）
-- `container/state.sigil`: 配置の単位（Node, Workload, Instance）と状態の保存形式（望ましい状態 Desired State と観測した状態 Observed State の分離、P4 DB 行符号化・復号、整合トランザクション）
+- `container/rootfs.sigil`: ADR 0035 のイメージ層の展開と検証（単一層、静的 ELF `/app`、User `65532:65532`、上限検査、RootfsRecord への変換）
+- `container/runtime.sigil`: OCI ランタイム抽象（runc/crun のライフサイクルコマンド生成、OCI state JSON パース、100MiB ログバッファ管理、強制終了後の後始末計画と評価、差分照合）
+- `container/state.sigil`: 配置の単位（Node, Workload, Instance, Rootfs, RuntimeState）と状態の保存形式（望ましい状態 Desired State と観測した状態 Observed State の分離、P4 DB 行符号化・復号、整合トランザクション）
 - `db/`: P4 組込みデータベース（`sigil-db`）の固定版
 
 ## テストの実行
@@ -55,3 +57,4 @@ Sigil の P5「コンテナ管理」の実装リポジトリです。
 2. `sigil check --root .`: 静的型・所有権・効果検証
 3. `sigil run --root .`: SIR 評価器でのテスト実行
 4. `sigil build --root .`: ネイティブ実行バイナリのビルドと実行（評価器とネイティブの一致確認）
+5. `tests/test_runtime_e2e.sh`: 実 OCI ランタイム（crun / runc）によるライフサイクル統合試験、否定試験（rootfs 読取専用書込禁止、既定拒否ネットワーク隔離）、強制終了後の後始末検証、runc / crun 出力差分照合記録
