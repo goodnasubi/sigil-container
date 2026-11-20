@@ -1,0 +1,202 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 古い実行の自動キャンセル（sigil 本体 Issue #562 項目2、sigil-db と同じ形）。
+# Pull Request の実行だけを、同じ PR の新しい push で打ち切る。
+# main への push の実行はキャンセルしない（マージ後の確認を止めないため）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
+  # P5-1（PR #2）のコードはこの版のローカルビルドで test.sh 全量の通過を確認済み。
+  SIGIL_REF: 97e22263d5fe2fbf390e4a38c66e4c38388b904a
+
+jobs:
+  # 変更検出（sigil 本体 Issue #562 項目1、sigil-db と同じ役割）。
+  # 方針: ワークフロー自体は止めず（on: の paths は使わない）、後段のジョブを if: で切り替える。
+  # フェイルセーフ: 出力 code は最初に true にしておき、「コードの変更が無い」と確定したときだけ false に上書きする。
+  # 検出のどこかが失敗しても、このジョブ自体が失敗しても、後段は実行側に倒れる。
+  # main への push では検出しない（test ジョブ側で常に全量を実行する）。
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: コードの変更を検出
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          echo "code=true" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          changed="$(git diff --name-only --no-renames "$BASE_SHA" HEAD)"
+          echo "変更されたファイル:"
+          echo "$changed"
+          # コード扱いするパス。ci.yml の変更では ci.yml の全ジョブを実行する。
+          if printf '%s\n' "$changed" | grep -Eq '^(container/|db/|tests/)|^test\.sh$|^test_runner\.sigil$|^\.github/workflows/ci\.yml$'; then
+            echo "コードの変更あり: テストを実行する"
+          else
+            echo "コードの変更なし: テストをスキップする"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # PR の関門（sigil-db の gate と同じ名前・役割）。速い検査だけを実行する:
+  # fmt・型チェック・SIR 評価器でのテスト。第4節のネイティブ全量は main への push の test ジョブで実行する。
+  # コードの変更が無い PR（README のみなど）ではジョブごとスキップされ、必須チェックでは成功扱いになる。
+  gate:
+    needs: changes
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Sigil コンパイラ（固定版）の取得
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil
+          ref: ${{ env.SIGIL_REF }}
+          path: sigil-compiler
+
+      - name: Rust stable
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      # test.sh のネイティブビルドと、Sigil コンパイラのビルドのリンクに cc と glibc が要る（sigil-db と同じ）。
+      - name: ネイティブ出力の前提
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      # ビルドのキャッシュ（sigil 本体 Issue #562 項目3、キーは sigil-db と同じ考え方）。
+      # OS・CPU・rustc の版・コンパイラの固定版・Cargo.lock からキーを作る。
+      # 復元に失敗してもそのままビルドする。保存は main への push の実行だけが行う。
+      - name: キャッシュの復元
+        id: cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-
+
+      - name: Sigil コンパイラのビルド
+        run: cargo build --locked --release --bin sigil
+        working-directory: sigil-compiler
+
+      # gate の検査本体。test.sh の第1〜3節（fmt・check・SIR 評価器）と同一のコマンドを、
+      # ネイティブ全量（第4節）を省いて実行する。test.sh に gate モードが入ったら ./test.sh へ寄せる。
+      # 対象コード（test.sh）がまだチェックアウト先に無い PR（この CI 自体の PR など）では、
+      # 検査対象が無い旨を表示して成功で終わる。コードが入った PR から自動的に実検査が始まる。
+      - name: gate（fmt・check・SIR 評価器）
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+        run: |
+          set -euo pipefail
+          if [ ! -f test.sh ]; then
+            echo "test.sh が無いため、検査対象のコードはまだありません（スキップ）"
+            exit 0
+          fi
+          echo "=== 1. Checking format (sigil fmt --check) ==="
+          "$SIGIL" fmt --check container/*.sigil tests/*.sigil test_runner.sigil db/*.sigil
+          echo "=== 2. Type checking (sigil check) ==="
+          "$SIGIL" check --root . test_runner.sigil
+          echo "=== 3. Running tests via SIR evaluator (sigil run) ==="
+          RUN_OUTPUT="$("$SIGIL" run --root . test_runner.sigil main)"
+          echo "$RUN_OUTPUT"
+          if [ "$RUN_OUTPUT" != "0" ]; then
+            echo "Test failure in SIR evaluator: expected 0, got $RUN_OUTPUT" >&2
+            exit 1
+          fi
+          echo "gate passed (SIR evaluator tests, result = 0)"
+
+  # main への push の全量（sigil-db の test と同じ名前・役割）。test.sh の全節
+  # （fmt・check・SIR 評価器・ネイティブビルドと実行）を実行する。
+  test:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Sigil コンパイラ（固定版）の取得
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil
+          ref: ${{ env.SIGIL_REF }}
+          path: sigil-compiler
+
+      - name: Rust stable
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: ネイティブ出力の前提
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      # ビルドのキャッシュ。gate ジョブと同じキーで、main の全量ジョブが保存したものを復元する。
+      - name: キャッシュの復元
+        id: cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-
+
+      - name: Sigil コンパイラのビルド
+        run: cargo build --locked --release --bin sigil
+        working-directory: sigil-compiler
+
+      - name: test（test.sh、全量）
+        run: |
+          if [ ! -f test.sh ]; then
+            echo "test.sh が無いため、検査対象のコードはまだありません（スキップ）"
+            exit 0
+          fi
+          ./test.sh
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          SIGIL_REF: ${{ env.SIGIL_REF }}
+
+      # main への push のときだけ保存する。同じキーが既にあれば保存されない
+      # （Cargo.lock かツールチェーンか SIGIL_REF が変わると新しいキーになる）。
+      - name: キャッシュの保存
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
