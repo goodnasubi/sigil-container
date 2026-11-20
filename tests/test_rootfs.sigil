@@ -623,5 +623,91 @@ pub fn run_rootfs_tests() -> Bool
     return false;
   }
 
+  // 6. 想定プロセス身元 (65532:65532) に対する実行権限評価テスト
+  // (a) UID 0 / GID 0 で mode 0500 -> 非 root からは other に該当し実行権限なし (拒否されること)
+  let root_0500_hdr = create_tar_header_for_test(&app_name, 120, &"0000500", 48, 0, 0);
+  let mut root_0500_tar = Bytes.new();
+  root_0500_tar.extend(&root_0500_hdr);
+  root_0500_tar.extend(&valid_elf);
+  i = 120;
+  while i < 512 {
+    root_0500_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut root_0500_tar, 2);
+  let mut root_0500_m = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&root_0500_tar, &dest) {
+    Ok(m) => {
+      root_0500_m = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&root_0500_m) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (b) UID 0 / GID 0 で mode 0555 -> other 実行権限あり (通過すること)
+  let root_0555_hdr = create_tar_header_for_test(&app_name, 120, &"0000555", 48, 0, 0);
+  let mut root_0555_tar = Bytes.new();
+  root_0555_tar.extend(&root_0555_hdr);
+  root_0555_tar.extend(&valid_elf);
+  i = 120;
+  while i < 512 {
+    root_0555_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut root_0555_tar, 2);
+  let mut root_0555_m = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&root_0555_tar, &dest) {
+    Ok(m) => {
+      root_0555_m = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&root_0555_m) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (c) UID 65532 / GID 65532 で mode 0500 -> owner 実行権限あり (通過すること)
+  let nonroot_0500_hdr = create_tar_header_for_test(&app_name, 120, &"0000500", 48, 65532, 65532);
+  let mut nonroot_0500_tar = Bytes.new();
+  nonroot_0500_tar.extend(&nonroot_0500_hdr);
+  nonroot_0500_tar.extend(&valid_elf);
+  i = 120;
+  while i < 512 {
+    nonroot_0500_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut nonroot_0500_tar, 2);
+  let mut nonroot_0500_m = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&nonroot_0500_tar, &dest) {
+    Ok(m) => {
+      nonroot_0500_m = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&nonroot_0500_m) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
   return true;
 }

@@ -151,6 +151,28 @@ pub fn run_runtime_tests() -> Bool
     return false;
   }
 
+  // 3b. JSON 文字列エスケープデコード (\", \\, \/, \b, \f, \n, \r, \t, \uXXXX, サロゲートペア)
+  let esc_json = "{\"id\":\"ctr-\\\"001\\\"\",\"status\":\"run\\ning\",\"pid\":1234,\"bundle\":\"/bun\\tdle/\\u0041\\u3042\\uD83D\\uDE00\",\"rootfs\":\"root\\\\fs\\/sub\\f\\b\\r\"}";
+  match parse_oci_state_json(&esc_json) {
+    Ok(esc_info) => {
+      if esc_info.id != "ctr-\"001\"" {
+        return false;
+      }
+      if esc_info.status != "run\ning" {
+        return false;
+      }
+      if esc_info.bundle != "/bun\tdle/Aあ😀" {
+        return false;
+      }
+      if esc_info.rootfs != "root\\fs/sub\u{C}\u{8}\r" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
   // 4. ログバッファと 100 MiB 上限
   let mut log_buf = new_log_buffer();
   let mut normal_chunk = Bytes.new();

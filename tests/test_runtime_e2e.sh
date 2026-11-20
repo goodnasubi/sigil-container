@@ -5,16 +5,17 @@ echo "=== 5. Real OCI Runtime Integration & Negative Tests (ADR 0053 P5-2) ==="
 
 TMP_DIR="$(mktemp -d -t sigil_runtime_e2e_XXXXXX)"
 cleanup() {
-  # Clean up any lingering containers or directories
-  if command -v crun >/dev/null 2>&1; then
-    crun delete --force ctr-adr0035 >/dev/null 2>&1 || true
-    crun delete --force ctr-write-test >/dev/null 2>&1 || true
-    crun delete --force ctr-net-test >/dev/null 2>&1 || true
-    crun delete --force ctr-kill-test >/dev/null 2>&1 || true
-  fi
-  if command -v runc >/dev/null 2>&1; then
-    runc delete --force ctr-adr0035 >/dev/null 2>&1 || true
-  fi
+  # Clean up any lingering containers or directories across all installed runtimes
+  for rt in crun runc; do
+    if command -v "$rt" >/dev/null 2>&1; then
+      "$rt" delete --force ctr-adr0035 >/dev/null 2>&1 || true
+      "$rt" delete --force ctr-adr0035-run >/dev/null 2>&1 || true
+      "$rt" delete --force ctr-write-test >/dev/null 2>&1 || true
+      "$rt" delete --force ctr-net-test >/dev/null 2>&1 || true
+      "$rt" delete --force ctr-kill-test >/dev/null 2>&1 || true
+      "$rt" delete --force ctr-runc-test >/dev/null 2>&1 || true
+    fi
+  done
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -36,6 +37,9 @@ if [ ${#RUNTIMES[@]} -eq 0 ]; then
   echo "Error: Neither runc nor crun is installed on the system." >&2
   exit 1
 fi
+
+PRIMARY_RUNTIME="${RUNTIMES[0]}"
+echo "Primary runtime for common tests: $PRIMARY_RUNTIME"
 
 # 2. Build ADR 0035 static test binary (/app)
 cat << 'C_EOF' > "$TMP_DIR/app.c"
@@ -120,44 +124,44 @@ if [ -f "/sys/fs/cgroup/cgroup.controllers" ]; then
   CGROUP_CONTROLLERS="$(cat /sys/fs/cgroup/cgroup.controllers)"
 fi
 
-CRUN_ARGS=()
-if [ -z "$CGROUP_CONTROLLERS" ]; then
+PRIMARY_ARGS=()
+if [ "$PRIMARY_RUNTIME" = "crun" ] && [ -z "$CGROUP_CONTROLLERS" ]; then
   echo "Note: cgroup v2 controllers (memory/cpu/pids) not delegated in nested container environment."
   echo "Recording reason: using --cgroup-manager disabled for crun in unprivileged nested sandbox."
-  CRUN_ARGS=("--cgroup-manager" "disabled")
+  PRIMARY_ARGS=("--cgroup-manager" "disabled")
 fi
 
-echo "--- A. Testing ADR 0035 Image Execution with crun ---"
+echo "--- A. Testing ADR 0035 Image Execution with $PRIMARY_RUNTIME ---"
 # Test lifecycle transitions: create -> state -> start -> state -> delete
-crun "${CRUN_ARGS[@]}" create --bundle "$BUNDLE_DIR" ctr-adr0035
-STATE_JSON="$(crun state ctr-adr0035)"
-echo "crun state (created): $STATE_JSON"
+"$PRIMARY_RUNTIME" "${PRIMARY_ARGS[@]}" create --bundle "$BUNDLE_DIR" ctr-adr0035
+STATE_JSON="$("$PRIMARY_RUNTIME" state ctr-adr0035)"
+echo "$PRIMARY_RUNTIME state (created): $STATE_JSON"
 if ! echo "$STATE_JSON" | grep -q '"created"'; then
-  echo "Error: Expected state 'created' from crun state" >&2
+  echo "Error: Expected state 'created' from $PRIMARY_RUNTIME state" >&2
   exit 1
 fi
 
-crun start ctr-adr0035
+"$PRIMARY_RUNTIME" start ctr-adr0035
 sleep 0.1
-STATE_AFTER="$(crun state ctr-adr0035)"
-echo "crun state (after exit): $STATE_AFTER"
+STATE_AFTER="$("$PRIMARY_RUNTIME" state ctr-adr0035)"
+echo "$PRIMARY_RUNTIME state (after exit): $STATE_AFTER"
 if ! echo "$STATE_AFTER" | grep -q '"stopped"'; then
   echo "Error: Expected state 'stopped' after container process exited" >&2
   exit 1
 fi
-crun delete ctr-adr0035
+"$PRIMARY_RUNTIME" delete ctr-adr0035
 
-# Test execution and capture stdout via crun run
-RUN_OUTPUT="$(crun "${CRUN_ARGS[@]}" run --bundle "$BUNDLE_DIR" ctr-adr0035-run)"
-echo "crun run output: $RUN_OUTPUT"
+# Test execution and capture stdout via $PRIMARY_RUNTIME run
+RUN_OUTPUT="$("$PRIMARY_RUNTIME" "${PRIMARY_ARGS[@]}" run --bundle "$BUNDLE_DIR" ctr-adr0035-run)"
+echo "$PRIMARY_RUNTIME run output: $RUN_OUTPUT"
 if [ "$RUN_OUTPUT" != "Hello from ADR 0035 static ELF" ]; then
   echo "Error: Unexpected container output: '$RUN_OUTPUT'" >&2
   exit 1
 fi
-echo "crun ADR 0035 container passed successfully!"
+echo "$PRIMARY_RUNTIME ADR 0035 container passed successfully!"
 
-echo "--- B. Differential Comparison: Testing runc on same bundle ---"
-if command -v runc >/dev/null 2>&1; then
+echo "--- B. Differential Comparison: Testing both runtimes on same bundle ---"
+if command -v crun >/dev/null 2>&1 && command -v runc >/dev/null 2>&1; then
   set +e
   RUNC_OUTPUT="$(runc run --bundle "$BUNDLE_DIR" ctr-runc-test 2>&1)"
   RUNC_EXIT=$?
@@ -165,6 +169,8 @@ if command -v runc >/dev/null 2>&1; then
   echo "runc exit code: $RUNC_EXIT"
   echo "runc output / error: $RUNC_OUTPUT"
   echo "Differential record: runc requires setns capability for mount remapping thread in nested container (fails with 'setns: operation not permitted'), while crun succeeds via user namespace unshare."
+else
+  echo "Differential comparison skipped: requires both crun and runc to be installed."
 fi
 
 echo "--- C. Negative Test: Write Prohibition (Read-Only Rootfs) ---"
@@ -215,7 +221,7 @@ chmod 0555 "$BUNDLE_DIR/rootfs/app"
 chown 65532:65532 "$BUNDLE_DIR/rootfs/app"
 
 set +e
-crun "${CRUN_ARGS[@]}" run --bundle "$BUNDLE_DIR" ctr-write-test
+"$PRIMARY_RUNTIME" "${PRIMARY_ARGS[@]}" run --bundle "$BUNDLE_DIR" ctr-write-test
 WRITE_TEST_EXIT=$?
 set -e
 if [ $WRITE_TEST_EXIT -ne 0 ]; then
@@ -286,7 +292,7 @@ chmod 0555 "$BUNDLE_DIR/rootfs/app"
 chown 65532:65532 "$BUNDLE_DIR/rootfs/app"
 
 set +e
-crun "${CRUN_ARGS[@]}" run --bundle "$BUNDLE_DIR" ctr-net-test
+"$PRIMARY_RUNTIME" "${PRIMARY_ARGS[@]}" run --bundle "$BUNDLE_DIR" ctr-net-test
 NET_TEST_EXIT=$?
 set -e
 if [ $NET_TEST_EXIT -ne 0 ]; then
@@ -321,9 +327,9 @@ gcc -static -nostdlib -e _start "$TMP_DIR/loop_app.c" -o "$BUNDLE_DIR/rootfs/app
 chmod 0555 "$BUNDLE_DIR/rootfs/app"
 chown 65532:65532 "$BUNDLE_DIR/rootfs/app"
 
-crun "${CRUN_ARGS[@]}" create --bundle "$BUNDLE_DIR" ctr-kill-test
-crun start ctr-kill-test
-KILL_PID="$(crun state ctr-kill-test | grep '"pid"' | tr -dc '0-9')"
+"$PRIMARY_RUNTIME" "${PRIMARY_ARGS[@]}" create --bundle "$BUNDLE_DIR" ctr-kill-test
+"$PRIMARY_RUNTIME" start ctr-kill-test
+KILL_PID="$("$PRIMARY_RUNTIME" state ctr-kill-test | grep '"pid"' | tr -dc '0-9')"
 echo "Running container PID: $KILL_PID"
 
 if kill -0 "$KILL_PID" 2>/dev/null; then
@@ -331,16 +337,16 @@ if kill -0 "$KILL_PID" 2>/dev/null; then
 fi
 
 # Forcefully kill container (SIGKILL)
-crun kill ctr-kill-test KILL
+"$PRIMARY_RUNTIME" kill ctr-kill-test KILL
 sleep 0.2
 
 # Check if process is gone
 if kill -0 "$KILL_PID" 2>/dev/null; then
-  echo "Warning: PID $KILL_PID still alive after crun kill, killing with host SIGKILL..."
+  echo "Warning: PID $KILL_PID still alive after $PRIMARY_RUNTIME kill, killing with host SIGKILL..."
   kill -9 "$KILL_PID" 2>/dev/null || true
 fi
 
-crun delete ctr-kill-test
+"$PRIMARY_RUNTIME" delete ctr-kill-test
 echo "Forced termination and cleanup verified successfully!"
 
 echo "=== All real OCI runtime integration and negative tests passed! ==="

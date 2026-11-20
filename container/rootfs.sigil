@@ -320,16 +320,29 @@ pub fn validate_adr0035_rootfs(manifest: &RootfsManifest) -> Result<Bool, Contai
           if entry.size == 0 {
             return Err(ContainerError.LayerValidation("/app のサイズが 0 バイトです。"));
           }
-          // 実行権限の確認: mode 0555 (365) または少なくとも user 実行権限 (mode & 0o100 != 0)
-          if entry.mode / 64 % 2 == 0 {
-            return Err(ContainerError.LayerValidation("/app に実行権限が付与されていません。"));
-          }
           // ADR 0035 の UID/GID (65532 または 0)
-          if entry.uid != 0 && entry.uid != default_non_root_uid() {
+          let target_uid = default_non_root_uid();
+          let target_gid = default_non_root_gid();
+          if entry.uid != 0 && entry.uid != target_uid {
             return Err(ContainerError.LayerValidation("/app の UID が ADR 0035 規定値 (0 または 65532) に一致しません。"));
           }
-          if entry.gid != 0 && entry.gid != default_non_root_gid() {
+          if entry.gid != 0 && entry.gid != target_gid {
             return Err(ContainerError.LayerValidation("/app の GID が ADR 0035 規定値 (0 または 65532) に一致しません。"));
+          }
+          // 想定プロセス身元 (UID/GID 65532) に対する実行権限の確認:
+          // POSIX 権限評価に従い、想定プロセスの身元に適用される実行ビット (owner / group / other) を評価する。
+          // mode 0555 (365) は全クラスで実行可能 (owner 1, group 1, other 1)。
+          // UID 0 / GID 0 所有で mode 0500 の場合、非 root プロセスは other に該当するため EACCES となる。
+          let mut has_exec = false;
+          if entry.uid == target_uid {
+            has_exec = entry.mode / 64 % 2 != 0;
+          } else if entry.gid == target_gid {
+            has_exec = entry.mode / 8 % 2 != 0;
+          } else {
+            has_exec = entry.mode % 2 != 0;
+          }
+          if !has_exec {
+            return Err(ContainerError.LayerValidation("/app に想定プロセス (65532:65532) に対する実行権限が付与されていません。"));
           }
           // 実際のペイロードを検査し、無効・非静的な実行ファイルを拒否
           match validate_elf_payload(&entry.payload) {

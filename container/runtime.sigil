@@ -173,8 +173,52 @@ pub fn build_runtime_command(kind: &RuntimeKind, root_dir: &String, action: &Lif
 // OCI state 出力 JSON の簡易安全パーサ
 // ---------------------------------------------------------------------------
 
+fn hex_digit_val(b: Int) -> Int
+  intent "16進文字の値を 0..15 の整数として返す。無効な文字は -1 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 48 && b <= 57 {
+    return b - 48;
+  }
+  if b >= 65 && b <= 70 {
+    return b - 55;
+  }
+  if b >= 97 && b <= 102 {
+    return b - 87;
+  }
+  return -1;
+}
+
+fn append_utf8_codepoint(buf: &mut Bytes, cp: Int)
+  intent "Unicode コードポイントを UTF-8 バイト列にエンコードして Bytes に追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if cp < 0 {
+    return;
+  }
+  if cp < 128 {
+    buf.push(cp);
+  } else if cp < 2048 {
+    buf.push(192 + cp / 64);
+    buf.push(128 + cp % 64);
+  } else if cp < 65536 {
+    buf.push(224 + cp / 4096);
+    buf.push(128 + cp / 64 % 64);
+    buf.push(128 + cp % 64);
+  } else if cp <= 1114111 {
+    buf.push(240 + cp / 262144);
+    buf.push(128 + cp / 4096 % 64);
+    buf.push(128 + cp / 64 % 64);
+    buf.push(128 + cp % 64);
+  }
+}
+
 fn find_json_string_value(json: &String, key: &String) -> String
-  intent "JSON 文字列内の指定されたキーに対応する文字列値を抽出する"
+  intent "JSON 文字列内の指定されたキーに対応する文字列値を抽出・デコードする"
   requires none
   ensures none
   effects none
@@ -207,12 +251,83 @@ fn find_json_string_value(json: &String, key: &String) -> String
       }
       if pos < blen && bytes.get(pos).unwrap_or(0) == 34 {  // '"'
         pos = pos + 1;
-        let start = pos;
-        while pos < blen && bytes.get(pos).unwrap_or(0) != 34 {
-          pos = pos + 1;
+        let mut buf = Bytes.new();
+        let mut terminated = false;
+        while pos < blen && !terminated {
+          let b = bytes.get(pos).unwrap_or(0);
+          if b == 34 {  // '"' (非エスケープの終端クォート)
+            terminated = true;
+            pos = pos + 1;
+          } else if b == 92 {  // '\'
+            pos = pos + 1;
+            if pos < blen {
+              let esc = bytes.get(pos).unwrap_or(0);
+              if esc == 34 {  // '\"'
+                buf.push(34);
+                pos = pos + 1;
+              } else if esc == 92 {  // '\\'
+                buf.push(92);
+                pos = pos + 1;
+              } else if esc == 47 {  // '\/'
+                buf.push(47);
+                pos = pos + 1;
+              } else if esc == 98 {  // '\b'
+                buf.push(8);
+                pos = pos + 1;
+              } else if esc == 102 {  // '\f'
+                buf.push(12);
+                pos = pos + 1;
+              } else if esc == 110 {  // '\n'
+                buf.push(10);
+                pos = pos + 1;
+              } else if esc == 114 {  // '\r'
+                buf.push(13);
+                pos = pos + 1;
+              } else if esc == 116 {  // '\t'
+                buf.push(9);
+                pos = pos + 1;
+              } else if esc == 117 {  // '\uXXXX'
+                pos = pos + 1;
+                if pos + 4 <= blen {
+                  let h0 = hex_digit_val(bytes.get(pos).unwrap_or(0));
+                  let h1 = hex_digit_val(bytes.get(pos + 1).unwrap_or(0));
+                  let h2 = hex_digit_val(bytes.get(pos + 2).unwrap_or(0));
+                  let h3 = hex_digit_val(bytes.get(pos + 3).unwrap_or(0));
+                  if h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0 {
+                    let mut cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3;
+                    pos = pos + 4;
+                    // サロゲートペア検査 (0xD800..0xDBFF)
+                    if cp >= 55296 && cp <= 56319 && pos + 6 <= blen {
+                      if bytes.get(pos).unwrap_or(0) == 92 && bytes.get(pos + 1).unwrap_or(0) == 117 {
+                        let l0 = hex_digit_val(bytes.get(pos + 2).unwrap_or(0));
+                        let l1 = hex_digit_val(bytes.get(pos + 3).unwrap_or(0));
+                        let l2 = hex_digit_val(bytes.get(pos + 4).unwrap_or(0));
+                        let l3 = hex_digit_val(bytes.get(pos + 5).unwrap_or(0));
+                        if l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0 {
+                          let low = l0 * 4096 + l1 * 256 + l2 * 16 + l3;
+                          if low >= 56320 && low <= 57343 {
+                            cp = 65536 + (cp - 55296) * 1024 + (low - 56320);
+                            pos = pos + 6;
+                          }
+                        }
+                      }
+                    }
+                    append_utf8_codepoint(&mut buf, cp);
+                  } else {
+                    pos = pos + 4;
+                  }
+                }
+              } else {
+                buf.push(esc);
+                pos = pos + 1;
+              }
+            }
+          } else {
+            buf.push(b);
+            pos = pos + 1;
+          }
         }
-        let slice = bytes.slice(start, pos).unwrap_or(Bytes.new());
-        return match slice.to_string_utf8() {
+        return match buf.to_string_utf8() {
           Ok(s) => s,
           Err(_) => "",
         };
