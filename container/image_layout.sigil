@@ -182,7 +182,27 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
     // 終端マーカー
   }
 
-  // 1. ファイル名抽出 (0..100) と prefix (345..500)
+  // 1. typeflag (156)
+  let typeflag = header.get(156).unwrap_or(48);  // '0' = 48
+
+  // 危険な特殊ファイルの拒否:
+  // '3': Character device
+  // '4': Block device
+  // '6': FIFO
+  if typeflag == 51 || typeflag == 52 || typeflag == 54 {
+    return Err(ContainerError.LayerValidation("デバイスノードまたは FIFO 等の特殊ファイルは拒否されます。"));
+  }
+
+  // 未対応の拡張ヘッダ型 (PAX / GNU) の拒否:
+  // 'x': 120 (PAX extended header)
+  // 'g': 103 (PAX global extended header)
+  // 'L': 76 (GNU long filename)
+  // 'K': 75 (GNU long linkname)
+  if typeflag == 120 || typeflag == 103 || typeflag == 76 || typeflag == 75 {
+    return Err(ContainerError.LayerValidation("未対応の拡張ヘッダ型 (PAX または GNU 拡張ヘッダ: x, g, L, K) は実効パス・リンク先検証が未対応のため拒否されます。"));
+  }
+
+  // 2. ファイル名抽出 (0..100) と prefix (345..500)
   let name_part = extract_cstring(&header, 0, 100);
   let prefix_part = extract_cstring(&header, 345, 155);
   let mut full_path = name_part.clone();
@@ -203,16 +223,6 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
     Err(e) => {
       return Err(e);
     }
-  }
-
-  // 2. typeflag (156)
-  let typeflag = header.get(156).unwrap_or(48);  // '0' = 48
-  // 危険な特殊ファイルの拒否:
-  // '3': Character device
-  // '4': Block device
-  // '6': FIFO
-  if typeflag == 51 || typeflag == 52 || typeflag == 54 {
-    return Err(ContainerError.LayerValidation("デバイスノードまたは FIFO 等の特殊ファイルは拒否されます。"));
   }
 
   // 3. サイズ (124..136)

@@ -179,6 +179,49 @@ pub fn run_bundle_tests() -> Bool
       if !bytes_contains(&j.as_bytes(), &"\"destination\":\"/app/data\"".as_bytes()) {
         return false;
       }
+
+      // 6. 回帰テスト (指摘 3): bind マウントの options に "bind" およびアクセスモード (ro/rw) が含まれること
+      if !bytes_contains(&j.as_bytes(), &"\"options\":[\"bind\",\"ro\"]".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 5. 回帰テスト (指摘 1): 既定 seccomp 許可リストに arch_prctl が含まれること (x86-64 glibc TLS 初期化用)
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は現在、pure モード (effects none / trust none / targets server) で動作しており、
+  // 外部プロセス起動 (fork/exec) や Linux seccomp フィルタの直接適用 (prctl/seccomp システムコール) を行う
+  // 実行機能を持たないため、Sigil 内での実行スモークテスト (例: 許可リスト適用下で /bin/true が成功すること) は
+  // 不可能である。したがって、生成される OCI config JSON に arch_prctl が含まれることの JSON presence テストで代用する。
+  if !bytes_contains(&json1.as_bytes(), &"\"arch_prctl\"".as_bytes()) {
+    return false;
+  }
+
+  // 6 (続き). 回帰テスト (指摘 3): rw bind マウントおよび rbind マウントの options 出力
+  let mut rw_bind_spec = create_sample_spec();
+  rw_bind_spec.mounts = List.new();
+  rw_bind_spec.mounts.push(new_mount("/var/log", "/var/log", false, "bind"));
+  match generate_oci_config_json(&rw_bind_spec) {
+    Ok(j_rw) => {
+      if !bytes_contains(&j_rw.as_bytes(), &"\"options\":[\"bind\",\"rw\"]".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let mut rbind_spec = create_sample_spec();
+  rbind_spec.mounts = List.new();
+  rbind_spec.mounts.push(new_mount("/mnt/storage", "/storage", true, "rbind"));
+  match generate_oci_config_json(&rbind_spec) {
+    Ok(j_rb) => {
+      if !bytes_contains(&j_rb.as_bytes(), &"\"options\":[\"rbind\",\"ro\"]".as_bytes()) {
+        return false;
+      }
     }
     Err(_) => {
       return false;

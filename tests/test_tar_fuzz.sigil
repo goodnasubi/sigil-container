@@ -2,6 +2,7 @@ module tests.test_tar_fuzz
   targets server
   trust none
 
+use container.error.error_kind_name;
 use container.image_layout.inspect_tar_header;
 use container.image_layout.validate_path;
 use container.image_layout.validate_tar_archive;
@@ -295,6 +296,90 @@ pub fn run_tar_fuzz_tests() -> Bool
       return false;
     }
     Err(_) => {}
+  }
+
+  // 17. 回帰テスト (指摘 2): 未対応の拡張ヘッダ型 (PAX x/g, GNU L/K) の LayerValidation による拒否
+  // (1) PAX x 拡張ヘッダ ('x' = 120) 単体
+  let pax_x_single = create_tar_header_fixture("PaxHeaders.1000/safe", "00000000030 ", 120, "");
+  match inspect_tar_header(&pax_x_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) PAX g 拡張ヘッダ ('g' = 103) 単体
+  let pax_g_single = create_tar_header_fixture("pax_global_header", "00000000030 ", 103, "");
+  match inspect_tar_header(&pax_g_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (3) GNU long-name ('L' = 76) 単体
+  let gnu_l_single = create_tar_header_fixture("././@LongLink", "00000000030 ", 76, "");
+  match inspect_tar_header(&gnu_l_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) GNU long-link ('K' = 75) 単体
+  let gnu_k_single = create_tar_header_fixture("././@LongLink", "00000000030 ", 75, "");
+  match inspect_tar_header(&gnu_k_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (5) PAX x ヘッダに path=../escape を含み、その後に通常ヘッダ safe が続くアーカイブの拒否
+  let pax_x_h = create_tar_header_fixture("PaxHeaders.1000/safe", "00000000030 ", 120, "");
+  let mut pax_payload = Bytes.with_capacity(512);
+  let pax_content = "24 path=../escape\n".as_bytes();
+  let mut pi = 0;
+  while pi < pax_content.len() {
+    pax_payload.push(pax_content.get(pi).unwrap_or(0));
+    pi = pi + 1;
+  }
+  while pax_payload.len() < 512 {
+    pax_payload.push(0);
+  }
+  let safe_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+
+  let mut pax_escape_tar = Bytes.new();
+  pax_escape_tar.extend(&pax_x_h);
+  pax_escape_tar.extend(&pax_payload);
+  pax_escape_tar.extend(&safe_h);
+  pax_escape_tar.extend(&zero_b);
+
+  match validate_tar_archive(&pax_escape_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
   }
 
   return true;
