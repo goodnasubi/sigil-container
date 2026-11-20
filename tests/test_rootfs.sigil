@@ -4,6 +4,7 @@ module tests.test_rootfs
 
 use container.error.error_kind_name;
 use container.rootfs.manifest_to_rootfs_record;
+use container.rootfs.new_rootfs_entry;
 use container.rootfs.new_rootfs_manifest;
 use container.rootfs.unpack_layer_archive;
 use container.rootfs.validate_adr0035_rootfs;
@@ -706,6 +707,104 @@ pub fn run_rootfs_tests() -> Bool
     Ok(_) => {}
     Err(_) => {
       return false;
+    }
+  }
+
+  // 10. 相対パス接頭辞 "./app" の展開と ADR 0035 検証の成功
+  let dot_slash_name = "./app";
+  let dot_slash_hdr = create_tar_header_for_test(&dot_slash_name, 120, &"0000555", 48, 65532, 65532);
+  let mut dot_slash_tar = Bytes.new();
+  dot_slash_tar.extend(&dot_slash_hdr);
+  dot_slash_tar.extend(&valid_elf);
+  i = 120;
+  while i < 512 {
+    dot_slash_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut dot_slash_tar, 2);
+  let mut dot_slash_m = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&dot_slash_tar, &dest) {
+    Ok(m) => {
+      dot_slash_m = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if dot_slash_m.file_count != 1 {
+    return false;
+  }
+  match dot_slash_m.entries.get(0) {
+    Some(e) => {
+      if e.path != "./app" {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&dot_slash_m) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 11. 多重相対パス接頭辞 "././app" の正規化照合の成功
+  let mut multi_dot_entries = List.new();
+  multi_dot_entries.push(new_rootfs_entry("././app", 120, 365, 65532, 65532, false, valid_elf.clone()));
+  let multi_dot_m = new_rootfs_manifest(dest.clone(), multi_dot_entries, 120, 1);
+  match validate_adr0035_rootfs(&multi_dot_m) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 12. 否定テスト: validate_path 安全検査の不迂回 (トラバーサル、絶対パス、階層違い)
+  // (a) パストラバーサル "../app" は validate_path により拒否されること
+  let mut trav_entries = List.new();
+  trav_entries.push(new_rootfs_entry("../app", 120, 365, 65532, 65532, false, valid_elf.clone()));
+  let trav_m = new_rootfs_manifest(dest.clone(), trav_entries, 120, 1);
+  match validate_adr0035_rootfs(&trav_m) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (b) 絶対パス "/app" は validate_path により拒否されること
+  let mut abs_entries = List.new();
+  abs_entries.push(new_rootfs_entry("/app", 120, 365, 65532, 65532, false, valid_elf.clone()));
+  let abs_m = new_rootfs_manifest(dest.clone(), abs_entries, 120, 1);
+  match validate_adr0035_rootfs(&abs_m) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (c) サブディレクトリ配下の "./subdir/app" は /app として誤認されず拒否されること
+  let mut sub_entries = List.new();
+  sub_entries.push(new_rootfs_entry("./subdir/app", 120, 365, 65532, 65532, false, valid_elf.clone()));
+  let sub_m = new_rootfs_manifest(dest.clone(), sub_entries, 120, 1);
+  match validate_adr0035_rootfs(&sub_m) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
     }
   }
 

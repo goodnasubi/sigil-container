@@ -302,6 +302,38 @@ pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Res
   return Ok(RootfsManifest { destination_path: destination_path.clone(), entries: entries, total_bytes: total_bytes, file_count: file_count });
 }
 
+fn is_adr0035_app_entry(path: &String) -> Bool
+  intent "エントリパスが validate_path の安全規則を満たし、かつ安全な相対パス要素の正規化後に /app に一致するかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. validate_path による安全検査 (相対パス必須、上位参照 .. の禁止、パス長、階層深さ) を迂回しない
+  match validate_path(&path) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 照合のためだけの安全な相対パス正規化 (先頭の "./" 要素の除去)
+  let bytes = path.as_bytes();
+  let len = bytes.len();
+  let mut start = 0;
+  while start + 1 < len && bytes.get(start).unwrap_or(0) == 46 && bytes.get(start + 1).unwrap_or(0) == 47 {
+    start = start + 2;
+    while start < len && bytes.get(start).unwrap_or(0) == 47 {
+      start = start + 1;
+    }
+  }
+
+  // 正規化後の相対パスが "app" であるかを照合
+  if len - start != 3 {
+    return false;
+  }
+  return bytes.get(start).unwrap_or(0) == 97 && bytes.get(start + 1).unwrap_or(0) == 112 && bytes.get(start + 2).unwrap_or(0) == 112;
+}
+
 pub fn validate_adr0035_rootfs(manifest: &RootfsManifest) -> Result<Bool, ContainerError>
   intent "展開された rootfs が ADR 0035 仕様 (単一層、静的 ELF /app、User 65532:65532、実行可能) を満たすかを検査する"
   requires none
@@ -313,7 +345,15 @@ pub fn validate_adr0035_rootfs(manifest: &RootfsManifest) -> Result<Bool, Contai
   while i < manifest.entries.len() {
     match manifest.entries.get(i) {
       Some(entry) => {
-        if entry.path == "app" || entry.path == "/app" {
+        // 元のパスの安全検査 (上位参照 ..、絶対パス等の拒否) を確認
+        match validate_path(&entry.path) {
+          Ok(_) => {}
+          Err(err) => {
+            return Err(err);
+          }
+        }
+
+        if is_adr0035_app_entry(&entry.path) {
           if entry.is_dir {
             return Err(ContainerError.LayerValidation("/app がディレクトリとして配置されています (通常 ELF ファイルである必要があります)。"));
           }

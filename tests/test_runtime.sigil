@@ -120,6 +120,34 @@ pub fn run_runtime_tests() -> Bool
     return false;
   }
 
+  // Stop (INT: 2) - 要求されたシグナル番号が数値文字列として保持されること (KILL に置換されない)
+  let stop_int_cmd = build_runtime_command(&RuntimeKind.Crun, &"", &LifecycleAction.Stop(2), &cid, &bdir);
+  if !check_arg(&stop_int_cmd.args, 0, &"kill") {
+    return false;
+  }
+  if !check_arg(&stop_int_cmd.args, 2, &"2") {
+    return false;
+  }
+
+  // Kill (HUP: 1) - 要求されたシグナル番号が数値文字列として保持されること (KILL に置換されない)
+  let kill_hup_cmd = build_runtime_command(&RuntimeKind.Runc, &"", &LifecycleAction.Kill(1), &cid, &bdir);
+  if !check_arg(&kill_hup_cmd.args, 0, &"kill") {
+    return false;
+  }
+  if !check_arg(&kill_hup_cmd.args, 2, &"1") {
+    return false;
+  }
+
+  // Stop (USR1: 10) / Kill (QUIT: 3)
+  let stop_usr1_cmd = build_runtime_command(&RuntimeKind.Runc, &"", &LifecycleAction.Stop(10), &cid, &bdir);
+  if !check_arg(&stop_usr1_cmd.args, 2, &"10") {
+    return false;
+  }
+  let kill_quit_cmd = build_runtime_command(&RuntimeKind.Crun, &"", &LifecycleAction.Kill(3), &cid, &bdir);
+  if !check_arg(&kill_quit_cmd.args, 2, &"3") {
+    return false;
+  }
+
   // Delete (--force)
   let del_cmd = build_runtime_command(&RuntimeKind.Crun, &"", &LifecycleAction.Delete(true), &cid, &bdir);
   if !check_arg(&del_cmd.args, 0, &"delete") {

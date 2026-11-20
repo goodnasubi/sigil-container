@@ -103,8 +103,48 @@ pub fn parse_runtime_kind(name: &String) -> Result<RuntimeKind, ContainerError>
   return Err(ContainerError.SpecValidation("未対応の OCI ランタイムです ('runc' または 'crun' を指定してください)。"));
 }
 
+fn int_to_str(val: Int) -> String
+  intent "整数を 10 進文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if val == 0 {
+    return "0";
+  }
+  let mut n = val;
+  let mut is_neg = false;
+  if n < 0 {
+    is_neg = true;
+    n = -n;
+  }
+  let mut digits = List.new();
+  while n > 0 {
+    digits.push(n % 10);
+    n = n / 10;
+  }
+  let mut buf = Bytes.new();
+  if is_neg {
+    buf.push(45);  // '-'
+  }
+  let mut i = digits.len();
+  while i > 0 {
+    i = i - 1;
+    match digits.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+  }
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
+
 fn append_signal_str(args: &mut List<String>, sig: Int)
-  intent "シグナル番号の文字列を引数リストに追加する"
+  intent "シグナル番号の文字列を引数リストに追加する。9 (KILL) と 15 (TERM) は名前文字列、その他は要求されたシグナル番号を文字列として保持する"
   requires none
   ensures none
   effects none
@@ -114,7 +154,7 @@ fn append_signal_str(args: &mut List<String>, sig: Int)
   } else if sig == 15 {
     args.push("TERM");
   } else {
-    args.push("KILL");
+    args.push(int_to_str(sig));
   }
 }
 
