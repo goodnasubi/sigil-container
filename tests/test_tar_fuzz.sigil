@@ -5,6 +5,7 @@ module tests.test_tar_fuzz
 use container.error.error_kind_name;
 use container.image_layout.extract_cstring;
 use container.image_layout.inspect_tar_header;
+use container.image_layout.parse_octal;
 use container.image_layout.validate_path;
 use container.image_layout.validate_tar_archive;
 
@@ -989,6 +990,115 @@ pub fn run_tar_fuzz_tests() -> Bool
       if error_kind_name(&e) != "LayerValidation" {
         return false;
       }
+    }
+  }
+
+  // 22. 回帰テスト (再レビュー指摘 1): 先頭 NUL の後に数字が続く malformed な 8 進数フィールドの拒否
+  // (1) parse_octal: 先頭 NUL + 0000001000 + NUL は Corrupt により拒否されること
+  let mut malformed_octal = Bytes.new();
+  malformed_octal.push(0);
+  malformed_octal.extend(&"0000001000".as_bytes());
+  malformed_octal.push(0);
+  match parse_octal(&malformed_octal, 0, malformed_octal.len()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (2) parse_octal: 通常の 0000001000 + NUL は 512 と読めること
+  let mut normal_octal = Bytes.new();
+  normal_octal.extend(&"0000001000".as_bytes());
+  normal_octal.push(0);
+  match parse_octal(&normal_octal, 0, normal_octal.len()) {
+    Ok(val) => {
+      if val != 512 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (3) parse_octal: 全 NUL フィールドは 0 になること
+  let mut all_null_octal = Bytes.new();
+  let mut ano_i = 0;
+  while ano_i < 12 {
+    all_null_octal.push(0);
+    ano_i = ano_i + 1;
+  }
+  match parse_octal(&all_null_octal, 0, all_null_octal.len()) {
+    Ok(val) => {
+      if val != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (4) 単体ヘッダ検査: size フィールドが NUL + 0000001000 + NUL のヘッダは inspect_tar_header で Corrupt により拒否されること
+  let mut malformed_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+  malformed_size_h.set(124, 0);
+  let ms_digits = "0000001000".as_bytes();
+  let mut msd_i = 0;
+  while msd_i < ms_digits.len() {
+    malformed_size_h.set(125 + msd_i, ms_digits.get(msd_i).unwrap_or(0));
+    msd_i = msd_i + 1;
+  }
+  malformed_size_h.set(135, 0);
+  match inspect_tar_header(&malformed_size_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (5) 単体ヘッダ検査: 通常の 0000001000 + NUL のヘッダは size 512 として受理されること
+  let mut normal_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+  let mut nsd_i = 0;
+  while nsd_i < ms_digits.len() {
+    normal_size_h.set(124 + nsd_i, ms_digits.get(nsd_i).unwrap_or(0));
+    nsd_i = nsd_i + 1;
+  }
+  normal_size_h.set(134, 0);
+  normal_size_h.set(135, 0);
+  match inspect_tar_header(&normal_size_h) {
+    Ok(entry) => {
+      if entry.size != 512 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (6) 単体ヘッダ検査: 全 NUL size フィールドのヘッダは size 0 として受理されること
+  let mut all_null_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+  let mut ansh_i = 0;
+  while ansh_i < 12 {
+    all_null_size_h.set(124 + ansh_i, 0);
+    ansh_i = ansh_i + 1;
+  }
+  match inspect_tar_header(&all_null_size_h) {
+    Ok(entry) => {
+      if entry.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
     }
   }
 

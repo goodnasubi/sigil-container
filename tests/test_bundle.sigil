@@ -261,5 +261,10 @@ pub fn run_bundle_tests() -> Bool
     }
   }
 
+  // 8. 回帰テスト (再レビュー指摘 2): CAP_NET_BIND_SERVICE を許可した spec の生成 JSON に ambient として同 capability が含まれること
+  if !bytes_contains(&json1.as_bytes(), &"\"ambient\":[\"CAP_NET_BIND_SERVICE\"]".as_bytes()) {
+    return false;
+  }
+
   return true;
 }

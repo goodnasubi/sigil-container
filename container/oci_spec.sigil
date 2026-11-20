@@ -200,7 +200,9 @@ pub fn generate_oci_config_json(spec: &ContainerSpec) -> Result<String, Containe
   }
   caps_buf.push(93);  // ']'
 
-  buf.extend(&"\"bounding\":".as_bytes());
+  buf.extend(&"\"ambient\":".as_bytes());
+  buf.extend(&caps_buf);
+  buf.extend(&",\"bounding\":".as_bytes());
   buf.extend(&caps_buf);
   buf.extend(&",\"effective\":".as_bytes());
   buf.extend(&caps_buf);

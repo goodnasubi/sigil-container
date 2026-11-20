@@ -33,15 +33,25 @@ pub fn parse_octal(bytes: &Bytes, start: Int, len: Int) -> Result<Int, Container
   let mut i = start;
   let end = start + len;
   let mut seen_digit = false;
+  let mut seen_null = false;
   let mut done = false;
 
   while i < end && !done {
     let b = bytes.get(i).unwrap_or(0);
-    if b == 0 || b == 32 {  // NULL または 空白
+    if b == 0 {
+      if seen_digit {
+        done = true;
+      } else {
+        seen_null = true;
+      }
+    } else if b == 32 {  // 空白
       if seen_digit {
         done = true;
       }
     } else if b >= 48 && b <= 55 {  // '0' .. '7'
+      if seen_null {
+        return Err(ContainerError.Corrupt("8進数フィールドの先頭 NUL の後に数字が含まれています。"));
+      }
       seen_digit = true;
       let digit = b - 48;
       val = val * 8 + digit;
