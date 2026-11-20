@@ -1,0 +1,389 @@
+module container.state
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use db.types.Value;
+use db.types.decode_row;
+use db.types.encode_key;
+use db.types.encode_row;
+
+// ADR 0053 決定 2・6: 状態の保存形式（P4 のデータベース上）
+// 配置の単位:「ノード」「ワークロード（望ましい状態の宣言）」「インスタンス（実行中のコンテナ）」
+// 望ましい状態と観測した状態を分けて保存する。
+// 整合性が要る更新は単一のトランザクションで行う。
+
+pub struct NodeRecord {
+  node_id: String,
+  status: String,  // "Ready", "NotReady"
+  total_memory_bytes: Int,
+  total_cpu_quota_us: Int,
+  total_pids: Int,
+}
+
+pub struct WorkloadRecord {
+  workload_id: String,
+  image_digest: String,
+  desired_replicas: Int,
+  version: Int,
+}
+
+pub struct InstanceRecord {
+  instance_id: String,
+  workload_id: String,
+  node_id: String,
+  status: String,  // "Creating", "Running", "Stopped", "Failed"
+  exit_code: Int,
+}
+
+pub fn new_node_record(node_id: String, status: String, total_memory_bytes: Int, total_cpu_quota_us: Int, total_pids: Int) -> NodeRecord
+  intent "NodeRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return NodeRecord { node_id: node_id, status: status, total_memory_bytes: total_memory_bytes, total_cpu_quota_us: total_cpu_quota_us, total_pids: total_pids };
+}
+
+pub fn new_workload_record(workload_id: String, image_digest: String, desired_replicas: Int, version: Int) -> WorkloadRecord
+  intent "WorkloadRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return WorkloadRecord { workload_id: workload_id, image_digest: image_digest, desired_replicas: desired_replicas, version: version };
+}
+
+pub fn new_instance_record(instance_id: String, workload_id: String, node_id: String, status: String, exit_code: Int) -> InstanceRecord
+  intent "InstanceRecord を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return InstanceRecord { instance_id: instance_id, workload_id: workload_id, node_id: node_id, status: status, exit_code: exit_code };
+}
+
+fn concat_str(prefix: &String, s: &String) -> String
+  intent "接頭辞と文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.extend(&prefix.as_bytes());
+  buf.extend(&s.as_bytes());
+  return match buf.to_string_utf8() {
+    Ok(res) => res,
+    Err(_) => "",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// NodeRecord の符号化と復号
+// ---------------------------------------------------------------------------
+
+pub fn encode_node_key(node_id: &String) -> Result<Bytes, ContainerError>
+  intent "Node のキー (prefix 'node:' + node_id) を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let k = Value.StrVal(concat_str(&"node:", &node_id));
+  return match encode_key(&k) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("ノードキーの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_node_record(node: &NodeRecord) -> Result<Bytes, ContainerError>
+  intent "NodeRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(node.node_id.clone()));
+  row.push(Value.StrVal(node.status.clone()));
+  row.push(Value.IntVal(node.total_memory_bytes));
+  row.push(Value.IntVal(node.total_cpu_quota_us));
+  row.push(Value.IntVal(node.total_pids));
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("ノードレコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn decode_node_record(bytes: &Bytes) -> Result<NodeRecord, ContainerError>
+  intent "P4 行形式バイト列から NodeRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("ノードレコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != 5 {
+    return Err(ContainerError.StateError("ノード行の列数が一致しません。"));
+  }
+
+  let mut node_id = "";
+  match row.get(0) {
+    Some(Value.StrVal(s)) => {
+      node_id = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("node_id の型不一致"));
+    }
+  }
+
+  let mut status = "";
+  match row.get(1) {
+    Some(Value.StrVal(s)) => {
+      status = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("status の型不一致"));
+    }
+  }
+
+  let mut mem = 0;
+  match row.get(2) {
+    Some(Value.IntVal(n)) => {
+      mem = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("total_memory の型不一致"));
+    }
+  }
+
+  let mut cpu = 0;
+  match row.get(3) {
+    Some(Value.IntVal(n)) => {
+      cpu = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("total_cpu の型不一致"));
+    }
+  }
+
+  let mut pids = 0;
+  match row.get(4) {
+    Some(Value.IntVal(n)) => {
+      pids = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("total_pids の型不一致"));
+    }
+  }
+
+  return Ok(NodeRecord { node_id: node_id, status: status, total_memory_bytes: mem, total_cpu_quota_us: cpu, total_pids: pids });
+}
+
+// ---------------------------------------------------------------------------
+// WorkloadRecord (望ましい状態: Desired State) の符号化と復号
+// ---------------------------------------------------------------------------
+
+pub fn encode_workload_key(workload_id: &String) -> Result<Bytes, ContainerError>
+  intent "Workload のキー (prefix 'workload:' + workload_id) を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let k = Value.StrVal(concat_str(&"workload:", &workload_id));
+  return match encode_key(&k) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("ワークロードキーの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_workload_record(workload: &WorkloadRecord) -> Result<Bytes, ContainerError>
+  intent "WorkloadRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(workload.workload_id.clone()));
+  row.push(Value.StrVal(workload.image_digest.clone()));
+  row.push(Value.IntVal(workload.desired_replicas));
+  row.push(Value.IntVal(workload.version));
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("ワークロードレコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn decode_workload_record(bytes: &Bytes) -> Result<WorkloadRecord, ContainerError>
+  intent "P4 行形式バイト列から WorkloadRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("ワークロードレコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != 4 {
+    return Err(ContainerError.StateError("ワークロード行の列数が一致しません。"));
+  }
+
+  let mut wid = "";
+  match row.get(0) {
+    Some(Value.StrVal(s)) => {
+      wid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("workload_id の型不一致"));
+    }
+  }
+
+  let mut digest = "";
+  match row.get(1) {
+    Some(Value.StrVal(s)) => {
+      digest = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("image_digest の型不一致"));
+    }
+  }
+
+  let mut replicas = 0;
+  match row.get(2) {
+    Some(Value.IntVal(n)) => {
+      replicas = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("desired_replicas の型不一致"));
+    }
+  }
+
+  let mut ver = 0;
+  match row.get(3) {
+    Some(Value.IntVal(n)) => {
+      ver = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("version の型不一致"));
+    }
+  }
+
+  return Ok(WorkloadRecord { workload_id: wid, image_digest: digest, desired_replicas: replicas, version: ver });
+}
+
+// ---------------------------------------------------------------------------
+// InstanceRecord (観測した状態: Observed State) の符号化と復号
+// ---------------------------------------------------------------------------
+
+pub fn encode_instance_key(instance_id: &String) -> Result<Bytes, ContainerError>
+  intent "Instance のキー (prefix 'instance:' + instance_id) を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let k = Value.StrVal(concat_str(&"instance:", &instance_id));
+  return match encode_key(&k) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("インスタンスキーの符号化に失敗しました。")),
+  };
+}
+
+pub fn encode_instance_record(inst: &InstanceRecord) -> Result<Bytes, ContainerError>
+  intent "InstanceRecord を P4 行形式に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.StrVal(inst.instance_id.clone()));
+  row.push(Value.StrVal(inst.workload_id.clone()));
+  row.push(Value.StrVal(inst.node_id.clone()));
+  row.push(Value.StrVal(inst.status.clone()));
+  row.push(Value.IntVal(inst.exit_code));
+  return match encode_row(&row) {
+    Ok(b) => Ok(b),
+    Err(_) => Err(ContainerError.StateError("インスタンスレコードの符号化に失敗しました。")),
+  };
+}
+
+pub fn decode_instance_record(bytes: &Bytes) -> Result<InstanceRecord, ContainerError>
+  intent "P4 行形式バイト列から InstanceRecord を復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  match decode_row(&bytes) {
+    Ok(r) => {
+      row = r;
+    }
+    Err(_) => {
+      return Err(ContainerError.StateError("インスタンスレコードの復号に失敗しました。"));
+    }
+  }
+  if row.len() != 5 {
+    return Err(ContainerError.StateError("インスタンス行の列数が一致しません。"));
+  }
+
+  let mut iid = "";
+  match row.get(0) {
+    Some(Value.StrVal(s)) => {
+      iid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("instance_id の型不一致"));
+    }
+  }
+
+  let mut wid = "";
+  match row.get(1) {
+    Some(Value.StrVal(s)) => {
+      wid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("workload_id の型不一致"));
+    }
+  }
+
+  let mut nid = "";
+  match row.get(2) {
+    Some(Value.StrVal(s)) => {
+      nid = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("node_id の型不一致"));
+    }
+  }
+
+  let mut status = "";
+  match row.get(3) {
+    Some(Value.StrVal(s)) => {
+      status = s.clone();
+    }
+    _ => {
+      return Err(ContainerError.StateError("status の型不一致"));
+    }
+  }
+
+  let mut code = 0;
+  match row.get(4) {
+    Some(Value.IntVal(n)) => {
+      code = n;
+    }
+    _ => {
+      return Err(ContainerError.StateError("exit_code の型不一致"));
+    }
+  }
+
+  return Ok(InstanceRecord { instance_id: iid, workload_id: wid, node_id: nid, status: status, exit_code: code });
+}

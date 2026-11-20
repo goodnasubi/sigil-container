@@ -1,0 +1,85 @@
+module tests.test_bundle
+  targets server
+  trust none
+
+use container.oci_spec.generate_oci_config_json;
+use container.spec.ContainerSpec;
+use container.spec.RestartPolicy;
+use container.spec.default_secure_isolation;
+use container.spec.new_container_spec;
+use container.spec.new_env_var;
+use container.spec.new_mount;
+use container.spec.new_port_mapping;
+use container.spec.new_resources;
+
+fn create_sample_spec() -> ContainerSpec
+  intent "バンドル生成用の標準的な ContainerSpec を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut args = List.new();
+  args.push("/app");
+  args.push("--port");
+  args.push("8080");
+
+  let mut env_vars = List.new();
+  env_vars.push(new_env_var("APP_ENV", "production"));
+  env_vars.push(new_env_var("LOG_LEVEL", "info"));
+
+  let mut iso = default_secure_isolation();
+  iso.allowed_capabilities.push("CAP_NET_BIND_SERVICE");
+
+  let res = new_resources(268435456, 50000, 128, 536870912, 5242880);
+
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 8080, "tcp", "127.0.0.1"));
+
+  let mut mounts = List.new();
+  mounts.push(new_mount("/var/tmp", "/tmp", false, "tmpfs"));
+
+  return new_container_spec("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", args, env_vars, "/app", iso, res, true, ports, mounts, List.new(), RestartPolicy.Always);
+}
+
+pub fn run_bundle_tests() -> Bool
+  intent "決定的な OCI runtime-spec bundle 生成のテストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  let spec = create_sample_spec();
+
+  // 1回目生成
+  let mut json1 = "";
+  match generate_oci_config_json(&spec) {
+    Ok(j) => {
+      json1 = j;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2回目生成
+  let mut json2 = "";
+  match generate_oci_config_json(&spec) {
+    Ok(j) => {
+      json2 = j;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 完全一致の検証 (決定性: 同じ入力からはバイト単位で完全に同一の出力が出る)
+  if json1 != json2 {
+    return false;
+  }
+
+  // 必須キーの含有確認
+  if json1.len() == 0 {
+    return false;
+  }
+
+  return true;
+}

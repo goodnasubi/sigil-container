@@ -1,0 +1,252 @@
+module tests.test_tar_fuzz
+  targets server
+  trust none
+
+use container.image_layout.inspect_tar_header;
+use container.image_layout.validate_path;
+use container.image_layout.validate_tar_archive;
+
+fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: Int, linkname: String) -> Bytes
+  intent "テスト用の 512 バイト Tar ヘッダを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let name_b = name.as_bytes();
+  let mut i = 0;
+  while i < 100 {
+    if i < name_b.len() {
+      bytes.push(name_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode ("0000644" + 0)
+  let mode_b = "0000644".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid ("0000000" + 0)
+  let uid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid ("0000000" + 0)
+  let gid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size (12 bytes, 8進数 ASCII + 空白)
+  let size_b = size_octal.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < size_b.len() {
+      bytes.push(size_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 136..148: mtime ("00000000000" + 0)
+  let mtime_b = "00000000000".as_bytes();
+  i = 0;
+  while i < 11 {
+    bytes.push(mtime_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum ("0000000" + 0)
+  let chk_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(chk_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname
+  let link_b = linkname.as_bytes();
+  i = 0;
+  while i < 100 {
+    if i < link_b.len() {
+      bytes.push(link_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 257..512: 残りをゼロ埋め
+  while bytes.len() < 512 {
+    bytes.push(0);
+  }
+
+  return bytes;
+}
+
+pub fn run_tar_fuzz_tests() -> Bool
+  intent "tar のパストラバーサル、リンク、特殊ファイル、展開爆弾等のファジング・境界値試験を行う"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 正常な通常ファイルのエントリ
+  let valid_h = create_tar_header_fixture("app/main", "00000001000 ", 48, "");  // 512 byte
+  match inspect_tar_header(&valid_h) {
+    Ok(e) => {
+      if e.path != "app/main" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 絶対パス (/etc/shadow) の拒否 (パストラバーサル防止)
+  let abs_h = create_tar_header_fixture("/etc/shadow", "00000000100 ", 48, "");
+  match inspect_tar_header(&abs_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 3. 上位参照 (..) の拒否 (../escape)
+  let dotdot_h = create_tar_header_fixture("../escape", "00000000100 ", 48, "");
+  match inspect_tar_header(&dotdot_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 4. パス途中の上位参照 (a/b/../../escape) の拒否
+  let mid_dotdot_h = create_tar_header_fixture("a/b/../../escape", "00000000100 ", 48, "");
+  match inspect_tar_header(&mid_dotdot_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 5. 特殊ファイル (Character device: '3' = 51) の拒否
+  let char_dev_h = create_tar_header_fixture("dev/null", "00000000000 ", 51, "");
+  match inspect_tar_header(&char_dev_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 6. 特殊ファイル (Block device: '4' = 52) の拒否
+  let blk_dev_h = create_tar_header_fixture("dev/sda", "00000000000 ", 52, "");
+  match inspect_tar_header(&blk_dev_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 7. 特殊ファイル (FIFO: '6' = 54) の拒否
+  let fifo_h = create_tar_header_fixture("tmp/fifo", "00000000000 ", 54, "");
+  match inspect_tar_header(&fifo_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 8. シンボリックリンク ('2' = 50) でリンク先が上位参照 (../target) の拒否
+  let sym_traversal_h = create_tar_header_fixture("link_file", "00000000000 ", 50, "../target");
+  match inspect_tar_header(&sym_traversal_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 9. シンボリックリンクでリンク先が絶対パス (/etc/passwd) の拒否
+  let sym_abs_h = create_tar_header_fixture("link_abs", "00000000000 ", 50, "/etc/passwd");
+  match inspect_tar_header(&sym_abs_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 10. 展開爆弾対策: 単一ファイルサイズ上限 (1 GiB) を超える宣言の拒否 (例: 20000000000 8進数 = 2 GiB)
+  let bomb_h = create_tar_header_fixture("huge_file", "20000000000 ", 48, "");
+  match inspect_tar_header(&bomb_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 11. ディレクトリ深さ超過 (> 16 階層) の拒否
+  let deep_path = "1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17";
+  match validate_path(&deep_path) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 12. 全ゼロブロック (終端) が typeflag 255 として正常に認識されること
+  let mut zero_b = Bytes.with_capacity(512);
+  let mut z_i = 0;
+  while z_i < 512 {
+    zero_b.push(0);
+    z_i = z_i + 1;
+  }
+  match inspect_tar_header(&zero_b) {
+    Ok(e) => {
+      if e.typeflag != 255 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 13. tar アーカイブ全体の検査
+  let mut archive = Bytes.new();
+  archive.extend(&valid_h);
+  archive.extend(&zero_b);
+  match validate_tar_archive(&archive) {
+    Ok(count) => {
+      if count != 1 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}

@@ -1,0 +1,174 @@
+module tests.test_spec
+  targets server
+  trust none
+
+use container.spec.ContainerSpec;
+use container.spec.RestartPolicy;
+use container.spec.default_secure_isolation;
+use container.spec.new_container_spec;
+use container.spec.new_env_var;
+use container.spec.new_mount;
+use container.spec.new_port_mapping;
+use container.spec.new_resources;
+use container.spec.validate_spec;
+
+fn create_valid_test_spec() -> ContainerSpec
+  intent "正常なテスト用 ContainerSpec を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut args = List.new();
+  args.push("/app");
+
+  let mut env_vars = List.new();
+  env_vars.push(new_env_var("APP_ENV", "production"));
+
+  let iso = default_secure_isolation();
+
+  let res = new_resources(536870912, 100000, 256, 1073741824, 10485760);
+
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 8080, "tcp", "127.0.0.1"));
+
+  let mut mounts = List.new();
+  mounts.push(new_mount("/var/data", "/app/data", true, "bind"));
+
+  return new_container_spec("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", args, env_vars, "/app", iso, res, true, ports, mounts, List.new(), RestartPolicy.Always);
+}
+
+pub fn run_spec_tests() -> Bool
+  intent "コンテナ仕様の型と検証、既定拒否の規則をテストする"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 正常な仕様の検証がパスすること
+  let spec = create_valid_test_spec();
+  match validate_spec(&spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 特権 (privileged) の拒否
+  let mut priv_spec = create_valid_test_spec();
+  priv_spec.isolation.privileged = true;
+  match validate_spec(&priv_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 3. host PID / IPC / UTS / Net namespace 共有の拒否
+  let mut pid_spec = create_valid_test_spec();
+  pid_spec.isolation.share_host_pid = true;
+  match validate_spec(&pid_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+  let mut net_spec = create_valid_test_spec();
+  net_spec.isolation.share_host_net = true;
+  match validate_spec(&net_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 4. root 実行 (uid 0) の拒否
+  let mut root_spec = create_valid_test_spec();
+  root_spec.isolation.uid = 0;
+  match validate_spec(&root_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 5. 危険な capability (CAP_SYS_ADMIN 等) の拒否
+  let mut cap_spec = create_valid_test_spec();
+  cap_spec.isolation.allowed_capabilities.push("CAP_SYS_ADMIN");
+  match validate_spec(&cap_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 6. rootfs 読み取り専用違反 (readonly_rootfs = false) の拒否
+  let mut rw_spec = create_valid_test_spec();
+  rw_spec.isolation.readonly_rootfs = false;
+  match validate_spec(&rw_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 7. 資源上限なし (メモリ 0 / 未指定) の拒否
+  let mut no_mem_spec = create_valid_test_spec();
+  no_mem_spec.resources.memory_max_bytes = 0;
+  match validate_spec(&no_mem_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 8. 資源上限なし (CPU 0) の拒否
+  let mut no_cpu_spec = create_valid_test_spec();
+  no_cpu_spec.resources.cpu_quota_us = 0;
+  match validate_spec(&no_cpu_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 9. 資源上限なし (pids 0) の拒否
+  let mut no_pids_spec = create_valid_test_spec();
+  no_pids_spec.resources.pids_max = 0;
+  match validate_spec(&no_pids_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 10. イメージ参照のタグのみ・不正 digest の拒否
+  let mut tag_spec = create_valid_test_spec();
+  tag_spec.image_digest = "sigil-app:latest";
+  match validate_spec(&tag_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 11. host マウント (/proc, /sys 等の既定露出) の拒否
+  let mut proc_spec = create_valid_test_spec();
+  proc_spec.mounts.push(new_mount("/proc", "/host_proc", true, "bind"));
+  match validate_spec(&proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 12. ポートの全方位公開 (0.0.0.0) の拒否
+  let mut pub_port_spec = create_valid_test_spec();
+  pub_port_spec.ports.push(new_port_mapping(9000, 9000, "tcp", "0.0.0.0"));
+  match validate_spec(&pub_port_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  return true;
+}

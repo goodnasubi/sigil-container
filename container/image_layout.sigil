@@ -1,0 +1,302 @@
+module container.image_layout
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_file_count;
+use container.limits.max_layer_size;
+use container.limits.max_path_depth;
+use container.limits.max_path_length;
+use container.limits.max_total_image_size;
+
+// ADR 0053 決定 1・3・6: OCI Image Layout の読み取りと層のパスの検査
+// 相対パス・上位参照・リンク・特殊ファイルを検査し、サイズ・個数・深さに上限を持つ。
+
+pub struct TarEntry {
+  path: String,
+  size: Int,
+  typeflag: Int,  // 0: file, 1: hardlink, 2: symlink, 5: dir
+  linkname: String,
+}
+
+// ---------------------------------------------------------------------------
+// 8進数 ASCII 文字列のパース
+// ---------------------------------------------------------------------------
+
+pub fn parse_octal(bytes: &Bytes, start: Int, len: Int) -> Result<Int, ContainerError>
+  intent "固定長バイト列内の 8 進数 ASCII 文字列をパースする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut val = 0;
+  let mut i = start;
+  let end = start + len;
+  let mut seen_digit = false;
+  let mut done = false;
+
+  while i < end && !done {
+    let b = bytes.get(i).unwrap_or(0);
+    if b == 0 || b == 32 {  // NULL または 空白
+      if seen_digit {
+        done = true;
+      }
+    } else if b >= 48 && b <= 55 {  // '0' .. '7'
+      seen_digit = true;
+      let digit = b - 48;
+      val = val * 8 + digit;
+      if val < 0 {
+        return Err(ContainerError.LimitExceeded("8進数フィールドのパースで整数オーバーフローが発生しました。"));
+      }
+    } else {
+      return Err(ContainerError.Corrupt("8進数フィールドに無効な文字が含まれています。"));
+    }
+    i = i + 1;
+  }
+  return Ok(val);
+}
+
+// ---------------------------------------------------------------------------
+// Null 終端文字列の抽出
+// ---------------------------------------------------------------------------
+
+pub fn extract_cstring(bytes: &Bytes, start: Int, max_len: Int) -> String
+  intent "バイト列から null 終端または最大長までの UTF-8 文字列を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut len = 0;
+  let mut found_null = false;
+  while len < max_len && !found_null {
+    let b = bytes.get(start + len).unwrap_or(0);
+    if b == 0 {
+      found_null = true;
+    } else {
+      len = len + 1;
+    }
+  }
+  if len == 0 {
+    return "";
+  }
+  let slice = bytes.slice(start, start + len).unwrap_or(Bytes.new());
+  return match slice.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// パスの安全性検査 (トラバーサル、上位参照、深さ、長さ)
+// ---------------------------------------------------------------------------
+
+pub fn validate_path(path: &String) -> Result<Bool, ContainerError>
+  intent "層内パスの相対性、上位参照 (..)、パス長、深さを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = path.as_bytes();
+  if bytes.len() == 0 {
+    return Err(ContainerError.LayerValidation("パスが空です。"));
+  }
+
+  // 1. パス長上限
+  if bytes.len() > max_path_length() {
+    return Err(ContainerError.LimitExceeded("パス長が上限 (256 byte) を超過しています。"));
+  }
+
+  // 2. 絶対パスの拒否 (先頭が '/')
+  if bytes.get(0).unwrap_or(0) == 47 {
+    return Err(ContainerError.LayerValidation("絶対パスは拒否されます (相対パス必須)。"));
+  }
+
+  // 3. 上位参照 (..) および深さの検査
+  let mut depth = 0;
+  let mut i = 0;
+  let mut segment_start = 0;
+
+  while i <= bytes.len() {
+    let mut is_delim = false;
+    if i == bytes.len() {
+      is_delim = true;
+    } else {
+      if bytes.get(i).unwrap_or(0) == 47 {
+        is_delim = true;
+      }
+    }
+
+    if is_delim {
+      let seg_len = i - segment_start;
+      if seg_len == 2 {
+        let c1 = bytes.get(segment_start).unwrap_or(0);
+        let c2 = bytes.get(segment_start + 1).unwrap_or(0);
+        if c1 == 46 && c2 == 46 {  // ".."
+          return Err(ContainerError.LayerValidation("パストラバーサル・上位参照 (..) は拒否されます。"));
+        }
+      }
+      if seg_len > 0 {
+        // 有効なセグメント（'.' は深さに加算しない）
+        if seg_len != 1 || bytes.get(segment_start).unwrap_or(0) != 46 {
+          depth = depth + 1;
+          if depth > max_path_depth() {
+            return Err(ContainerError.LimitExceeded("パスの階層深さが上限 (16) を超過しています。"));
+          }
+        }
+      }
+      segment_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// 単一 Tar ヘッダ (512 byte) の検査
+// ---------------------------------------------------------------------------
+
+pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
+  intent "512 バイトの Tar ヘッダを検査・パースし、安全な TarEntry を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if header.len() != 512 {
+    return Err(ContainerError.Corrupt("Tar ヘッダのサイズが 512 バイトではありません。"));
+  }
+
+  // 全ゼロブロックの判定 (終端マーカー)
+  let mut all_zero = true;
+  let mut z_i = 0;
+  while z_i < 512 {
+    if header.get(z_i).unwrap_or(0) != 0 {
+      all_zero = false;
+      z_i = 512;  // 早期脱出
+    } else {
+      z_i = z_i + 1;
+    }
+  }
+  if all_zero {
+    return Ok(TarEntry { path: "", size: 0, typeflag: 255, linkname: "" });
+    // 終端マーカー
+  }
+
+  // 1. ファイル名抽出 (0..100) と prefix (345..500)
+  let name_part = extract_cstring(&header, 0, 100);
+  let prefix_part = extract_cstring(&header, 345, 155);
+  let mut full_path = name_part.clone();
+  if prefix_part.len() > 0 {
+    let mut p_buf = Bytes.new();
+    p_buf.extend(&prefix_part.as_bytes());
+    p_buf.push(47);  // '/'
+    p_buf.extend(&name_part.as_bytes());
+    full_path = match p_buf.to_string_utf8() {
+      Ok(s) => s,
+      Err(_) => "",
+    };
+  }
+
+  // パスの安全性検査
+  match validate_path(&full_path) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 2. typeflag (156)
+  let typeflag = header.get(156).unwrap_or(48);  // '0' = 48
+  // 危険な特殊ファイルの拒否:
+  // '3': Character device
+  // '4': Block device
+  // '6': FIFO
+  if typeflag == 51 || typeflag == 52 || typeflag == 54 {
+    return Err(ContainerError.LayerValidation("デバイスノードまたは FIFO 等の特殊ファイルは拒否されます。"));
+  }
+
+  // 3. サイズ (124..136)
+  let mut size = 0;
+  match parse_octal(&header, 124, 12) {
+    Ok(s) => {
+      size = s;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 展開爆弾対策: 単一ファイルサイズの上限検査
+  if size > max_layer_size() {
+    return Err(ContainerError.LimitExceeded("ファイルサイズが層の最大容量 (1 GiB) を超過しています (展開爆弾拒否)。"));
+  }
+
+  // 4. linkname (157..257) - シンボリックリンク / ハードリンク
+  let mut linkname = "";
+  if typeflag == 49 || typeflag == 50 {  // '1' (hardlink) または '2' (symlink)
+    linkname = extract_cstring(&header, 157, 100);
+    // リンク先のトラバーサル検査: 絶対パスまたは上位参照 .. の拒否
+    match validate_path(&linkname) {
+      Ok(_) => {}
+      Err(_) => {
+        return Err(ContainerError.LayerValidation("リンク先が無効または上位参照を含んでいます。"));
+      }
+    }
+  }
+
+  return Ok(TarEntry { path: full_path, size: size, typeflag: typeflag, linkname: linkname });
+}
+
+// ---------------------------------------------------------------------------
+// 層全体の検査 (非圧縮 tar ストリームのシミュレーション検査)
+// ---------------------------------------------------------------------------
+
+pub fn validate_tar_archive(tar_bytes: &Bytes) -> Result<Int, ContainerError>
+  intent "非圧縮 tar アーカイブ全体を安全に検査し、総エントリ数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if tar_bytes.len() > max_layer_size() {
+    return Err(ContainerError.LimitExceeded("層のサイズが最大容量 (1 GiB) を超過しています。"));
+  }
+
+  let mut offset = 0;
+  let mut entry_count = 0;
+  let mut total_unpacked_size = 0;
+  let mut reached_end = false;
+
+  while offset + 512 <= tar_bytes.len() && !reached_end {
+    let header_slice = tar_bytes.slice(offset, offset + 512).unwrap_or(Bytes.new());
+    let mut entry = TarEntry { path: "", size: 0, typeflag: 0, linkname: "" };
+    match inspect_tar_header(&header_slice) {
+      Ok(e) => {
+        entry = e;
+      }
+      Err(err) => {
+        return Err(err);
+      }
+    }
+
+    if entry.typeflag == 255 {
+      // 終端マーカー
+      reached_end = true;
+    } else {
+      entry_count = entry_count + 1;
+      if entry_count > max_file_count() {
+        return Err(ContainerError.LimitExceeded("層内のファイル数が上限 (100,000) を超過しています。"));
+      }
+
+      total_unpacked_size = total_unpacked_size + entry.size;
+      if total_unpacked_size > max_total_image_size() {
+        return Err(ContainerError.LimitExceeded("層の展開合計サイズが上限 (4 GiB) を超過しています (展開爆弾拒否)。"));
+      }
+
+      // 512 バイトブロック境界へ切り上げ
+      let content_blocks = (entry.size + 511) / 512;
+      offset = offset + 512 + content_blocks * 512;
+    }
+  }
+
+  return Ok(entry_count);
+}
