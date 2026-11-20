@@ -12,8 +12,8 @@ use container.state.decode_rootfs_record;
 use container.state.encode_rootfs_key;
 use container.state.encode_rootfs_record;
 
-fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typeflag_byte: Int, uid: Int, gid: Int) -> Bytes
-  intent "テスト用の 512 バイト USTAR ヘッダを構築する"
+fn create_tar_header_raw_for_test(name: &String, size: Int, mode_str: &String, typeflag_byte: Int, uid_str: &String, gid_str: &String) -> Bytes
+  intent "テスト用の 512 バイト USTAR ヘッダを任意の UID/GID 文字列で構築する"
   requires none
   ensures none
   effects none
@@ -41,11 +41,7 @@ fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typef
   }
   bytes.push(0);
 
-  // 108..116: uid (e.g. 65532 -> "0177774")
-  let mut uid_str = "0177774";
-  if uid == 0 {
-    uid_str = "0000000";
-  }
+  // 108..116: uid (7文字 + NUL)
   let uid_b = uid_str.as_bytes();
   i = 0;
   while i < 7 {
@@ -54,11 +50,7 @@ fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typef
   }
   bytes.push(0);
 
-  // 116..124: gid
-  let mut gid_str = "0177774";
-  if gid == 0 {
-    gid_str = "0000000";
-  }
+  // 116..124: gid (7文字 + NUL)
   let gid_b = gid_str.as_bytes();
   i = 0;
   while i < 7 {
@@ -163,6 +155,23 @@ fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typef
   }
 
   return final_bytes;
+}
+
+fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typeflag_byte: Int, uid: Int, gid: Int) -> Bytes
+  intent "テスト用の 512 バイト USTAR ヘッダを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut uid_str = "0177774";
+  if uid == 0 {
+    uid_str = "0000000";
+  }
+  let mut gid_str = "0177774";
+  if gid == 0 {
+    gid_str = "0000000";
+  }
+  return create_tar_header_raw_for_test(&name, size, &mode_str, typeflag_byte, &uid_str, &gid_str);
 }
 
 fn append_null_blocks(buf: &mut Bytes, count: Int)
@@ -805,6 +814,109 @@ pub fn run_rootfs_tests() -> Bool
       if error_kind_name(&e) != "LayerValidation" {
         return false;
       }
+    }
+  }
+
+  // 13. UID／GID 8進数パースおよびエラー伝播テスト (Codex P2 指摘修正)
+  // (a) 不正な 8 進数「0000008」の UID を持つ層が拒否されること (Corrupt)
+  let bad_uid_hdr = create_tar_header_raw_for_test(&app_name, 120, &"0000555", 48, &"0000008", &"0000000");
+  let mut bad_uid_tar = Bytes.new();
+  bad_uid_tar.extend(&bad_uid_hdr);
+  bad_uid_tar.extend(&valid_elf);
+  i = valid_elf.len();
+  while i < 512 {
+    bad_uid_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut bad_uid_tar, 2);
+  match unpack_layer_archive(&bad_uid_tar, &dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (b) 不正な 8 進数「0000008」の GID を持つ層が拒否されること (Corrupt)
+  let bad_gid_hdr = create_tar_header_raw_for_test(&app_name, 120, &"0000555", 48, &"0000000", &"0000008");
+  let mut bad_gid_tar = Bytes.new();
+  bad_gid_tar.extend(&bad_gid_hdr);
+  bad_gid_tar.extend(&valid_elf);
+  i = valid_elf.len();
+  while i < 512 {
+    bad_gid_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut bad_gid_tar, 2);
+  match unpack_layer_archive(&bad_gid_tar, &dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (c) 正しい 8 進数の 0 (UID=0, GID=0) が正しくパースされること
+  let zero_id_hdr = create_tar_header_raw_for_test(&app_name, 120, &"0000555", 48, &"0000000", &"0000000");
+  let mut zero_id_tar = Bytes.new();
+  zero_id_tar.extend(&zero_id_hdr);
+  zero_id_tar.extend(&valid_elf);
+  i = valid_elf.len();
+  while i < 512 {
+    zero_id_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut zero_id_tar, 2);
+  match unpack_layer_archive(&zero_id_tar, &dest) {
+    Ok(m) => {
+      match m.entries.get(0) {
+        Some(entry) => {
+          if entry.uid != 0 || entry.gid != 0 {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (d) 正しい 8 進数の 0 以外の値 (UID=65532 "0177774", GID=512 "0001000") が正しくパースされること
+  let nonzero_id_hdr = create_tar_header_raw_for_test(&app_name, 120, &"0000555", 48, &"0177774", &"0001000");
+  let mut nonzero_id_tar = Bytes.new();
+  nonzero_id_tar.extend(&nonzero_id_hdr);
+  nonzero_id_tar.extend(&valid_elf);
+  i = valid_elf.len();
+  while i < 512 {
+    nonzero_id_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut nonzero_id_tar, 2);
+  match unpack_layer_archive(&nonzero_id_tar, &dest) {
+    Ok(m) => {
+      match m.entries.get(0) {
+        Some(entry) => {
+          if entry.uid != 65532 || entry.gid != 512 {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
     }
   }
 

@@ -251,8 +251,24 @@ pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Res
 
           // mode (100..108), uid (108..116), gid (116..124) のパース
           let mode = parse_octal(&header, 100, 8).unwrap_or(0);
-          let uid = parse_octal(&header, 108, 8).unwrap_or(0);
-          let gid = parse_octal(&header, 116, 8).unwrap_or(0);
+          let mut uid = 0;
+          match parse_octal(&header, 108, 8) {
+            Ok(v) => {
+              uid = v;
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+          let mut gid = 0;
+          match parse_octal(&header, 116, 8) {
+            Ok(v) => {
+              gid = v;
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
 
           // 上限検査
           file_count = file_count + 1;
