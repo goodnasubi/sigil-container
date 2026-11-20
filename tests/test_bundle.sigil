@@ -2,6 +2,7 @@ module tests.test_bundle
   targets server
   trust none
 
+use container.error.error_kind_name;
 use container.oci_spec.append_raw_escaped;
 use container.oci_spec.generate_oci_config_json;
 use container.spec.ContainerSpec;
@@ -190,13 +191,22 @@ pub fn run_bundle_tests() -> Bool
     }
   }
 
-  // 5. 回帰テスト (指摘 1): 既定 seccomp 許可リストに arch_prctl が含まれること (x86-64 glibc TLS 初期化用)
+  // 5. 回帰テスト (指摘 1): 既定 seccomp 許可リストに arch_prctl, clone, clone3, rseq が含まれること (x86-64 glibc TLS 初期化およびスレッド作成用)
   // [実行スモークテストの検討に関する注記]
   // Sigil コンパイラおよび評価器は現在、pure モード (effects none / trust none / targets server) で動作しており、
   // 外部プロセス起動 (fork/exec) や Linux seccomp フィルタの直接適用 (prctl/seccomp システムコール) を行う
-  // 実行機能を持たないため、Sigil 内での実行スモークテスト (例: 許可リスト適用下で /bin/true が成功すること) は
-  // 不可能である。したがって、生成される OCI config JSON に arch_prctl が含まれることの JSON presence テストで代用する。
+  // 実行機能を持たないため、Sigil 内での実際のフィルター下でのマルチスレッド実行ファイル検証は
+  // 不可能である。したがって、生成される OCI config JSON に arch_prctl, clone, clone3, rseq が含まれることの JSON presence テストで代用する。
   if !bytes_contains(&json1.as_bytes(), &"\"arch_prctl\"".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"clone\"".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"clone3\"".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"rseq\"".as_bytes()) {
     return false;
   }
 
@@ -225,6 +235,29 @@ pub fn run_bundle_tests() -> Bool
     }
     Err(_) => {
       return false;
+    }
+  }
+
+  // 7. 回帰テスト (指摘 2): 仕様サイズ上限超過時に generate_oci_config_json も LimitExceeded で拒否されること
+  let mut over_limit_spec = create_sample_spec();
+  let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";  // 64 bytes
+  let mut large_buf = Bytes.new();
+  while large_buf.len() < 66000 {
+    large_buf.extend(&chunk.as_bytes());
+  }
+  let large_str = match large_buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+  over_limit_spec.args.push(large_str);
+  match generate_oci_config_json(&over_limit_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
     }
   }
 

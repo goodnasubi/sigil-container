@@ -2,8 +2,11 @@ module tests.test_spec
   targets server
   trust none
 
+use container.error.error_kind_name;
+use container.limits.max_spec_size;
 use container.spec.ContainerSpec;
 use container.spec.RestartPolicy;
+use container.spec.calculate_spec_size;
 use container.spec.default_secure_isolation;
 use container.spec.new_container_spec;
 use container.spec.new_env_var;
@@ -11,6 +14,28 @@ use container.spec.new_mount;
 use container.spec.new_port_mapping;
 use container.spec.new_resources;
 use container.spec.validate_spec;
+
+fn make_repeated_string(len: Int) -> String
+  intent "指定された長さの繰り返し文字列を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";  // 64 bytes
+  let mut buf = Bytes.new();
+  while buf.len() + 64 <= len {
+    buf.extend(&chunk.as_bytes());
+  }
+  let rem = len - buf.len();
+  if rem > 0 {
+    let rem_slice = chunk.as_bytes().slice(0, rem).unwrap_or(Bytes.new());
+    buf.extend(&rem_slice);
+  }
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
 
 fn create_valid_test_spec() -> ContainerSpec
   intent "正常なテスト用 ContainerSpec を生成する"
@@ -254,6 +279,92 @@ pub fn run_spec_tests() -> Bool
     Ok(_) => {}
     Err(_) => {
       return false;
+    }
+  }
+
+  // 15a. 回帰テスト (指摘 2): 単一の引数が 64 KiB (65536 byte) を超える仕様の拒否
+  let mut large_arg_spec = create_valid_test_spec();
+  large_arg_spec.args.push(make_repeated_string(65537));
+  match validate_spec(&large_arg_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 15b. 回帰テスト (指摘 2): 単一の環境変数値が 64 KiB を超える仕様の拒否
+  let mut large_env_spec = create_valid_test_spec();
+  large_env_spec.env_vars.push(new_env_var("TEST_LARGE_ENV", make_repeated_string(65537)));
+  match validate_spec(&large_env_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 15c. 回帰テスト (指摘 2): 多数の引数の累積が 64 KiB を超える仕様の拒否
+  let mut many_args_spec = create_valid_test_spec();
+  let arg_chunk = make_repeated_string(1000);
+  let mut arg_c = 0;
+  while arg_c < 70 {
+    many_args_spec.args.push(arg_chunk.clone());
+    arg_c = arg_c + 1;
+  }
+  match validate_spec(&many_args_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 15d. 回帰テスト (指摘 2): 境界値検証 (累積サイズがちょうど 65536 byte は通過し、65537 byte は拒否)
+  let mut boundary_spec = create_valid_test_spec();
+  boundary_spec.args = List.new();
+  boundary_spec.env_vars = List.new();
+  boundary_spec.ports = List.new();
+  boundary_spec.mounts = List.new();
+  let base_size = calculate_spec_size(&boundary_spec);
+  let exact_arg_len = max_spec_size() - base_size;
+  boundary_spec.args.push(make_repeated_string(exact_arg_len));
+  if calculate_spec_size(&boundary_spec) != 65536 {
+    return false;
+  }
+  match validate_spec(&boundary_spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut over_boundary_spec = create_valid_test_spec();
+  over_boundary_spec.args = List.new();
+  over_boundary_spec.env_vars = List.new();
+  over_boundary_spec.ports = List.new();
+  over_boundary_spec.mounts = List.new();
+  over_boundary_spec.args.push(make_repeated_string(exact_arg_len + 1));
+  if calculate_spec_size(&over_boundary_spec) != 65537 {
+    return false;
+  }
+  match validate_spec(&over_boundary_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
     }
   }
 
