@@ -5,6 +5,7 @@ module container.rootfs
 use container.error.ContainerError;
 use container.image_layout.inspect_tar_header;
 use container.image_layout.parse_octal;
+use container.image_layout.validate_path;
 use container.limits.default_non_root_gid;
 use container.limits.default_non_root_uid;
 use container.limits.max_file_count;
@@ -24,6 +25,7 @@ pub struct RootfsEntry {
   uid: Int,
   gid: Int,
   is_dir: Bool,
+  payload: Bytes,
 }
 
 pub struct RootfsManifest {
@@ -33,13 +35,13 @@ pub struct RootfsManifest {
   file_count: Int,
 }
 
-pub fn new_rootfs_entry(path: String, size: Int, mode: Int, uid: Int, gid: Int, is_dir: Bool) -> RootfsEntry
+pub fn new_rootfs_entry(path: String, size: Int, mode: Int, uid: Int, gid: Int, is_dir: Bool, payload: Bytes) -> RootfsEntry
   intent "RootfsEntry を構築する"
   requires none
   ensures none
   effects none
 {
-  return RootfsEntry { path: path, size: size, mode: mode, uid: uid, gid: gid, is_dir: is_dir };
+  return RootfsEntry { path: path, size: size, mode: mode, uid: uid, gid: gid, is_dir: is_dir, payload: payload };
 }
 
 pub fn new_rootfs_manifest(destination_path: String, entries: List<RootfsEntry>, total_bytes: Int, file_count: Int) -> RootfsManifest
@@ -49,6 +51,135 @@ pub fn new_rootfs_manifest(destination_path: String, entries: List<RootfsEntry>,
   effects none
 {
   return RootfsManifest { destination_path: destination_path, entries: entries, total_bytes: total_bytes, file_count: file_count };
+}
+
+fn read_u16(bytes: &Bytes, offset: Int, is_le: Bool) -> Int
+  intent "バイト列から 16 ビット整数を読み出す"
+  requires none
+  ensures none
+  effects none
+{
+  let b0 = bytes.get(offset).unwrap_or(0);
+  let b1 = bytes.get(offset + 1).unwrap_or(0);
+  if is_le {
+    return b0 + b1 * 256;
+  } else {
+    return b0 * 256 + b1;
+  }
+}
+
+fn read_u32(bytes: &Bytes, offset: Int, is_le: Bool) -> Int
+  intent "バイト列から 32 ビット整数を読み出す"
+  requires none
+  ensures none
+  effects none
+{
+  let b0 = bytes.get(offset).unwrap_or(0);
+  let b1 = bytes.get(offset + 1).unwrap_or(0);
+  let b2 = bytes.get(offset + 2).unwrap_or(0);
+  let b3 = bytes.get(offset + 3).unwrap_or(0);
+  if is_le {
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+  } else {
+    return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
+  }
+}
+
+fn validate_elf_payload(payload: &Bytes) -> Result<Bool, ContainerError>
+  intent "ELF ペイロードを検査し、静的実行可能バイナリ (ET_EXEC) であるかを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. payload 長 64 バイト以上
+  if payload.len() < 64 {
+    return Err(ContainerError.LayerValidation("/app のサイズが 64 バイト未満です (有効な ELF ヘッダではありません)。"));
+  }
+
+  // 2. ELF magic (0x7f, 'E', 'L', 'F')
+  let m0 = payload.get(0).unwrap_or(0);
+  let m1 = payload.get(1).unwrap_or(0);
+  let m2 = payload.get(2).unwrap_or(0);
+  let m3 = payload.get(3).unwrap_or(0);
+  if m0 != 127 || m1 != 69 || m2 != 76 || m3 != 70 {
+    return Err(ContainerError.LayerValidation("/app の ELF マジックヘッダが無効です。"));
+  }
+
+  // 3. EI_CLASS が 1 または 2
+  let ei_class = payload.get(4).unwrap_or(0);
+  if ei_class != 1 && ei_class != 2 {
+    return Err(ContainerError.LayerValidation("/app の ELF クラスが無効です (32-bit または 64-bit 必須)。"));
+  }
+
+  // エンディアン (EI_DATA): 1 (LSB) または 2 (MSB)
+  let ei_data = payload.get(5).unwrap_or(0);
+  if ei_data != 1 && ei_data != 2 {
+    return Err(ContainerError.LayerValidation("/app の ELF エンディアンが無効です。"));
+  }
+  let is_le = ei_data == 1;
+
+  // 4. e_type == 2 (ET_EXEC) のみ許可し ET_DYN (3) は拒否
+  let e_type = read_u16(&payload, 16, is_le);
+  if e_type != 2 {
+    return Err(ContainerError.LayerValidation("/app が静的実行ファイル (ET_EXEC) ではありません。ET_DYN や再配置可能ファイルは拒否されます。"));
+  }
+
+  // 5. ELF64（e_phoff 32、e_phentsize 54、e_phnum 56）と ELF32（e_phoff 28、e_phentsize 42、e_phnum 44）
+  let mut phoff = 0;
+  let mut phentsize = 0;
+  let mut phnum = 0;
+
+  if ei_class == 2 {
+    let mut hi_offset = 32;
+    let mut lo_offset = 36;
+    if is_le {
+      hi_offset = 36;
+      lo_offset = 32;
+    }
+    let hi = read_u32(&payload, hi_offset, is_le);
+    if hi != 0 {
+      return Err(ContainerError.LayerValidation("/app のプログラムヘッダオフセットが有効範囲を超過しています。"));
+    }
+    phoff = read_u32(&payload, lo_offset, is_le);
+    phentsize = read_u16(&payload, 54, is_le);
+    phnum = read_u16(&payload, 56, is_le);
+    if phentsize < 56 {
+      return Err(ContainerError.LayerValidation("/app のプログラムヘッダエントリサイズが ELF64 規定未満です。"));
+    }
+  } else {
+    phoff = read_u32(&payload, 28, is_le);
+    phentsize = read_u16(&payload, 42, is_le);
+    phnum = read_u16(&payload, 44, is_le);
+    if phentsize < 32 {
+      return Err(ContainerError.LayerValidation("/app のプログラムヘッダエントリサイズが ELF32 規定未満です。"));
+    }
+  }
+
+  if phoff < 0 || phentsize < 0 || phnum < 0 {
+    return Err(ContainerError.LayerValidation("/app のプログラムヘッダパラメータが無効です。"));
+  }
+
+  // プログラムヘッダの範囲が payload を超える場合は拒否
+  let ph_table_end = phoff + phnum * phentsize;
+  if ph_table_end > payload.len() {
+    return Err(ContainerError.LayerValidation("/app のプログラムヘッダ範囲がペイロード末尾を超過しています。"));
+  }
+
+  // プログラムヘッダを走査して PT_DYNAMIC (2) / PT_INTERP (3) があれば拒否
+  let mut i = 0;
+  while i < phnum {
+    let ph_entry_offset = phoff + i * phentsize;
+    let p_type = read_u32(&payload, ph_entry_offset, is_le);
+    if p_type == 2 {
+      return Err(ContainerError.LayerValidation("/app に PT_DYNAMIC が含まれています (静的バイナリではありません)。"));
+    }
+    if p_type == 3 {
+      return Err(ContainerError.LayerValidation("/app に PT_INTERP が含まれています (動的リンクバイナリは拒否されます)。"));
+    }
+    i = i + 1;
+  }
+
+  return Ok(true);
 }
 
 fn is_null_block(bytes: &Bytes, offset: Int) -> Bool
@@ -74,6 +205,10 @@ pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Res
   ensures none
   effects none
 {
+  if destination_path.len() == 0 {
+    return Err(ContainerError.LayerValidation("展開先パス (destination_path) が空です。"));
+  }
+
   let total_len = tar_bytes.len();
   if total_len % 512 != 0 {
     return Err(ContainerError.Corrupt("Tar アーカイブのサイズが 512 バイト境界に揃っていません。"));
@@ -102,6 +237,18 @@ pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Res
       let header = tar_bytes.slice(offset, offset + 512).unwrap_or(Bytes.new());
       match inspect_tar_header(&header) {
         Ok(tar_entry) => {
+          // エントリパスが destination 配下に収まること (../ や絶対パスを拒否)
+          match validate_path(&tar_entry.path) {
+            Ok(_) => {}
+            Err(err) => {
+              return Err(err);
+            }
+          }
+          let p_bytes = tar_entry.path.as_bytes();
+          if p_bytes.len() == 0 || p_bytes.get(0).unwrap_or(0) == 47 {
+            return Err(ContainerError.LayerValidation("エントリパスが不正または絶対パスです。"));
+          }
+
           // mode (100..108), uid (108..116), gid (116..124) のパース
           let mode = parse_octal(&header, 100, 8).unwrap_or(0);
           let uid = parse_octal(&header, 108, 8).unwrap_or(0);
@@ -126,15 +273,24 @@ pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Res
             return Err(ContainerError.LayerValidation("ADR 0035 仕様外のリンクまたは特殊ファイルエントリです。"));
           }
 
-          let rootfs_entry = RootfsEntry { path: tar_entry.path, size: tar_entry.size, mode: mode, uid: uid, gid: gid, is_dir: is_dir };
-          entries.push(rootfs_entry);
-
-          // ヘッダ 512 バイト + ペイロード (512 バイト切り上げ)
-          let payload_blocks = (tar_entry.size + 511) / 512 * 512;
-          offset = offset + 512 + payload_blocks;
-          if offset > total_len {
+          // 境界検査: offset+512+size がアーカイブ末尾を超えたら Corrupt で拒否、ペイロード切り上げパディングも境界内に収まること。
+          let payload_end = offset + 512 + tar_entry.size;
+          if payload_end > total_len {
             return Err(ContainerError.Corrupt("Tar エントリのペイロードがアーカイブ末尾を超過しています。"));
           }
+
+          let payload_blocks = (tar_entry.size + 511) / 512 * 512;
+          let next_offset = offset + 512 + payload_blocks;
+          if next_offset > total_len {
+            return Err(ContainerError.Corrupt("Tar エントリのペイロードパディングがアーカイブ末尾を超過しています。"));
+          }
+
+          let payload = tar_bytes.slice(offset + 512, payload_end).unwrap_or(Bytes.new());
+
+          let rootfs_entry = RootfsEntry { path: tar_entry.path, size: tar_entry.size, mode: mode, uid: uid, gid: gid, is_dir: is_dir, payload: payload };
+          entries.push(rootfs_entry);
+
+          offset = next_offset;
         }
         Err(err) => {
           return Err(err);
@@ -174,6 +330,13 @@ pub fn validate_adr0035_rootfs(manifest: &RootfsManifest) -> Result<Bool, Contai
           }
           if entry.gid != 0 && entry.gid != default_non_root_gid() {
             return Err(ContainerError.LayerValidation("/app の GID が ADR 0035 規定値 (0 または 65532) に一致しません。"));
+          }
+          // 実際のペイロードを検査し、無効・非静的な実行ファイルを拒否
+          match validate_elf_payload(&entry.payload) {
+            Ok(_) => {}
+            Err(err) => {
+              return Err(err);
+            }
           }
           found_app = true;
         }

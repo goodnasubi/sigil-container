@@ -76,7 +76,7 @@ fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typef
   s_buf.push(48);
   s_buf.push(48);
   s_buf.push(48);
-  s_buf.push(48);
+  s_buf.push(48 + size / 512 % 8);
   s_buf.push(48 + size / 64 % 8);
   s_buf.push(48 + size / 8 % 8);
   s_buf.push(48 + size % 8);
@@ -181,6 +181,142 @@ fn append_null_blocks(buf: &mut Bytes, count: Int)
   }
 }
 
+fn bytes_equal(a: &Bytes, b: &Bytes) -> Bool
+  intent "2つのバイト列がバイト単位で完全に一致するかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn create_test_elf_payload(e_type: Int, ph_type: Int) -> Bytes
+  intent "テスト用の最小 ELF64 ペイロード (ヘッダ 64 バイト + プログラムヘッダ 56 バイト) を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut elf = Bytes.with_capacity(120);
+
+  // 0..4: magic (\x7fELF)
+  elf.push(127);
+  elf.push(69);
+  elf.push(76);
+  elf.push(70);
+
+  // 4: EI_CLASS (2 = ELF64)
+  elf.push(2);
+  // 5: EI_DATA (1 = 2's complement, little endian)
+  elf.push(1);
+  // 6: EI_VERSION (1 = current)
+  elf.push(1);
+  // 7..16: padding
+  let mut i = 7;
+  while i < 16 {
+    elf.push(0);
+    i = i + 1;
+  }
+
+  // 16..18: e_type (uint16: 2 = ET_EXEC, 3 = ET_DYN)
+  elf.push(e_type % 256);
+  elf.push(e_type / 256 % 256);
+
+  // 18..20: e_machine (uint16: 0x3e = x86_64 = 62)
+  elf.push(62);
+  elf.push(0);
+
+  // 20..24: e_version (uint32: 1)
+  elf.push(1);
+  elf.push(0);
+  elf.push(0);
+  elf.push(0);
+
+  // 24..32: e_entry (uint64: 0)
+  i = 0;
+  while i < 8 {
+    elf.push(0);
+    i = i + 1;
+  }
+
+  // 32..40: e_phoff (uint64: 64)
+  elf.push(64);
+  i = 1;
+  while i < 8 {
+    elf.push(0);
+    i = i + 1;
+  }
+
+  // 40..48: e_shoff (uint64: 0)
+  i = 0;
+  while i < 8 {
+    elf.push(0);
+    i = i + 1;
+  }
+
+  // 48..52: e_flags (uint32: 0)
+  i = 0;
+  while i < 4 {
+    elf.push(0);
+    i = i + 1;
+  }
+
+  // 52..54: e_ehsize (uint16: 64)
+  elf.push(64);
+  elf.push(0);
+
+  // 54..56: e_phentsize (uint16: 56)
+  elf.push(56);
+  elf.push(0);
+
+  // 56..58: e_phnum (uint16: 1)
+  elf.push(1);
+  elf.push(0);
+
+  // 58..60: e_shentsize (uint16: 64)
+  elf.push(64);
+  elf.push(0);
+
+  // 60..62: e_shnum (uint16: 0)
+  elf.push(0);
+  elf.push(0);
+
+  // 62..64: e_shstrndx (uint16: 0)
+  elf.push(0);
+  elf.push(0);
+
+  // --- Program Header (offset 64..120, size 56) ---
+  // 64..68: p_type (uint32: ph_type, 1 = PT_LOAD, 2 = PT_DYNAMIC, 3 = PT_INTERP)
+  elf.push(ph_type % 256);
+  elf.push(ph_type / 256 % 256);
+  elf.push(0);
+  elf.push(0);
+
+  // 68..72: p_flags (uint32: 5 = PF_R | PF_X)
+  elf.push(5);
+  elf.push(0);
+  elf.push(0);
+  elf.push(0);
+
+  // 72..120: p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align (all 0)
+  i = 72;
+  while i < 120 {
+    elf.push(0);
+    i = i + 1;
+  }
+
+  return elf;
+}
+
 pub fn run_rootfs_tests() -> Bool
   intent "rootfs 展開、ADR 0035 検証、状態保存のテストを実行する"
   requires none
@@ -188,18 +324,16 @@ pub fn run_rootfs_tests() -> Bool
   effects none
 {
   // 1. ADR 0035 の正常イメージアーカイブの構築と展開
-  // 単一層、静的 ELF app (16 バイト, mode 0555, user 65532:65532)
+  // 単一層、静的 ELF app (120 バイト, mode 0555, user 65532:65532)
+  let valid_elf = create_test_elf_payload(2, 1);
   let app_name = "app";
-  let app_hdr = create_tar_header_for_test(&app_name, 16, &"0000555", 48, 65532, 65532);
+  let app_hdr = create_tar_header_for_test(&app_name, 120, &"0000555", 48, 65532, 65532);
 
   let mut valid_tar = Bytes.new();
   valid_tar.extend(&app_hdr);
-  // payload 16 bytes + padding to 512 bytes
-  let mut i = 0;
-  while i < 16 {
-    valid_tar.push(127);  // ELF magic dummy
-    i = i + 1;
-  }
+  valid_tar.extend(&valid_elf);
+  // payload 120 bytes + padding to 512 bytes (392 bytes)
+  let mut i = 120;
   while i < 512 {
     valid_tar.push(0);
     i = i + 1;
@@ -221,8 +355,23 @@ pub fn run_rootfs_tests() -> Bool
   if manifest.file_count != 1 {
     return false;
   }
-  if manifest.total_bytes != 16 {
+  if manifest.total_bytes != 120 {
     return false;
+  }
+
+  // 結合テスト: manifest の entry.payload が元のペイロードと一致し payload 長が size と等しいことを検証
+  match manifest.entries.get(0) {
+    Some(e) => {
+      if e.payload.len() != e.size || e.size != 120 {
+        return false;
+      }
+      if !bytes_equal(&e.payload, &valid_elf) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
   }
 
   // 2. ADR 0035 の仕様検証が成功すること
@@ -233,11 +382,156 @@ pub fn run_rootfs_tests() -> Bool
     }
   }
 
-  // 3. 実行権限がないファイルの場合、LayerValidation で拒否されること
-  let no_exec_hdr = create_tar_header_for_test(&app_name, 16, &"0000444", 48, 65532, 65532);
+  // 3. 結合テスト: destination_path が空の場合は LayerValidation で拒否されること
+  let empty_dest = "";
+  match unpack_layer_archive(&valid_tar, &empty_dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 4. 結合テスト: ペイロード切詰めのアーカイブは拒否されること
+  let mut no_payload_tar = Bytes.new();
+  no_payload_tar.extend(&app_hdr);
+  match unpack_layer_archive(&no_payload_tar, &dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  let large_size_hdr = create_tar_header_for_test(&app_name, 1000, &"0000555", 48, 65532, 65532);
+  let mut truncated_data_tar = Bytes.new();
+  truncated_data_tar.extend(&large_size_hdr);
+  i = 0;
+  while i < 512 {
+    truncated_data_tar.push(0);
+    i = i + 1;
+  }
+  match unpack_layer_archive(&truncated_data_tar, &dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // 5. 否定テスト: 非 ELF ペイロードは validate_adr0035_rootfs で拒否されること
+  let mut non_elf_payload = Bytes.new();
+  i = 0;
+  while i < 120 {
+    non_elf_payload.push(0);
+    i = i + 1;
+  }
+  let mut non_elf_tar = Bytes.new();
+  non_elf_tar.extend(&app_hdr);
+  non_elf_tar.extend(&non_elf_payload);
+  i = 120;
+  while i < 512 {
+    non_elf_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut non_elf_tar, 2);
+  let mut non_elf_manifest = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&non_elf_tar, &dest) {
+    Ok(m) => {
+      non_elf_manifest = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&non_elf_manifest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 6. 否定テスト: ET_DYN ペイロードは validate_adr0035_rootfs で拒否されること
+  let dyn_elf_payload = create_test_elf_payload(3, 1);
+  let mut dyn_tar = Bytes.new();
+  dyn_tar.extend(&app_hdr);
+  dyn_tar.extend(&dyn_elf_payload);
+  i = 120;
+  while i < 512 {
+    dyn_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut dyn_tar, 2);
+  let mut dyn_manifest = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&dyn_tar, &dest) {
+    Ok(m) => {
+      dyn_manifest = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&dyn_manifest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 7. 否定テスト: PT_DYNAMIC を含むペイロードは validate_adr0035_rootfs で拒否されること
+  let pt_dyn_elf_payload = create_test_elf_payload(2, 2);
+  let mut pt_dyn_tar = Bytes.new();
+  pt_dyn_tar.extend(&app_hdr);
+  pt_dyn_tar.extend(&pt_dyn_elf_payload);
+  i = 120;
+  while i < 512 {
+    pt_dyn_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut pt_dyn_tar, 2);
+  let mut pt_dyn_manifest = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&pt_dyn_tar, &dest) {
+    Ok(m) => {
+      pt_dyn_manifest = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&pt_dyn_manifest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 8. 実行権限がないファイルの場合、LayerValidation で拒否されること
+  let no_exec_hdr = create_tar_header_for_test(&app_name, 120, &"0000444", 48, 65532, 65532);
   let mut no_exec_tar = Bytes.new();
   no_exec_tar.extend(&no_exec_hdr);
-  i = 0;
+  no_exec_tar.extend(&valid_elf);
+  i = 120;
   while i < 512 {
     no_exec_tar.push(0);
     i = i + 1;

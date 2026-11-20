@@ -278,7 +278,19 @@ pub fn generate_oci_config_json(spec: &ContainerSpec) -> Result<String, Containe
   buf.extend(&"},\"pids\":{\"limit\":".as_bytes());
   append_int_str(&mut buf, spec.resources.pids_max);
   if spec.isolation.uid != 0 || spec.isolation.gid != 0 {
-    buf.extend(&"}},\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"mount\"},{\"type\":\"network\"},{\"type\":\"user\"}],\"uidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":65536}],\"gidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":65536}],\"seccomp\":".as_bytes());
+    let mut mapping_size = 65536;
+    let mut max_id = spec.isolation.uid;
+    if spec.isolation.gid > max_id {
+      max_id = spec.isolation.gid;
+    }
+    if max_id + 1 > mapping_size {
+      mapping_size = max_id + 1;
+    }
+    buf.extend(&"}},\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"mount\"},{\"type\":\"network\"},{\"type\":\"user\"}],\"uidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":".as_bytes());
+    append_int_str(&mut buf, mapping_size);
+    buf.extend(&"}],\"gidMappings\":[{\"containerID\":0,\"hostID\":0,\"size\":".as_bytes());
+    append_int_str(&mut buf, mapping_size);
+    buf.extend(&"}],\"seccomp\":".as_bytes());
   } else {
     buf.extend(&"}},\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"mount\"},{\"type\":\"network\"}],\"seccomp\":".as_bytes());
   }

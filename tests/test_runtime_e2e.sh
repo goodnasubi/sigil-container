@@ -185,11 +185,21 @@ void _start(void) {
         "mov %%rax, %0\n"
         : "=r"(fd) : "r"(path) : "rax", "rdi", "rsi", "rdx"
     );
+    // Raw syscall: open returns -errno on failure.
+    // EROFS is 30, so raw return is -30.
+    // If open returned -30 (-EROFS), exit with 0 (success of write prohibition)
     // If open succeeded (fd >= 0), exit with 42 (failure of write prohibition)
-    // If open failed (fd < 0, EROFS is -30), exit with 0 (success of write prohibition)
-    long exit_code = 0;
-    if (fd >= 0) {
+    // If open failed with -EACCES (-13), exit with 43
+    // Any other failure, exit with 44
+    long exit_code;
+    if (fd == -30) {
+        exit_code = 0;
+    } else if (fd >= 0) {
         exit_code = 42;
+    } else if (fd == -13) {
+        exit_code = 43;
+    } else {
+        exit_code = 44;
     }
     __asm__ volatile (
         "mov $60, %%rax\n"
