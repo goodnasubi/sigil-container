@@ -3,6 +3,7 @@ module test_runner
   trust none
 
 use tests.test_bundle.run_bundle_tests;
+use tests.test_reconciler.run_reconciler_tests;
 use tests.test_rootfs.run_rootfs_tests;
 use tests.test_runtime.run_runtime_tests;
 use tests.test_spec.run_spec_tests;
@@ -32,6 +33,10 @@ pub fn main() -> Int
   }
   if !run_runtime_tests() {
     return 6;
+  }
+  let rc = run_reconciler_tests();
+  if rc != 0 {
+    return rc;
   }
   return 0;
 }

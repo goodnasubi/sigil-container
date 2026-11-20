@@ -1,0 +1,838 @@
+module container.reconcile_loop
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.error.error_message;
+use container.limits.max_operation_attempts;
+use container.reconcile_state.OperationRecord;
+use container.reconcile_state.PolicyRecord;
+use container.reconcile_state.RestartStateRecord;
+use container.reconcile_state.decode_operation_record;
+use container.reconcile_state.decode_policy_record;
+use container.reconcile_state.decode_restart_state_record;
+use container.reconcile_state.encode_operation_record;
+use container.reconcile_state.encode_policy_record;
+use container.reconcile_state.encode_restart_state_record;
+use container.reconcile_state.new_operation_record;
+use container.reconciler.Declaration;
+use container.reconciler.Observed;
+use container.reconciler.PlannedAction;
+use container.reconciler.empty_tick_plan;
+use container.reconciler.new_declaration;
+use container.reconciler.new_observed;
+use container.reconciler.plan_tick;
+use container.state.WorkloadRecord;
+use container.state.decode_workload_record;
+use container.state.encode_workload_record;
+use container.state.new_workload_record;
+
+// ADR 0053 決定 2 (P5-3): 調整ループの 1 回分 (tick) の手順。
+//
+// 状態の保存先 (StateStore) と実行環境 (ModelRuntime) は「ポート」として構造体で表す。
+// 本段の実装は純 Sigil (effects none) で、ポートの実体は P5-2 のコマンド生成と P4 のデータベースへ
+// 後続の段で配線する。ここで定義するポートの契約は次のとおり:
+//   - StateStore.commit は全部適用か全部不適用 (途中の状態を見せない)。失敗は Err を返す。
+//   - ModelRuntime.apply の各操作は冪等 (作成は既にあれば成功、削除は無ければ成功)。
+//   - 観測 (observe) は常に実行環境から取り直す。保存した状態を観測の代わりにしない。
+// 失敗は黙って成功にしない: 操作の失敗は OperationRecord に残し、次の tick で再試行する。
+
+pub struct StoreEntry {
+  key: String,
+  row: Bytes,
+}
+
+pub struct StateStore {
+  entries: List<StoreEntry>,
+  fail_commits: Bool,  // 障害注入: 書き込みを失敗させる
+}
+
+pub struct ModelInstance {
+  instance_id: String,
+  workload_id: String,
+  status: String,  // "created" / "running" / "stopped"
+  exit_code: Int,
+  health_failures: Int,
+  uptime_ms: Int,
+}
+
+pub struct ModelRuntime {
+  instances: List<ModelInstance>,
+  fail_ops: Bool,  // 障害注入: ランタイムの操作を失敗させる
+  fail_observe: Bool,  // 障害注入: 観測を失敗させる
+  crash_after: Int,  // 障害注入: この数の操作を実行したところで調整ループが強制終了する (-1 で無効)
+  applied: Int,  // 実行済みの操作数
+  crashed: Bool,
+}
+
+pub struct TickReport {
+  executed: Int,
+  failed: Int,
+  gave_up: List<String>,
+  unhealthy: List<String>,
+  errors: List<String>,
+}
+
+pub fn new_state_store() -> StateStore
+  intent "空の状態の保存先を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return StateStore { entries: List.new(), fail_commits: false };
+}
+
+pub fn new_model_runtime() -> ModelRuntime
+  intent "空の実行環境モデルを作る"
+  requires none
+  ensures none
+  effects none
+{
+  return ModelRuntime { instances: List.new(), fail_ops: false, fail_observe: false, crash_after: 0 - 1, applied: 0, crashed: false };
+}
+
+fn concat2(a: &String, b: &String) -> String
+  intent "文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.extend(&a.as_bytes());
+  buf.extend(&b.as_bytes());
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
+
+fn starts_with(s: &String, prefix: &String) -> Bool
+  intent "s が prefix で始まるか"
+  requires none
+  ensures none
+  effects none
+{
+  let sb = s.as_bytes();
+  let pb = prefix.as_bytes();
+  if sb.len() < pb.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < pb.len() {
+    if sb.get(i).unwrap_or(0) != pb.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 状態の保存先
+// ---------------------------------------------------------------------------
+
+pub fn store_commit(store: &mut StateStore, puts: &List<StoreEntry>, deletes: &List<String>) -> Result<Bool, ContainerError>
+  intent "1 つのトランザクションで書き込みと削除を適用する。全部適用か全部不適用で、失敗時は何も変えない"
+  requires none
+  ensures none
+  effects none
+{
+  if store.fail_commits {
+    return Err(ContainerError.StateError("状態の保存に失敗しました (トランザクションは適用されていません)。"));
+  }
+  let mut next = List.new();
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(e) => {
+        let mut drop_it = false;
+        let mut d = 0;
+        while d < deletes.len() {
+          match deletes.get(d) {
+            Some(k) => {
+              if e.key == k {
+                drop_it = true;
+              }
+            }
+            None => {}
+          }
+          d = d + 1;
+        }
+        let mut replaced = false;
+        let mut p = 0;
+        while p < puts.len() {
+          match puts.get(p) {
+            Some(pe) => {
+              if pe.key == e.key {
+                replaced = true;
+              }
+            }
+            None => {}
+          }
+          p = p + 1;
+        }
+        if !drop_it && !replaced {
+          next.push(StoreEntry { key: e.key.clone(), row: e.row.clone() });
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let mut p = 0;
+  while p < puts.len() {
+    match puts.get(p) {
+      Some(pe) => {
+        next.push(StoreEntry { key: pe.key.clone(), row: pe.row.clone() });
+      }
+      None => {}
+    }
+    p = p + 1;
+  }
+  store.entries = next;
+  return Ok(true);
+}
+
+pub fn put_workload(store: &mut StateStore, w: &WorkloadRecord, policy: &PolicyRecord) -> Result<Bool, ContainerError>
+  intent "望ましい状態 (ワークロードと宣言ポリシー) を 1 トランザクションで保存する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut puts = List.new();
+  match crate_encode_workload(&w) {
+    Ok(b) => {
+      puts.push(StoreEntry { key: concat2(&"workload:", &w.workload_id), row: b });
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match encode_policy(&policy) {
+    Ok(b) => {
+      puts.push(StoreEntry { key: concat2(&"policy:", &policy.workload_id), row: b });
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  return store_commit(&mut store, &puts, &List.new());
+}
+
+fn crate_encode_workload(w: &WorkloadRecord) -> Result<Bytes, ContainerError>
+  intent "WorkloadRecord を符号化する (state モジュールの関数への薄い橋渡し)"
+  requires none
+  ensures none
+  effects none
+{
+  return encode_workload_record(&w);
+}
+
+fn encode_policy(p: &PolicyRecord) -> Result<Bytes, ContainerError>
+  intent "PolicyRecord を検証してから符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  return encode_policy_record(&p);
+}
+
+fn load_declarations(store: &StateStore) -> Result<List<Declaration>, ContainerError>
+  intent "保存した望ましい状態を宣言の一覧として読み出す。壊れた行は黙って捨てず失敗する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut decls = List.new();
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(e) => {
+        if starts_with(&e.key, &"workload:") {
+          let mut w = new_workload_record("", "", 0, 0);
+          match decode_workload_record(&e.row) {
+            Ok(v) => {
+              w = v;
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+          let policy_key = concat2(&"policy:", &w.workload_id);
+          let mut found = false;
+          let mut j = 0;
+          while j < store.entries.len() {
+            match store.entries.get(j) {
+              Some(pe) => {
+                if pe.key == policy_key {
+                  match decode_policy_record(&pe.row) {
+                    Ok(p) => {
+                      decls.push(new_declaration(w.workload_id.clone(), "node-1", w.desired_replicas, w.version, p));
+                      found = true;
+                    }
+                    Err(err) => {
+                      return Err(err);
+                    }
+                  }
+                }
+              }
+              None => {}
+            }
+            j = j + 1;
+          }
+          if !found {
+            return Err(ContainerError.Corrupt("ワークロードの宣言ポリシーがありません。"));
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(decls);
+}
+
+fn load_restart_states(store: &StateStore) -> Result<List<RestartStateRecord>, ContainerError>
+  intent "保存した再起動の経過を読み出す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(e) => {
+        if starts_with(&e.key, &"restart:") {
+          match decode_restart_state_record(&e.row) {
+            Ok(r) => {
+              out.push(r);
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+pub fn load_operations(store: &StateStore) -> Result<List<OperationRecord>, ContainerError>
+  intent "保存した操作の記録を読み出す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(e) => {
+        if starts_with(&e.key, &"op:") {
+          match decode_operation_record(&e.row) {
+            Ok(r) => {
+              out.push(r);
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+pub fn load_restart_state_list(store: &StateStore) -> Result<List<RestartStateRecord>, ContainerError>
+  intent "保存した再起動の経過を読み出す (検査用)"
+  requires none
+  ensures none
+  effects none
+{
+  return load_restart_states(&store);
+}
+
+// ---------------------------------------------------------------------------
+// 実行環境 (モデル)
+// ---------------------------------------------------------------------------
+
+fn runtime_find(rt: &ModelRuntime, id: &String) -> Int
+  intent "実行環境のインスタンスの添字を返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < rt.instances.len() {
+    match rt.instances.get(i) {
+      Some(m) => {
+        if m.instance_id == id {
+          return i;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+pub fn observe(rt: &ModelRuntime) -> Result<List<Observed>, ContainerError>
+  intent "実行環境から観測を取り直す。観測に失敗したら黙って空にせず失敗する"
+  requires none
+  ensures none
+  effects none
+{
+  if rt.fail_observe {
+    return Err(ContainerError.StateError("実行環境の観測に失敗しました。"));
+  }
+  let mut out = List.new();
+  let mut i = 0;
+  while i < rt.instances.len() {
+    match rt.instances.get(i) {
+      Some(m) => {
+        out.push(new_observed(m.instance_id.clone(), m.workload_id.clone(), m.status.clone(), m.exit_code, m.health_failures, m.uptime_ms));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+fn runtime_apply(rt: &mut ModelRuntime, a: &PlannedAction) -> Result<Bool, ContainerError>
+  intent "1 つの操作を冪等に実行する (作成は既にあれば成功、削除は無ければ成功)"
+  requires none
+  ensures none
+  effects none
+{
+  if rt.fail_ops {
+    return Err(ContainerError.StateError("ランタイムの操作に失敗しました。"));
+  }
+  let idx = runtime_find(&rt, &a.instance_id);
+  if a.kind == "create" {
+    if idx < 0 {
+      rt.instances.push(ModelInstance { instance_id: a.instance_id.clone(), workload_id: a.workload_id.clone(), status: "created", exit_code: 0, health_failures: 0, uptime_ms: 0 });
+    }
+    return Ok(true);
+  }
+  if a.kind == "start" {
+    if idx < 0 {
+      return Err(ContainerError.StateError("起動するインスタンスがありません。"));
+    }
+    let mut next = List.new();
+    let mut i = 0;
+    while i < rt.instances.len() {
+      match rt.instances.get(i) {
+        Some(m) => {
+          let mut st = m.status.clone();
+          let mut up = m.uptime_ms + 0;
+          let mut hf = m.health_failures + 0;
+          if m.instance_id == a.instance_id {
+            st = "running";
+            up = 0;
+            hf = 0;
+          }
+          next.push(ModelInstance { instance_id: m.instance_id.clone(), workload_id: m.workload_id.clone(), status: st, exit_code: 0, health_failures: hf, uptime_ms: up });
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    rt.instances = next;
+    return Ok(true);
+  }
+  if a.kind == "stop" {
+    let mut next = List.new();
+    let mut i = 0;
+    while i < rt.instances.len() {
+      match rt.instances.get(i) {
+        Some(m) => {
+          let mut st = m.status.clone();
+          let mut code = m.exit_code + 0;
+          if m.instance_id == a.instance_id && m.status == "running" {
+            st = "stopped";
+            code = 137;
+          }
+          next.push(ModelInstance { instance_id: m.instance_id.clone(), workload_id: m.workload_id.clone(), status: st, exit_code: code, health_failures: m.health_failures + 0, uptime_ms: m.uptime_ms + 0 });
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    rt.instances = next;
+    return Ok(true);
+  }
+  if a.kind == "delete" {
+    let mut next = List.new();
+    let mut i = 0;
+    while i < rt.instances.len() {
+      match rt.instances.get(i) {
+        Some(m) => {
+          if m.instance_id != a.instance_id {
+            next.push(ModelInstance { instance_id: m.instance_id.clone(), workload_id: m.workload_id.clone(), status: m.status.clone(), exit_code: m.exit_code + 0, health_failures: m.health_failures + 0, uptime_ms: m.uptime_ms + 0 });
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    rt.instances = next;
+    return Ok(true);
+  }
+  return Err(ContainerError.Corrupt("未対応の操作種別です。"));
+}
+
+// ---------------------------------------------------------------------------
+// 調整ループの 1 回分
+// ---------------------------------------------------------------------------
+
+fn find_op(ops: &List<OperationRecord>, op_id: &String) -> Int
+  intent "操作の記録の添字を返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < ops.len() {
+    match ops.get(i) {
+      Some(o) => {
+        if o.op_id == op_id {
+          return i;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn str_in(list: &List<String>, s: &String) -> Bool
+  intent "文字列の一覧に s が含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < list.len() {
+    match list.get(i) {
+      Some(v) => {
+        if v == s {
+          return true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub fn reconcile_tick(store: &mut StateStore, rt: &mut ModelRuntime, now_ms: Int) -> Result<TickReport, ContainerError>
+  intent "調整ループを 1 回実行する: 読み出し→観測→計画→先行記録→実行→結果の記録。失敗は状態に残して報告し、黙って成功にしない"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 読み出しと観測 (観測は実行環境から取り直す)
+  let mut decls = List.new();
+  match load_declarations(&store) {
+    Ok(d) => {
+      decls = d;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut states = List.new();
+  match load_restart_states(&store) {
+    Ok(s) => {
+      states = s;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut ops = List.new();
+  match load_operations(&store) {
+    Ok(o) => {
+      ops = o;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut observed = List.new();
+  match observe(&rt) {
+    Ok(o) => {
+      observed = o;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 2. 計画
+  let mut plan = empty_tick_plan();
+  match plan_tick(&decls, &observed, &states, &ops, now_ms) {
+    Ok(p) => {
+      plan = p;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 3. 先行記録: 再起動の経過と Pending の操作を 1 トランザクションで保存する。
+  //    保存に失敗したらランタイムには触れない (記録の無い操作を先に実行しない)。
+  let mut puts = List.new();
+  let mut deletes = List.new();
+  let mut ui = 0;
+  while ui < plan.restart_updates.len() {
+    match plan.restart_updates.get(ui) {
+      Some(r) => {
+        match encode_restart_state_record(&r) {
+          Ok(b) => {
+            puts.push(StoreEntry { key: concat2(&"restart:", &r.instance_id), row: b });
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        }
+      }
+      None => {}
+    }
+    ui = ui + 1;
+  }
+  let mut ai = 0;
+  while ai < plan.actions.len() {
+    match plan.actions.get(ai) {
+      Some(a) => {
+        let oi = find_op(&ops, &a.op_id);
+        let mut attempts = 0;
+        let mut last_error = "";
+        if oi >= 0 {
+          match ops.get(oi) {
+            Some(o) => {
+              attempts = o.attempts + 0;
+              last_error = o.last_error.clone();
+            }
+            None => {}
+          }
+        }
+        let rec = new_operation_record(a.op_id.clone(), a.instance_id.clone(), a.kind.clone(), "Pending", attempts, last_error);
+        match encode_operation_record(&rec) {
+          Ok(b) => {
+            puts.push(StoreEntry { key: concat2(&"op:", &a.op_id), row: b });
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        }
+      }
+      None => {}
+    }
+    ai = ai + 1;
+  }
+  let mut si = 0;
+  while si < plan.satisfied_ops.len() {
+    match plan.satisfied_ops.get(si) {
+      Some(id) => {
+        deletes.push(concat2(&"op:", &id));
+      }
+      None => {}
+    }
+    si = si + 1;
+  }
+  match store_commit(&mut store, &puts, &deletes) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 4. 実行。失敗した操作はそのインスタンスの後続操作を止め、結果を記録する。
+  let mut report = TickReport { executed: 0, failed: 0, gave_up: plan.gave_up.clone(), unhealthy: plan.unhealthy.clone(), errors: List.new() };
+  let mut failed_instances = List.new();
+  let mut result_puts = List.new();
+  let mut result_deletes = List.new();
+  let mut xi = 0;
+  while xi < plan.actions.len() {
+    match plan.actions.get(xi) {
+      Some(a) => {
+        if str_in(&failed_instances, &a.instance_id) {
+          // 前の操作が失敗したので、この操作は Pending のまま次の tick へ
+        } else {
+          // 強制終了の注入: 指定数の操作を実行した直後に調整ループが落ちる (結果の記録は行われない)
+          if rt.crash_after >= 0 && rt.applied >= rt.crash_after {
+            rt.crashed = true;
+            return Err(ContainerError.StateError("調整ループが強制終了しました (注入)。"));
+          }
+          let mut ok = false;
+          let mut msg = "";
+          match runtime_apply(&mut rt, &a) {
+            Ok(_) => {
+              ok = true;
+            }
+            Err(e) => {
+              msg = error_message(&e);
+            }
+          }
+          rt.applied = rt.applied + 1;
+          let key = concat2(&"op:", &a.op_id);
+          if ok {
+            report.executed = report.executed + 1;
+            result_deletes.push(key);
+          } else {
+            report.failed = report.failed + 1;
+            failed_instances.push(a.instance_id.clone());
+            report.errors.push(msg.clone());
+            let oi = find_op(&ops, &a.op_id);
+            let mut attempts = 1;
+            if oi >= 0 {
+              match ops.get(oi) {
+                Some(o) => {
+                  attempts = o.attempts + 1;
+                }
+                None => {}
+              }
+            }
+            let mut status = "Pending";
+            if attempts >= max_operation_attempts() {
+              status = "Failed";
+            }
+            let rec = new_operation_record(a.op_id.clone(), a.instance_id.clone(), a.kind.clone(), status, attempts, msg);
+            match encode_operation_record(&rec) {
+              Ok(b) => {
+                result_puts.push(StoreEntry { key: key, row: b });
+              }
+              Err(e) => {
+                return Err(e);
+              }
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    xi = xi + 1;
+  }
+
+  // 5. 結果の記録。ここで失敗しても操作は Pending のまま残り、次の tick が観測で Done にする (冪等)。
+  match store_commit(&mut store, &result_puts, &result_deletes) {
+    Ok(_) => {}
+    Err(e) => {
+      report.errors.push(error_message(&e));
+    }
+  }
+  return Ok(report);
+}
+
+// ---------------------------------------------------------------------------
+// 実行環境モデルの観測用・注入用の関数 (試験で外部の出来事を再現するために使う)
+// ---------------------------------------------------------------------------
+
+pub fn model_instance_count(rt: &ModelRuntime) -> Int
+  intent "実行環境モデルのインスタンス数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return rt.instances.len();
+}
+
+pub fn model_instance_status(rt: &ModelRuntime, id: &String) -> String
+  intent "実行環境モデルのインスタンスの状態を返す。無ければ 'missing'"
+  requires none
+  ensures none
+  effects none
+{
+  let idx = runtime_find(&rt, &id);
+  if idx < 0 {
+    return "missing";
+  }
+  let mut out = "missing";
+  match rt.instances.get(idx) {
+    Some(m) => {
+      out = m.status.clone();
+    }
+    None => {}
+  }
+  return out;
+}
+
+pub fn count_model_status(rt: &ModelRuntime, status: &String) -> Int
+  intent "実行環境モデルで指定の状態のインスタンス数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut n = 0;
+  let mut i = 0;
+  while i < rt.instances.len() {
+    match rt.instances.get(i) {
+      Some(m) => {
+        if m.status == status {
+          n = n + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+pub fn inject_instance_state(rt: &mut ModelRuntime, id: &String, status: &String, exit_code: Int, health_failures: Int, uptime_ms: Int)
+  intent "外部の出来事 (コンテナの終了、プローブの失敗) を実行環境モデルに再現する。無ければ何もしない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = List.new();
+  let mut i = 0;
+  while i < rt.instances.len() {
+    match rt.instances.get(i) {
+      Some(m) => {
+        if m.instance_id == id {
+          next.push(ModelInstance { instance_id: m.instance_id.clone(), workload_id: m.workload_id.clone(), status: status.clone(), exit_code: exit_code, health_failures: health_failures, uptime_ms: uptime_ms });
+        } else {
+          next.push(ModelInstance { instance_id: m.instance_id.clone(), workload_id: m.workload_id.clone(), status: m.status.clone(), exit_code: m.exit_code + 0, health_failures: m.health_failures + 0, uptime_ms: m.uptime_ms + 0 });
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  rt.instances = next;
+}
+
+pub fn inject_instance_loss(rt: &mut ModelRuntime, id: &String)
+  intent "実行環境からインスタンスが消えた出来事を再現する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = List.new();
+  let mut i = 0;
+  while i < rt.instances.len() {
+    match rt.instances.get(i) {
+      Some(m) => {
+        if m.instance_id != id {
+          next.push(ModelInstance { instance_id: m.instance_id.clone(), workload_id: m.workload_id.clone(), status: m.status.clone(), exit_code: m.exit_code + 0, health_failures: m.health_failures + 0, uptime_ms: m.uptime_ms + 0 });
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  rt.instances = next;
+}

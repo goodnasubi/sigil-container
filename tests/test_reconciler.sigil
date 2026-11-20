@@ -1,0 +1,966 @@
+module tests.test_reconciler
+  targets server
+  trust none
+
+use container.error.error_kind_name;
+use container.limits.max_operation_attempts;
+use container.reconcile_loop.ModelRuntime;
+use container.reconcile_loop.StateStore;
+use container.reconcile_loop.count_model_status;
+use container.reconcile_loop.inject_instance_loss;
+use container.reconcile_loop.inject_instance_state;
+use container.reconcile_loop.load_operations;
+use container.reconcile_loop.load_restart_state_list;
+use container.reconcile_loop.model_instance_count;
+use container.reconcile_loop.model_instance_status;
+use container.reconcile_loop.new_model_runtime;
+use container.reconcile_loop.new_state_store;
+use container.reconcile_loop.put_workload;
+use container.reconcile_loop.reconcile_tick;
+use container.reconcile_state.decode_operation_record;
+use container.reconcile_state.decode_policy_record;
+use container.reconcile_state.decode_restart_state_record;
+use container.reconcile_state.disabled_health_check;
+use container.reconcile_state.encode_operation_record;
+use container.reconcile_state.encode_policy_record;
+use container.reconcile_state.encode_restart_state_record;
+use container.reconcile_state.new_health_check_spec;
+use container.reconcile_state.new_operation_record;
+use container.reconcile_state.new_policy_record;
+use container.reconcile_state.new_restart_state_record;
+use container.reconcile_state.validate_policy;
+use container.reconciler.ProbeResult;
+use container.reconciler.backoff_delay_ms;
+use container.reconciler.clamp_reconcile_interval;
+use container.reconciler.instance_id_for;
+use container.reconciler.int_to_str;
+use container.reconciler.next_health_failures;
+use container.reconciler.should_reconcile;
+use container.state.new_workload_record;
+
+fn digest() -> String
+  intent "試験用のイメージ digest を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+}
+
+fn declare(store: &mut StateStore, wid: &String, replicas: Int, kind: &String, max_retries: Int, backoff_ms: Int, enable_health: Bool) -> Bool
+  intent "ワークロードと宣言ポリシーを保存する (試験の準備)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut hc = disabled_health_check();
+  if enable_health {
+    hc = new_health_check_spec(true, 5000, 1000, 2, 10000);
+  }
+  let w = new_workload_record(wid.clone(), digest(), replicas, 1);
+  let p = new_policy_record(wid.clone(), kind.clone(), max_retries, backoff_ms, hc);
+  return match put_workload(&mut store, &w, &p) {
+    Ok(_) => true,
+    Err(_) => false,
+  };
+}
+
+fn tick_ok(store: &mut StateStore, rt: &mut ModelRuntime, now_ms: Int) -> Bool
+  intent "調整を 1 回行い、成功したか返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match reconcile_tick(&mut store, &mut rt, now_ms) {
+    Ok(_) => true,
+    Err(_) => false,
+  };
+}
+
+fn tick_executed(store: &mut StateStore, rt: &mut ModelRuntime, now_ms: Int) -> Int
+  intent "調整を 1 回行い、実行した操作の数を返す。失敗は -1"
+  requires none
+  ensures none
+  effects none
+{
+  return match reconcile_tick(&mut store, &mut rt, now_ms) {
+    Ok(r) => r.executed,
+    Err(_) => 0 - 1,
+  };
+}
+
+fn tick_failed(store: &mut StateStore, rt: &mut ModelRuntime, now_ms: Int) -> Int
+  intent "調整を 1 回行い、失敗した操作の数を返す。tick 自体の失敗は -1"
+  requires none
+  ensures none
+  effects none
+{
+  return match reconcile_tick(&mut store, &mut rt, now_ms) {
+    Ok(r) => r.failed,
+    Err(_) => 0 - 1,
+  };
+}
+
+fn op_count(store: &StateStore) -> Int
+  intent "保存された操作の記録の数を返す。読み出せなければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  return match load_operations(&store) {
+    Ok(ops) => ops.len(),
+    Err(_) => 0 - 1,
+  };
+}
+
+fn restart_count_of(store: &StateStore, id: &String) -> Int
+  intent "保存された再起動回数を返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = 0 - 1;
+  match load_restart_state_list(&store) {
+    Ok(list) => {
+      let mut i = 0;
+      while i < list.len() {
+        match list.get(i) {
+          Some(s) => {
+            if s.instance_id == id {
+              out = s.restart_count + 0;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+    }
+    Err(_) => {}
+  }
+  return out;
+}
+
+fn restart_phase_of(store: &StateStore, id: &String) -> String
+  intent "保存された再起動の段階を返す。無ければ空"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = "";
+  match load_restart_state_list(&store) {
+    Ok(list) => {
+      let mut i = 0;
+      while i < list.len() {
+        match list.get(i) {
+          Some(s) => {
+            if s.instance_id == id {
+              out = s.phase.clone();
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+    }
+    Err(_) => {}
+  }
+  return out;
+}
+
+fn op_field_of(store: &StateStore, kind: &String, field: &String) -> String
+  intent "指定した種別の操作の記録の項目 (status / attempts / error) を文字列で返す。無ければ空"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = "";
+  match load_operations(&store) {
+    Ok(ops) => {
+      let mut i = 0;
+      while i < ops.len() {
+        match ops.get(i) {
+          Some(o) => {
+            if o.kind == kind {
+              if field == "status" {
+                out = o.status.clone();
+              } else if field == "attempts" {
+                out = int_to_str(o.attempts);
+              } else {
+                out = o.last_error.clone();
+              }
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+    }
+    Err(_) => {}
+  }
+  return out;
+}
+
+// 1. 収束と冪等性
+fn test_converge_and_idempotent() -> Int
+  intent "宣言どおりに作成・起動して収束し、繰り返しても結果が変わらない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"web", 2, &"always", 3, 1000, false) {
+    return 1;
+  }
+  if tick_executed(&mut store, &mut rt, 1000) != 4 {
+    return 2;
+  }
+  if count_model_status(&rt, &"running") != 2 || model_instance_count(&rt) != 2 {
+    return 3;
+  }
+  if op_count(&store) != 0 {
+    return 4;
+  }
+  // 同じ調整を繰り返しても何も起きない
+  let mut i = 0;
+  while i < 3 {
+    if tick_executed(&mut store, &mut rt, 2000 + i) != 0 {
+      return 5;
+    }
+    i = i + 1;
+  }
+  if model_instance_count(&rt) != 2 || count_model_status(&rt, &"running") != 2 {
+    return 6;
+  }
+  // 実行環境から消えたインスタンスは取り直した観測で検出して作り直す (保存した状態を鵜呑みにしない)
+  inject_instance_loss(&mut rt, &instance_id_for(&"web", 1));
+  if model_instance_count(&rt) != 1 {
+    return 7;
+  }
+  if tick_executed(&mut store, &mut rt, 3000) != 2 {
+    return 8;
+  }
+  if count_model_status(&rt, &"running") != 2 {
+    return 9;
+  }
+  return 0;
+}
+
+// 2. 縮小と削除
+fn test_scale_down_and_remove() -> Int
+  intent "レプリカ数を減らす・ワークロードを外すと余ったインスタンスを止めて削除する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"api", 3, &"no", 0, 0, false) {
+    return 1;
+  }
+  if !tick_ok(&mut store, &mut rt, 1000) {
+    return 2;
+  }
+  if count_model_status(&rt, &"running") != 3 {
+    return 3;
+  }
+  if !declare(&mut store, &"api", 1, &"no", 0, 0, false) {
+    return 4;
+  }
+  if !tick_ok(&mut store, &mut rt, 2000) {
+    return 5;
+  }
+  if model_instance_count(&rt) != 1 || count_model_status(&rt, &"running") != 1 {
+    return 6;
+  }
+  if model_instance_status(&rt, &instance_id_for(&"api", 0)) != "running" {
+    return 7;
+  }
+  if !declare(&mut store, &"api", 0, &"no", 0, 0, false) {
+    return 8;
+  }
+  if !tick_ok(&mut store, &mut rt, 3000) {
+    return 9;
+  }
+  if model_instance_count(&rt) != 0 {
+    return 10;
+  }
+  return 0;
+}
+
+// 3. 再起動の方針
+fn test_restart_policy() -> Int
+  intent "再起動の方針と上限に従い、無制限の再起動ループにならない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"job", 1, &"on_failure", 2, 1000, false) {
+    return 1;
+  }
+  let id = instance_id_for(&"job", 0);
+  if !tick_ok(&mut store, &mut rt, 1000) {
+    return 2;
+  }
+
+  // 正常終了 (exit 0) では on_failure は再起動しない
+  inject_instance_state(&mut rt, &id, &"stopped", 0, 0, 0);
+  if tick_executed(&mut store, &mut rt, 2000) != 0 {
+    return 3;
+  }
+  if model_instance_status(&rt, &id) != "stopped" {
+    return 4;
+  }
+
+  // 異常終了 (exit 1): 待ち時間つきで予約し、待ち時間の前は再起動しない
+  inject_instance_state(&mut rt, &id, &"stopped", 1, 0, 0);
+  if tick_executed(&mut store, &mut rt, 10000) != 0 {
+    return 5;
+  }
+  if restart_phase_of(&store, &id) != "Backoff" {
+    return 6;
+  }
+  if tick_executed(&mut store, &mut rt, 10500) != 0 {
+    return 7;
+  }
+  if model_instance_status(&rt, &id) != "stopped" {
+    return 8;
+  }
+  // 待ち時間 (1000ms) が過ぎたら再起動する (1 回目)
+  if tick_executed(&mut store, &mut rt, 11000) != 3 {
+    return 9;
+  }
+  if model_instance_status(&rt, &id) != "running" || restart_count_of(&store, &id) != 1 {
+    return 10;
+  }
+
+  // 2 回目の失敗 (待ち時間は 2 倍の 2000ms)
+  inject_instance_state(&mut rt, &id, &"stopped", 2, 0, 0);
+  if tick_executed(&mut store, &mut rt, 20000) != 0 {
+    return 11;
+  }
+  if tick_executed(&mut store, &mut rt, 21000) != 0 {
+    return 12;
+  }
+  if tick_executed(&mut store, &mut rt, 22000) != 3 {
+    return 13;
+  }
+  if restart_count_of(&store, &id) != 2 {
+    return 14;
+  }
+
+  // 3 回目の失敗: 上限 (2 回) に達しているので止めて報告し、以後は再起動しない
+  inject_instance_state(&mut rt, &id, &"stopped", 3, 0, 0);
+  if tick_executed(&mut store, &mut rt, 30000) != 0 {
+    return 15;
+  }
+  if restart_phase_of(&store, &id) != "GaveUp" {
+    return 16;
+  }
+  let mut k = 0;
+  while k < 5 {
+    if tick_executed(&mut store, &mut rt, 40000 + k * 100000) != 0 {
+      return 17;
+    }
+    k = k + 1;
+  }
+  if model_instance_status(&rt, &id) != "stopped" {
+    return 18;
+  }
+  return 0;
+}
+
+fn test_restart_always_and_no() -> Int
+  intent "always は正常終了でも再起動し、no は再起動しない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"svc", 1, &"always", 1, 1000, false) {
+    return 1;
+  }
+  if !declare(&mut store, &"once", 1, &"no", 0, 0, false) {
+    return 2;
+  }
+  if !tick_ok(&mut store, &mut rt, 1000) {
+    return 3;
+  }
+  let sid = instance_id_for(&"svc", 0);
+  let oid = instance_id_for(&"once", 0);
+  inject_instance_state(&mut rt, &sid, &"stopped", 0, 0, 0);
+  inject_instance_state(&mut rt, &oid, &"stopped", 1, 0, 0);
+  let ta = tick_executed(&mut store, &mut rt, 5000);
+  let tb = tick_executed(&mut store, &mut rt, 7000);
+  if model_instance_status(&rt, &sid) != "running" {
+    return 4;
+  }
+  if model_instance_status(&rt, &oid) != "stopped" {
+    return 5;
+  }
+  if restart_count_of(&store, &sid) != 1 {
+    return 6;
+  }
+  // always でも上限 (1 回) に達したら止める
+  inject_instance_state(&mut rt, &sid, &"stopped", 0, 0, 0);
+  let tc = tick_executed(&mut store, &mut rt, 20000);
+  let td = tick_executed(&mut store, &mut rt, 30000);
+  if restart_phase_of(&store, &sid) != "GaveUp" || model_instance_status(&rt, &sid) != "stopped" {
+    return 7;
+  }
+  return 0;
+}
+
+// 4. ヘルスチェック
+fn test_health_check() -> Int
+  intent "ヘルスチェックの失敗を黙って成功にせず、不健全なら再起動の方針に従う"
+  requires none
+  ensures none
+  effects none
+{
+  // 判定不能 (Unknown) は成功にならない
+  if next_health_failures(0, &ProbeResult.Healthy) != 0 {
+    return 1;
+  }
+  if next_health_failures(1, &ProbeResult.Unhealthy) != 2 {
+    return 2;
+  }
+  if next_health_failures(1, &ProbeResult.Unknown) != 2 {
+    return 3;
+  }
+  if next_health_failures(5, &ProbeResult.Healthy) != 0 {
+    return 4;
+  }
+
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"hc", 1, &"on_failure", 3, 1000, true) {
+    return 5;
+  }
+  let id = instance_id_for(&"hc", 0);
+  if !tick_ok(&mut store, &mut rt, 1000) {
+    return 6;
+  }
+  // 起動猶予 (10 秒) の間の失敗は不健全としない
+  inject_instance_state(&mut rt, &id, &"running", 0, 5, 5000);
+  if tick_executed(&mut store, &mut rt, 6000) != 0 {
+    return 7;
+  }
+  // 猶予後でも失敗が閾値 (2) 未満なら健全
+  inject_instance_state(&mut rt, &id, &"running", 0, 1, 20000);
+  if tick_executed(&mut store, &mut rt, 21000) != 0 {
+    return 8;
+  }
+  // 閾値に達したら不健全: 止めて、再起動の方針に従い待ち時間つきで予約する
+  inject_instance_state(&mut rt, &id, &"running", 0, 2, 30000);
+  let unhealthy_seen = match reconcile_tick(&mut store, &mut rt, 31000) {
+    Ok(r) => r.unhealthy.len(),
+    Err(_) => 0 - 1,
+  };
+  if unhealthy_seen != 1 {
+    return 9;
+  }
+  if model_instance_status(&rt, &id) != "stopped" {
+    return 10;
+  }
+  if restart_phase_of(&store, &id) != "Backoff" {
+    return 11;
+  }
+  if tick_executed(&mut store, &mut rt, 32500) != 3 {
+    return 12;
+  }
+  if model_instance_status(&rt, &id) != "running" {
+    return 13;
+  }
+  return 0;
+}
+
+// 5. 通知の取りこぼしと周期的な再調整
+fn test_periodic_and_notification() -> Int
+  intent "通知が無くても周期で調整し、間隔には上限と下限がある"
+  requires none
+  ensures none
+  effects none
+{
+  // 通知があれば直ちに調整する
+  if !should_reconcile(1000, 900, 60000, true) {
+    return 1;
+  }
+  // 通知が無く、間隔が経過していなければ待つ
+  if should_reconcile(1000, 900, 60000, false) {
+    return 2;
+  }
+  // 通知を取りこぼしても (通知なしのまま)、間隔が経過すれば調整する
+  if !should_reconcile(61000, 900, 60000, false) {
+    return 3;
+  }
+  // 初回 (一度も調整していない) は調整する
+  if !should_reconcile(10, 0 - 1, 60000, false) {
+    return 4;
+  }
+  // 間隔は無制限に短くできず、長すぎもしない
+  if clamp_reconcile_interval(1) != 1000 {
+    return 5;
+  }
+  if clamp_reconcile_interval(999999999) != 3600000 {
+    return 6;
+  }
+  if clamp_reconcile_interval(30000) != 30000 {
+    return 7;
+  }
+  // 要求した間隔が短すぎても下限で動く (下限未満では調整しない)
+  if should_reconcile(1500, 1000, 1, false) {
+    return 8;
+  }
+
+  // 通知なしでも周期の調整だけで収束する
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"p", 2, &"always", 3, 1000, false) {
+    return 9;
+  }
+  if !tick_ok(&mut store, &mut rt, 1000) {
+    return 10;
+  }
+  inject_instance_loss(&mut rt, &instance_id_for(&"p", 0));
+  inject_instance_state(&mut rt, &instance_id_for(&"p", 1), &"stopped", 9, 0, 0);
+  // 変更の通知は届いていない。周期の tick だけで差を検出して直す。
+  if should_reconcile(70000, 1000, 60000, false) {
+    let tt = tick_executed(&mut store, &mut rt, 70000);
+  }
+  let tu = tick_executed(&mut store, &mut rt, 80000);
+  let tv = tick_executed(&mut store, &mut rt, 90000);
+  if count_model_status(&rt, &"running") != 2 {
+    return 11;
+  }
+  return 0;
+}
+
+// 6. 強制終了からの再開
+fn test_crash_and_resume() -> Int
+  intent "調整の途中で強制終了しても、再開して収束し、二重適用にならない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut k = 0;
+  while k < 4 {
+    let mut store = new_state_store();
+    let mut rt = new_model_runtime();
+    if !declare(&mut store, &"c", 2, &"always", 3, 1000, false) {
+      return 1;
+    }
+    // k 個の操作を実行したところで強制終了する
+    rt.crash_after = k;
+    let first = reconcile_tick(&mut store, &mut rt, 1000);
+    match first {
+      Ok(_) => {
+        return 2;
+      }
+      Err(_) => {}
+    }
+    if !rt.crashed {
+      return 3;
+    }
+    // 再開 (新しいプロセスを想定: 強制終了の注入と実行回数を戻す)
+    rt.crash_after = 0 - 1;
+    rt.crashed = false;
+    if !tick_ok(&mut store, &mut rt, 2000) {
+      return 4;
+    }
+    if model_instance_count(&rt) != 2 || count_model_status(&rt, &"running") != 2 {
+      return 5;
+    }
+    // 収束後は何も実行せず、操作の記録も残らない
+    if tick_executed(&mut store, &mut rt, 3000) != 0 {
+      return 6;
+    }
+    if op_count(&store) != 0 {
+      return 7;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+// 7. 障害注入: 状態の保存
+fn test_store_fault() -> Int
+  intent "状態の保存の失敗では実行環境に触れず失敗を報告し、障害を除去すれば収束する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"s", 2, &"always", 3, 1000, false) {
+    return 1;
+  }
+  store.fail_commits = true;
+  match reconcile_tick(&mut store, &mut rt, 1000) {
+    Ok(_) => {
+      return 2;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "StateError" {
+        return 3;
+      }
+    }
+  }
+  // 記録できない操作は実行しない
+  if model_instance_count(&rt) != 0 {
+    return 4;
+  }
+  store.fail_commits = false;
+  if !tick_ok(&mut store, &mut rt, 2000) {
+    return 5;
+  }
+  if count_model_status(&rt, &"running") != 2 {
+    return 6;
+  }
+
+  // 結果の記録だけが失敗しても、次の tick が観測で Done にして収束を保つ
+  let mut store2 = new_state_store();
+  let mut rt2 = new_model_runtime();
+  if !declare(&mut store2, &"s2", 1, &"always", 3, 1000, false) {
+    return 7;
+  }
+  // 先行記録は成功させ、実行後の結果記録で失敗させるため、先に 1 回目を空振りさせる
+  if !tick_ok(&mut store2, &mut rt2, 1000) {
+    return 8;
+  }
+  inject_instance_loss(&mut rt2, &instance_id_for(&"s2", 0));
+  if tick_executed(&mut store2, &mut rt2, 2000) != 2 {
+    return 9;
+  }
+  if op_count(&store2) != 0 {
+    return 10;
+  }
+  return 0;
+}
+
+// 8. 障害注入: ランタイム
+fn test_runtime_fault() -> Int
+  intent "ランタイムの失敗を状態に残して再試行し、障害を除去すれば収束する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"r", 1, &"always", 3, 1000, false) {
+    return 1;
+  }
+  rt.fail_ops = true;
+  // 失敗は黙って成功にしない: 失敗数を報告し、操作の記録に失敗の理由を残す
+  if tick_failed(&mut store, &mut rt, 1000) != 1 {
+    return 2;
+  }
+  if model_instance_count(&rt) != 0 {
+    return 3;
+  }
+  // 作成は失敗として残り、後続の起動は Pending のまま実行されない
+  if op_count(&store) != 2 {
+    return 4;
+  }
+  if op_field_of(&store, &"create", &"status") != "Pending" || op_field_of(&store, &"create", &"attempts") != "1" {
+    return 5;
+  }
+  if op_field_of(&store, &"create", &"error").len() == 0 {
+    return 6;
+  }
+  if op_field_of(&store, &"start", &"attempts") != "0" {
+    return 7;
+  }
+  // 試行回数の上限に達したら Failed として残し、報告し続ける
+  let mut i = 1;
+  while i < max_operation_attempts() {
+    if tick_failed(&mut store, &mut rt, 2000 + i * 1000) != 1 {
+      return 8;
+    }
+    i = i + 1;
+  }
+  if op_field_of(&store, &"create", &"status") != "Failed" {
+    return 9;
+  }
+  if op_field_of(&store, &"create", &"attempts") != int_to_str(max_operation_attempts()) {
+    return 90;
+  }
+  // 障害を除去すれば収束する
+  rt.fail_ops = false;
+  if !tick_ok(&mut store, &mut rt, 100000) {
+    return 12;
+  }
+  if count_model_status(&rt, &"running") != 1 {
+    return 13;
+  }
+  if op_count(&store) != 0 {
+    return 14;
+  }
+  // 観測の失敗も黙って成功にしない
+  rt.fail_observe = true;
+  if tick_ok(&mut store, &mut rt, 200000) {
+    return 15;
+  }
+  rt.fail_observe = false;
+  if !tick_ok(&mut store, &mut rt, 300000) {
+    return 16;
+  }
+  return 0;
+}
+
+// 9. 上限の検査
+fn test_limits_and_validation() -> Int
+  intent "宣言の上限を読み込む前に効かせ、超過は明示的に失敗する"
+  requires none
+  ensures none
+  effects none
+{
+  // 回数が 0 や 11 の always / on_failure は拒否 (無制限の再起動ループにしない)
+  match validate_policy(&new_policy_record("w", "always", 0, 1000, disabled_health_check())) {
+    Ok(_) => {
+      return 1;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return 2;
+      }
+    }
+  }
+  match validate_policy(&new_policy_record("w", "on_failure", 11, 1000, disabled_health_check())) {
+    Ok(_) => {
+      return 3;
+    }
+    Err(_) => {}
+  }
+  match validate_policy(&new_policy_record("w", "on_failure", 3, 999, disabled_health_check())) {
+    Ok(_) => {
+      return 4;
+    }
+    Err(_) => {}
+  }
+  match validate_policy(&new_policy_record("w", "on_failure", 3, 3600001, disabled_health_check())) {
+    Ok(_) => {
+      return 5;
+    }
+    Err(_) => {}
+  }
+  match validate_policy(&new_policy_record("w", "sometimes", 3, 1000, disabled_health_check())) {
+    Ok(_) => {
+      return 6;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "SpecValidation" {
+        return 7;
+      }
+    }
+  }
+  match validate_policy(&new_policy_record("w", "no", 1, 0, disabled_health_check())) {
+    Ok(_) => {
+      return 8;
+    }
+    Err(_) => {}
+  }
+  // ヘルスチェックの間隔・失敗回数・時間切れ
+  match validate_policy(&new_policy_record("w", "no", 0, 0, new_health_check_spec(true, 500, 100, 2, 0))) {
+    Ok(_) => {
+      return 9;
+    }
+    Err(_) => {}
+  }
+  match validate_policy(&new_policy_record("w", "no", 0, 0, new_health_check_spec(true, 5000, 6000, 2, 0))) {
+    Ok(_) => {
+      return 10;
+    }
+    Err(_) => {}
+  }
+  match validate_policy(&new_policy_record("w", "no", 0, 0, new_health_check_spec(true, 5000, 1000, 11, 0))) {
+    Ok(_) => {
+      return 11;
+    }
+    Err(_) => {}
+  }
+  match validate_policy(&new_policy_record("w", "always", 3, 1000, new_health_check_spec(true, 5000, 1000, 3, 0))) {
+    Ok(_) => {}
+    Err(_) => {
+      return 12;
+    }
+  }
+  // 待ち時間は倍々で増えるが上限で止まる
+  if backoff_delay_ms(1000, 0) != 1000 || backoff_delay_ms(1000, 3) != 8000 {
+    return 13;
+  }
+  if backoff_delay_ms(1000, 30) != 3600000 {
+    return 14;
+  }
+  // レプリカ数の上限は調整の前に検査される (超過は黙って切り捨てない)
+  let mut store = new_state_store();
+  let mut rt = new_model_runtime();
+  if !declare(&mut store, &"big", 65, &"no", 0, 0, false) {
+    return 15;
+  }
+  match reconcile_tick(&mut store, &mut rt, 1000) {
+    Ok(_) => {
+      return 16;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return 17;
+      }
+    }
+  }
+  if model_instance_count(&rt) != 0 {
+    return 18;
+  }
+  return 0;
+}
+
+// 10. 保存形式
+fn test_record_round_trip() -> Int
+  intent "調整ループの状態の保存形式を符号化・復号して往復させる"
+  requires none
+  ensures none
+  effects none
+{
+  let p = new_policy_record("wl", "on_failure", 3, 2000, new_health_check_spec(true, 5000, 1000, 2, 10000));
+  let mut pb = Bytes.new();
+  match encode_policy_record(&p) {
+    Ok(b) => {
+      pb = b;
+    }
+    Err(_) => {
+      return 1;
+    }
+  }
+  match decode_policy_record(&pb) {
+    Ok(d) => {
+      if d.workload_id != "wl" || d.restart_kind != "on_failure" || d.max_retries != 3 || d.backoff_ms != 2000 {
+        return 2;
+      }
+      if !d.health.enabled || d.health.interval_ms != 5000 || d.health.failure_threshold != 2 || d.health.start_period_ms != 10000 {
+        return 3;
+      }
+    }
+    Err(_) => {
+      return 4;
+    }
+  }
+
+  let r = new_restart_state_record("wl-0", 2, 12345, 7, "Backoff", "終了した");
+  let mut rb = Bytes.new();
+  match encode_restart_state_record(&r) {
+    Ok(b) => {
+      rb = b;
+    }
+    Err(_) => {
+      return 5;
+    }
+  }
+  match decode_restart_state_record(&rb) {
+    Ok(d) => {
+      if d.instance_id != "wl-0" || d.restart_count != 2 || d.next_restart_at_ms != 12345 || d.last_exit_code != 7 || d.phase != "Backoff" {
+        return 6;
+      }
+    }
+    Err(_) => {
+      return 7;
+    }
+  }
+
+  let o = new_operation_record("wl-0:create:0", "wl-0", "create", "Pending", 1, "失敗");
+  let mut ob = Bytes.new();
+  match encode_operation_record(&o) {
+    Ok(b) => {
+      ob = b;
+    }
+    Err(_) => {
+      return 8;
+    }
+  }
+  match decode_operation_record(&ob) {
+    Ok(d) => {
+      if d.op_id != "wl-0:create:0" || d.kind != "create" || d.status != "Pending" || d.attempts != 1 {
+        return 9;
+      }
+    }
+    Err(_) => {
+      return 10;
+    }
+  }
+
+  // 壊れた記録は黙って受け入れず Corrupt で拒否する
+  let bad = new_restart_state_record("wl-0", 2, 0, 0, "Elsewhere", "");
+  match encode_restart_state_record(&bad) {
+    Ok(b) => {
+      match decode_restart_state_record(&b) {
+        Ok(_) => {
+          return 11;
+        }
+        Err(e) => {
+          if error_kind_name(&e) != "Corrupt" {
+            return 12;
+          }
+        }
+      }
+    }
+    Err(_) => {
+      return 13;
+    }
+  }
+  return 0;
+}
+
+pub fn run_reconciler_tests() -> Int
+  intent "調整ループの試験をすべて実行し、0 で全合格、不合格なら 100 * 試験番号 + 失敗番号を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut code = test_converge_and_idempotent();
+  if code != 0 {
+    return 100 + code;
+  }
+  code = test_scale_down_and_remove();
+  if code != 0 {
+    return 200 + code;
+  }
+  code = test_restart_policy();
+  if code != 0 {
+    return 300 + code;
+  }
+  code = test_restart_always_and_no();
+  if code != 0 {
+    return 400 + code;
+  }
+  code = test_health_check();
+  if code != 0 {
+    return 500 + code;
+  }
+  code = test_periodic_and_notification();
+  if code != 0 {
+    return 600 + code;
+  }
+  code = test_crash_and_resume();
+  if code != 0 {
+    return 700 + code;
+  }
+  code = test_store_fault();
+  if code != 0 {
+    return 800 + code;
+  }
+  code = test_runtime_fault();
+  if code != 0 {
+    return 900 + code;
+  }
+  code = test_limits_and_validation();
+  if code != 0 {
+    return 1000 + code;
+  }
+  code = test_record_round_trip();
+  if code != 0 {
+    return 1100 + code;
+  }
+  return 0;
+}

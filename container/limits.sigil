@@ -135,3 +135,127 @@ pub fn default_non_root_gid() -> Int
 {
   return 65532;
 }
+
+// ---------------------------------------------------------------------------
+// P5-3 調整ループの上限 (ADR 0053 決定 2・6)
+// ---------------------------------------------------------------------------
+
+// 1 つのインスタンスが調整ループにより再起動できる最大回数 (Always を含む。超過後は Failed として止め、無制限の再起動ループにしない)
+pub fn max_restart_count() -> Int
+  intent "再起動回数の上限 (10)を返す"
+  requires none
+  ensures result == 10
+  effects none
+{
+  return 10;
+}
+
+// 再起動間隔の下限
+pub fn min_restart_backoff_ms() -> Int
+  intent "再起動間隔の下限 (1,000 ms)を返す"
+  requires none
+  ensures result == 1000
+  effects none
+{
+  return 1000;
+}
+
+// 再起動間隔の上限
+pub fn max_restart_backoff_ms() -> Int
+  intent "再起動間隔の上限 (3,600,000 ms)を返す"
+  requires none
+  ensures result == 3600000
+  effects none
+{
+  return 3600000;
+}
+
+// ヘルスチェックが不健全と判定するまでの連続失敗回数の上限
+pub fn max_health_retries() -> Int
+  intent "ヘルスチェック連続失敗回数の上限 (10)を返す"
+  requires none
+  ensures result == 10
+  effects none
+{
+  return 10;
+}
+
+// ヘルスチェック間隔の下限
+pub fn min_health_interval_ms() -> Int
+  intent "ヘルスチェック間隔の下限 (1,000 ms)を返す"
+  requires none
+  ensures result == 1000
+  effects none
+{
+  return 1000;
+}
+
+// ヘルスチェック間隔の上限
+pub fn max_health_interval_ms() -> Int
+  intent "ヘルスチェック間隔の上限 (3,600,000 ms)を返す"
+  requires none
+  ensures result == 3600000
+  effects none
+{
+  return 3600000;
+}
+
+// ヘルスチェック 1 回の時間切れの上限
+pub fn max_health_timeout_ms() -> Int
+  intent "ヘルスチェック 1 回の時間切れの上限 (60,000 ms)を返す"
+  requires none
+  ensures result == 60000
+  effects none
+{
+  return 60000;
+}
+
+// 周期的な再調整の間隔の下限 (無制限に短くできない)
+pub fn min_reconcile_interval_ms() -> Int
+  intent "周期的な再調整の間隔の下限 (1,000 ms)を返す"
+  requires none
+  ensures result == 1000
+  effects none
+{
+  return 1000;
+}
+
+// 周期的な再調整の間隔の上限 (取りこぼし時の収束が遅れすぎない)
+pub fn max_reconcile_interval_ms() -> Int
+  intent "周期的な再調整の間隔の上限 (3,600,000 ms)を返す"
+  requires none
+  ensures result == 3600000
+  effects none
+{
+  return 3600000;
+}
+
+// 1 ノードのワークロード数の上限
+pub fn max_workload_count() -> Int
+  intent "1 ノードのワークロード数の上限 (1,024)を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+// 1 ワークロードのレプリカ数の上限
+pub fn max_replicas() -> Int
+  intent "1 ワークロードのレプリカ数の上限 (64)を返す"
+  requires none
+  ensures result == 64
+  effects none
+{
+  return 64;
+}
+
+// 1 つの操作の再試行回数の上限 (超過後は失敗を状態に残して報告する)
+pub fn max_operation_attempts() -> Int
+  intent "1 操作の再試行回数の上限 (5)を返す"
+  requires none
+  ensures result == 5
+  effects none
+{
+  return 5;
+}
