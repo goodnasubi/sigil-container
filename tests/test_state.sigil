@@ -1,0 +1,157 @@
+module tests.test_state
+  targets server
+  trust none
+
+use container.state.decode_instance_record;
+use container.state.decode_node_record;
+use container.state.decode_workload_record;
+use container.state.encode_instance_key;
+use container.state.encode_instance_record;
+use container.state.encode_node_key;
+use container.state.encode_node_record;
+use container.state.encode_workload_key;
+use container.state.encode_workload_record;
+use container.state.new_instance_record;
+use container.state.new_node_record;
+use container.state.new_workload_record;
+
+pub fn run_state_tests() -> Bool
+  intent "コンテナ状態の保存・復元と整合性をテストする"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. NodeRecord のテスト
+  let node = new_node_record("node-1", "Ready", 8589934592, 1000000, 32768);
+
+  let mut node_key = Bytes.new();
+  match encode_node_key(&node.node_id) {
+    Ok(b) => {
+      node_key = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if node_key.len() == 0 {
+    return false;
+  }
+
+  let mut node_bytes = Bytes.new();
+  match encode_node_record(&node) {
+    Ok(b) => {
+      node_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded_node = new_node_record("", "", 0, 0, 0);
+  match decode_node_record(&node_bytes) {
+    Ok(n) => {
+      decoded_node = n;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  if decoded_node.node_id != node.node_id || decoded_node.status != node.status {
+    return false;
+  }
+  if decoded_node.total_memory_bytes != node.total_memory_bytes {
+    return false;
+  }
+
+  // 2. WorkloadRecord のテスト
+  let workload = new_workload_record("wl-web-api", "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 3, 1);
+
+  let mut wl_key = Bytes.new();
+  match encode_workload_key(&workload.workload_id) {
+    Ok(b) => {
+      wl_key = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if wl_key.len() == 0 {
+    return false;
+  }
+
+  let mut wl_bytes = Bytes.new();
+  match encode_workload_record(&workload) {
+    Ok(b) => {
+      wl_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded_wl = new_workload_record("", "", 0, 0);
+  match decode_workload_record(&wl_bytes) {
+    Ok(w) => {
+      decoded_wl = w;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  if decoded_wl.workload_id != workload.workload_id {
+    return false;
+  }
+  if decoded_wl.image_digest != workload.image_digest {
+    return false;
+  }
+  if decoded_wl.desired_replicas != 3 || decoded_wl.version != 1 {
+    return false;
+  }
+
+  // 3. InstanceRecord のテスト
+  let instance = new_instance_record("inst-web-api-1", "wl-web-api", "node-1", "Running", 0);
+
+  let mut inst_key = Bytes.new();
+  match encode_instance_key(&instance.instance_id) {
+    Ok(b) => {
+      inst_key = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if inst_key.len() == 0 {
+    return false;
+  }
+
+  let mut inst_bytes = Bytes.new();
+  match encode_instance_record(&instance) {
+    Ok(b) => {
+      inst_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded_inst = new_instance_record("", "", "", "", 0);
+  match decode_instance_record(&inst_bytes) {
+    Ok(i) => {
+      decoded_inst = i;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  if decoded_inst.instance_id != instance.instance_id {
+    return false;
+  }
+  if decoded_inst.status != "Running" || decoded_inst.exit_code != 0 {
+    return false;
+  }
+
+  return true;
+}

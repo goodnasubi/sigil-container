@@ -1,0 +1,1206 @@
+module tests.test_tar_fuzz
+  targets server
+  trust none
+
+use container.error.error_kind_name;
+use container.image_layout.extract_cstring;
+use container.image_layout.inspect_tar_header;
+use container.image_layout.parse_octal;
+use container.image_layout.validate_path;
+use container.image_layout.validate_tar_archive;
+
+fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: Int, link_bytes: &Bytes, prefix_bytes: &Bytes) -> Bytes
+  intent "テスト用の 512 バイト Tar ヘッダを任意のバイト列 (prefix 含む) から構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let mut i = 0;
+  while i < 100 {
+    if i < name_bytes.len() {
+      bytes.push(name_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode ("0000644" + 0)
+  let mode_b = "0000644".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid ("0000000" + 0)
+  let uid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid ("0000000" + 0)
+  let gid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size (12 bytes, 8進数 ASCII + 空白)
+  let size_b = size_octal.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < size_b.len() {
+      bytes.push(size_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 136..148: mtime ("00000000000" + 0)
+  let mtime_b = "00000000000".as_bytes();
+  i = 0;
+  while i < 11 {
+    bytes.push(mtime_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum ("0000000" + 0)
+  let chk_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(chk_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname
+  i = 0;
+  while i < 100 {
+    if i < link_bytes.len() {
+      bytes.push(link_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 257..263: magic ("ustar\0")
+  let magic_b = "ustar".as_bytes();
+  i = 0;
+  while i < 5 {
+    bytes.push(magic_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 263..265: version ("00")
+  bytes.push(48);
+  bytes.push(48);
+
+  // 265..345: ゼロ埋め
+  while bytes.len() < 345 {
+    bytes.push(0);
+  }
+
+  // 345..500: prefix (155 bytes)
+  i = 0;
+  while i < 155 {
+    if i < prefix_bytes.len() {
+      bytes.push(prefix_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 500..512: ゼロ埋め
+  while bytes.len() < 512 {
+    bytes.push(0);
+  }
+
+  return bytes;
+}
+
+fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int, atime_str: String) -> Bytes
+  intent "テスト用の 512 バイト旧 GNU Tar ヘッダを構築する (magic 'ustar ', version ' \\0', 345..357 に atime)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let name_b = name.as_bytes();
+  let mut i = 0;
+  while i < 100 {
+    if i < name_b.len() {
+      bytes.push(name_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode ("0000644\0")
+  let mode_b = "0000644".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid ("0000000\0")
+  let uid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid ("0000000\0")
+  let gid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size
+  let size_b = size_octal.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < size_b.len() {
+      bytes.push(size_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 136..148: mtime
+  let mtime_b = "00000000000".as_bytes();
+  i = 0;
+  while i < 11 {
+    bytes.push(mtime_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum (ダミー)
+  let chk_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(chk_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname (ゼロ埋め)
+  while bytes.len() < 257 {
+    bytes.push(0);
+  }
+
+  // 257..263: magic ("ustar ")
+  let magic_b = "ustar ".as_bytes();
+  i = 0;
+  while i < 6 {
+    bytes.push(magic_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+
+  // 263..265: version (" \0")
+  bytes.push(32);  // ' '
+  bytes.push(0);  // '\0'
+
+  // 265..345: ゼロ埋め
+  while bytes.len() < 345 {
+    bytes.push(0);
+  }
+
+  // 345..357: atime (12 bytes)
+  let atime_b = atime_str.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < atime_b.len() {
+      bytes.push(atime_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 357..512: ゼロ埋め
+  while bytes.len() < 512 {
+    bytes.push(0);
+  }
+
+  return bytes;
+}
+
+fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: Int, linkname: String) -> Bytes
+  intent "テスト用の 512 バイト Tar ヘッダを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let name_b = name.as_bytes();
+  let mut i = 0;
+  while i < 100 {
+    if i < name_b.len() {
+      bytes.push(name_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode ("0000644" + 0)
+  let mode_b = "0000644".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid ("0000000" + 0)
+  let uid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid ("0000000" + 0)
+  let gid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size (12 bytes, 8進数 ASCII + 空白)
+  let size_b = size_octal.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < size_b.len() {
+      bytes.push(size_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 136..148: mtime ("00000000000" + 0)
+  let mtime_b = "00000000000".as_bytes();
+  i = 0;
+  while i < 11 {
+    bytes.push(mtime_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum ("0000000" + 0)
+  let chk_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(chk_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname
+  let link_b = linkname.as_bytes();
+  i = 0;
+  while i < 100 {
+    if i < link_b.len() {
+      bytes.push(link_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 257..512: 残りをゼロ埋め
+  while bytes.len() < 512 {
+    bytes.push(0);
+  }
+
+  return bytes;
+}
+
+pub fn run_tar_fuzz_tests() -> Bool
+  intent "tar のパストラバーサル、リンク、特殊ファイル、展開爆弾等のファジング・境界値試験を行う"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 正常な通常ファイルのエントリ
+  let valid_h = create_tar_header_fixture("app/main", "00000001000 ", 48, "");  // 512 byte
+  match inspect_tar_header(&valid_h) {
+    Ok(e) => {
+      if e.path != "app/main" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 絶対パス (/etc/shadow) の拒否 (パストラバーサル防止)
+  let abs_h = create_tar_header_fixture("/etc/shadow", "00000000100 ", 48, "");
+  match inspect_tar_header(&abs_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 3. 上位参照 (..) の拒否 (../escape)
+  let dotdot_h = create_tar_header_fixture("../escape", "00000000100 ", 48, "");
+  match inspect_tar_header(&dotdot_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 4. パス途中の上位参照 (a/b/../../escape) の拒否
+  let mid_dotdot_h = create_tar_header_fixture("a/b/../../escape", "00000000100 ", 48, "");
+  match inspect_tar_header(&mid_dotdot_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 5. 特殊ファイル (Character device: '3' = 51) の拒否
+  let char_dev_h = create_tar_header_fixture("dev/null", "00000000000 ", 51, "");
+  match inspect_tar_header(&char_dev_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 6. 特殊ファイル (Block device: '4' = 52) の拒否
+  let blk_dev_h = create_tar_header_fixture("dev/sda", "00000000000 ", 52, "");
+  match inspect_tar_header(&blk_dev_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 7. 特殊ファイル (FIFO: '6' = 54) の拒否
+  let fifo_h = create_tar_header_fixture("tmp/fifo", "00000000000 ", 54, "");
+  match inspect_tar_header(&fifo_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 8. シンボリックリンク ('2' = 50) でリンク先が上位参照 (../target) の拒否
+  let sym_traversal_h = create_tar_header_fixture("link_file", "00000000000 ", 50, "../target");
+  match inspect_tar_header(&sym_traversal_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 9. シンボリックリンクでリンク先が絶対パス (/etc/passwd) の拒否
+  let sym_abs_h = create_tar_header_fixture("link_abs", "00000000000 ", 50, "/etc/passwd");
+  match inspect_tar_header(&sym_abs_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 10. 展開爆弾対策: 単一ファイルサイズ上限 (1 GiB) を超える宣言の拒否 (例: 20000000000 8進数 = 2 GiB)
+  let bomb_h = create_tar_header_fixture("huge_file", "20000000000 ", 48, "");
+  match inspect_tar_header(&bomb_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 11. ディレクトリ深さ超過 (> 16 階層) の拒否
+  let deep_path = "1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17";
+  match validate_path(&deep_path) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 12. 全ゼロブロック (終端) が typeflag 255 として正常に認識されること
+  let mut zero_b = Bytes.with_capacity(512);
+  let mut z_i = 0;
+  while z_i < 512 {
+    zero_b.push(0);
+    z_i = z_i + 1;
+  }
+  match inspect_tar_header(&zero_b) {
+    Ok(e) => {
+      if e.typeflag != 255 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 13. tar アーカイブ全体の検査
+  let mut archive = Bytes.new();
+  archive.extend(&valid_h);
+  archive.extend(&zero_b);
+  match validate_tar_archive(&archive) {
+    Ok(count) => {
+      if count != 1 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 14. 回帰テスト: 1 ヘッダ未満の入力 (< 512 バイト) は Ok(0) ではなくエラーを返すこと
+  let mut short_b = Bytes.new();
+  let mut s_i = 0;
+  while s_i < 100 {
+    short_b.push(0);
+    s_i = s_i + 1;
+  }
+  match validate_tar_archive(&short_b) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+  let empty_b = Bytes.new();
+  match validate_tar_archive(&empty_b) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 15. 回帰テスト: 宣言ペイロードが入力を超える切り詰め tar の拒否
+  // valid_h は 512 バイトのファイルサイズを宣言しているが、ペイロードが存在しない (ヘッダのみ 512 バイト)
+  let mut trunc_tar = Bytes.new();
+  trunc_tar.extend(&valid_h);
+  match validate_tar_archive(&trunc_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 16. 回帰テスト: 不完全な末尾ヘッダ (512 バイト境界未満の断片) の拒否
+  let zero_size_h = create_tar_header_fixture("empty_file", "00000000000 ", 48, "");
+  let mut frag_tar = Bytes.new();
+  frag_tar.extend(&zero_size_h);
+  // 100 バイトの不完全なヘッダー断片を追加
+  let mut f_i = 0;
+  while f_i < 100 {
+    frag_tar.push(0);
+    f_i = f_i + 1;
+  }
+  match validate_tar_archive(&frag_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 17. 回帰テスト (指摘 2): 未対応の拡張ヘッダ型 (PAX x/g, GNU L/K) の LayerValidation による拒否
+  // (1) PAX x 拡張ヘッダ ('x' = 120) 単体
+  let pax_x_single = create_tar_header_fixture("PaxHeaders.1000/safe", "00000000030 ", 120, "");
+  match inspect_tar_header(&pax_x_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) PAX g 拡張ヘッダ ('g' = 103) 単体
+  let pax_g_single = create_tar_header_fixture("pax_global_header", "00000000030 ", 103, "");
+  match inspect_tar_header(&pax_g_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (3) GNU long-name ('L' = 76) 単体
+  let gnu_l_single = create_tar_header_fixture("././@LongLink", "00000000030 ", 76, "");
+  match inspect_tar_header(&gnu_l_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) GNU long-link ('K' = 75) 単体
+  let gnu_k_single = create_tar_header_fixture("././@LongLink", "00000000030 ", 75, "");
+  match inspect_tar_header(&gnu_k_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (5) PAX x ヘッダに path=../escape を含み、その後に通常ヘッダ safe が続くアーカイブの拒否
+  let pax_x_h = create_tar_header_fixture("PaxHeaders.1000/safe", "00000000030 ", 120, "");
+  let mut pax_payload = Bytes.with_capacity(512);
+  let pax_content = "24 path=../escape\n".as_bytes();
+  let mut pi = 0;
+  while pi < pax_content.len() {
+    pax_payload.push(pax_content.get(pi).unwrap_or(0));
+    pi = pi + 1;
+  }
+  while pax_payload.len() < 512 {
+    pax_payload.push(0);
+  }
+  let safe_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+
+  let mut pax_escape_tar = Bytes.new();
+  pax_escape_tar.extend(&pax_x_h);
+  pax_escape_tar.extend(&pax_payload);
+  pax_escape_tar.extend(&safe_h);
+  pax_escape_tar.extend(&zero_b);
+
+  match validate_tar_archive(&pax_escape_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 18. 回帰テスト (再レビュー指摘 1): 不正な UTF-8 を含む tar パスの prefix / name / linkname の拒否
+  let empty_bytes = Bytes.new();
+
+  // (1) USTAR ヘッダで name が "safe"、prefix に "../\xff" のような不正な UTF-8 を含む場合の拒否
+  let mut invalid_prefix = Bytes.new();
+  invalid_prefix.push(46);  // '.'
+  invalid_prefix.push(46);  // '.'
+  invalid_prefix.push(47);  // '/'
+  invalid_prefix.push(255);  // 0xff: 不正な UTF-8 バイト
+  let bad_prefix_h = create_tar_header_raw(&"safe".as_bytes(), "00000000100 ", 48, &empty_bytes, &invalid_prefix);
+  match inspect_tar_header(&bad_prefix_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) prefix に不正な UTF-8 を含むヘッダがアーカイブ検査 (validate_tar_archive) でも拒否されること
+  let mut bad_prefix_tar = Bytes.new();
+  bad_prefix_tar.extend(&bad_prefix_h);
+  let mut dummy_payload = Bytes.with_capacity(512);
+  while dummy_payload.len() < 512 {
+    dummy_payload.push(0);
+  }
+  bad_prefix_tar.extend(&dummy_payload);
+  bad_prefix_tar.extend(&zero_b);
+  match validate_tar_archive(&bad_prefix_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (3) name に不正な UTF-8 を含むヘッダの拒否
+  let mut invalid_name = Bytes.new();
+  invalid_name.push(115);  // 's'
+  invalid_name.push(97);  // 'a'
+  invalid_name.push(102);  // 'f'
+  invalid_name.push(101);  // 'e'
+  invalid_name.push(255);  // 0xff
+  let bad_name_h = create_tar_header_raw(&invalid_name, "00000000100 ", 48, &empty_bytes, &empty_bytes);
+  match inspect_tar_header(&bad_name_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) linkname に不正な UTF-8 を含むシンボリックリンクの拒否
+  let mut invalid_link = Bytes.new();
+  invalid_link.push(116);  // 't'
+  invalid_link.push(97);  // 'a'
+  invalid_link.push(114);  // 'r'
+  invalid_link.push(103);  // 'g'
+  invalid_link.push(101);  // 'e'
+  invalid_link.push(116);  // 't'
+  invalid_link.push(255);  // 0xff
+  let bad_link_h = create_tar_header_raw(&"link_name".as_bytes(), "00000000000 ", 50, &invalid_link, &empty_bytes);
+  match inspect_tar_header(&bad_link_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (5) 正常な prefix ("subdir") と name ("app") の結合 ("subdir/app") が受理されること
+  let valid_prefix_h = create_tar_header_raw(&"app".as_bytes(), "00000000100 ", 48, &empty_bytes, &"subdir".as_bytes());
+  match inspect_tar_header(&valid_prefix_h) {
+    Ok(entry) => {
+      if entry.path != "subdir/app" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (6) extract_cstring 単体で無効な UTF-8 が Err(LayerValidation) を返すこと
+  let mut bad_utf8_bytes = Bytes.new();
+  bad_utf8_bytes.push(255);
+  bad_utf8_bytes.push(0);
+  match extract_cstring(&bad_utf8_bytes, 0, 10) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 19. 回帰テスト (再レビュー指摘 1): ディレクトリ ('5' = 53)・ハードリンク ('1' = 49)・シンボリックリンク ('2' = 50) の非ゼロサイズ拒否およびサイズ 0 の受理
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は pure モード (effects none / trust none) で動作しており、
+  // 外部プロセス起動や実際のファイルシステムへのアーカイブ展開を行う実行機能を持たないため、
+  // 実ファイルシステム上での展開スモークテストは行えません。
+  // そのため、インメモリ Tar ヘッダおよびアーカイブの検査結果（エラー種別 LayerValidation および TarEntry フィールド）への含有・適合テストで代用しています。
+
+  // (1) ディレクトリ ('5' = 53): 非ゼロサイズ (512 byte) の単体ヘッダ拒否 (LayerValidation)
+  let bad_dir_single = create_tar_header_fixture("test_dir", "00000001000 ", 53, "");
+  match inspect_tar_header(&bad_dir_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) ディレクトリ ('5' = 53): サイズ 0 の単体ヘッダ受理
+  let ok_dir_single = create_tar_header_fixture("test_dir", "00000000000 ", 53, "");
+  match inspect_tar_header(&ok_dir_single) {
+    Ok(e) => {
+      if e.typeflag != 53 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (3) ハードリンク ('1' = 49): 非ゼロサイズ (512 byte) の単体ヘッダ拒否 (LayerValidation)
+  let bad_hardlink_single = create_tar_header_fixture("link_hard", "00000001000 ", 49, "target_file");
+  match inspect_tar_header(&bad_hardlink_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) ハードリンク ('1' = 49): サイズ 0 かつ妥当な linkname の単体ヘッダ受理
+  let ok_hardlink_single = create_tar_header_fixture("link_hard", "00000000000 ", 49, "target_file");
+  match inspect_tar_header(&ok_hardlink_single) {
+    Ok(e) => {
+      if e.typeflag != 49 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (5) シンボリックリンク ('2' = 50): 非ゼロサイズ (512 byte) の単体ヘッダ拒否 (LayerValidation)
+  let bad_symlink_single = create_tar_header_fixture("link_sym", "00000001000 ", 50, "target_file");
+  match inspect_tar_header(&bad_symlink_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (6) シンボリックリンク ('2' = 50): サイズ 0 かつ妥当な linkname の単体ヘッダ受理
+  let ok_symlink_single = create_tar_header_fixture("link_sym", "00000000000 ", 50, "target_file");
+  match inspect_tar_header(&ok_symlink_single) {
+    Ok(e) => {
+      if e.typeflag != 50 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (7) アーカイブ単位での検証: 非ゼロサイズのディレクトリエントリを含むアーカイブの拒否 (LayerValidation)
+  let mut bad_dir_archive = Bytes.new();
+  bad_dir_archive.extend(&bad_dir_single);
+  bad_dir_archive.extend(&dummy_payload);
+  bad_dir_archive.extend(&zero_b);
+  match validate_tar_archive(&bad_dir_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (8) アーカイブ単位での検証: 非ゼロサイズのハードリンクエントリを含むアーカイブの拒否 (LayerValidation)
+  let mut bad_hardlink_archive = Bytes.new();
+  bad_hardlink_archive.extend(&bad_hardlink_single);
+  bad_hardlink_archive.extend(&dummy_payload);
+  bad_hardlink_archive.extend(&zero_b);
+  match validate_tar_archive(&bad_hardlink_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (9) アーカイブ単位での検証: 非ゼロサイズのシンボリックリンクエントリを含むアーカイブの拒否 (LayerValidation)
+  let mut bad_symlink_archive = Bytes.new();
+  bad_symlink_archive.extend(&bad_symlink_single);
+  bad_symlink_archive.extend(&dummy_payload);
+  bad_symlink_archive.extend(&zero_b);
+  match validate_tar_archive(&bad_symlink_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (10) アーカイブ単位での検証: サイズ 0 のディレクトリおよびシンボリックリンクを含む正常アーカイブの受理
+  let mut ok_dir_sym_archive = Bytes.new();
+  ok_dir_sym_archive.extend(&ok_dir_single);
+  ok_dir_sym_archive.extend(&ok_symlink_single);
+  ok_dir_sym_archive.extend(&zero_b);
+  match validate_tar_archive(&ok_dir_sym_archive) {
+    Ok(count) => {
+      if count != 2 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 20. 回帰テスト (再レビュー指摘 2): GNU sparse エントリ ('S' = 83) の拒否
+  // (1) GNU sparse ヘッダ単体 ('S' = 83) が inspect_tar_header で LayerValidation により拒否されること
+  let sparse_single = create_tar_header_fixture("sparse_file", "00000001000 ", 83, "");
+  match inspect_tar_header(&sparse_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) GNU sparse エントリを含むアーカイブが validate_tar_archive で LayerValidation により拒否されること
+  let mut sparse_archive = Bytes.new();
+  sparse_archive.extend(&sparse_single);
+  sparse_archive.extend(&dummy_payload);
+  sparse_archive.extend(&zero_b);
+  match validate_tar_archive(&sparse_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 21. 回帰テスト (再レビュー指摘: 旧 GNU ヘッダのメタデータフィールドとレイアウト解釈)
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は pure モード (effects none / trust none) で動作しており、
+  // 外部プロセス起動や実際のファイルシステムへのアーカイブ展開を行う実行機能を持たないため、
+  // 実ファイルシステム上での展開スモークテストは行えません。
+  // そのため、インメモリ Tar ヘッダおよびアーカイブの検査結果（エラー種別 LayerValidation および TarEntry フィールド）への含有・適合テストで代用します。
+  //
+  // (1) 旧 GNU ヘッダ (magic "ustar ", version " \0") で name が "/escape", atime (bytes 345..357) が "00000000001" の場合:
+  // bytes 345 以降は prefix ではなく GNU メタデータ (atime) であるため、prefix 結合されず full_path は "/escape" となり、
+  // inspect_tar_header で絶対パス拒否 (LayerValidation) されること
+  let gnu_escape_h = create_oldgnu_tar_header("/escape", "00000000000 ", 48, "00000000001");
+  match inspect_tar_header(&gnu_escape_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) 旧 GNU ヘッダで name が安全な相対パス "safe/app.txt", atime が "00000000001" の場合:
+  // atime は prefix として結合されず、full_path が "safe/app.txt" として正常に受理されること
+  let gnu_safe_h = create_oldgnu_tar_header("safe/app.txt", "00000000000 ", 48, "00000000001");
+  match inspect_tar_header(&gnu_safe_h) {
+    Ok(entry) => {
+      if entry.path != "safe/app.txt" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (3) 旧 GNU ヘッダ (name "/escape", atime "00000000001") を含むアーカイブが validate_tar_archive で LayerValidation により拒否されること
+  let mut gnu_escape_archive = Bytes.new();
+  gnu_escape_archive.extend(&gnu_escape_h);
+  gnu_escape_archive.extend(&zero_b);
+  match validate_tar_archive(&gnu_escape_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) 未対応の未知の magic (例: "badmag") を持つヘッダが inspect_tar_header で LayerValidation により拒否されること
+  let mut bad_magic_h = Bytes.new();
+  bad_magic_h.extend(&gnu_safe_h);
+  // 257..263 を "badmag" に書き換え
+  let bad_m_bytes = "badmag".as_bytes();
+  let mut bm_i = 0;
+  while bm_i < 6 {
+    bad_magic_h.set(257 + bm_i, bad_m_bytes.get(bm_i).unwrap_or(0));
+    bm_i = bm_i + 1;
+  }
+  match inspect_tar_header(&bad_magic_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 22. 回帰テスト (再レビュー指摘 1): 先頭 NUL の後に数字が続く malformed な 8 進数フィールドの拒否
+  // (1) parse_octal: 先頭 NUL + 0000001000 + NUL は Corrupt により拒否されること
+  let mut malformed_octal = Bytes.new();
+  malformed_octal.push(0);
+  malformed_octal.extend(&"0000001000".as_bytes());
+  malformed_octal.push(0);
+  match parse_octal(&malformed_octal, 0, malformed_octal.len()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (2) parse_octal: 通常の 0000001000 + NUL は 512 と読めること
+  let mut normal_octal = Bytes.new();
+  normal_octal.extend(&"0000001000".as_bytes());
+  normal_octal.push(0);
+  match parse_octal(&normal_octal, 0, normal_octal.len()) {
+    Ok(val) => {
+      if val != 512 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (3) parse_octal: 全 NUL フィールドは 0 になること
+  let mut all_null_octal = Bytes.new();
+  let mut ano_i = 0;
+  while ano_i < 12 {
+    all_null_octal.push(0);
+    ano_i = ano_i + 1;
+  }
+  match parse_octal(&all_null_octal, 0, all_null_octal.len()) {
+    Ok(val) => {
+      if val != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (4) 単体ヘッダ検査: size フィールドが NUL + 0000001000 + NUL のヘッダは inspect_tar_header で Corrupt により拒否されること
+  let mut malformed_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+  malformed_size_h.set(124, 0);
+  let ms_digits = "0000001000".as_bytes();
+  let mut msd_i = 0;
+  while msd_i < ms_digits.len() {
+    malformed_size_h.set(125 + msd_i, ms_digits.get(msd_i).unwrap_or(0));
+    msd_i = msd_i + 1;
+  }
+  malformed_size_h.set(135, 0);
+  match inspect_tar_header(&malformed_size_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (5) 単体ヘッダ検査: 通常の 0000001000 + NUL のヘッダは size 512 として受理されること
+  let mut normal_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+  let mut nsd_i = 0;
+  while nsd_i < ms_digits.len() {
+    normal_size_h.set(124 + nsd_i, ms_digits.get(nsd_i).unwrap_or(0));
+    nsd_i = nsd_i + 1;
+  }
+  normal_size_h.set(134, 0);
+  normal_size_h.set(135, 0);
+  match inspect_tar_header(&normal_size_h) {
+    Ok(entry) => {
+      if entry.size != 512 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (6) 単体ヘッダ検査: 全 NUL size フィールドのヘッダは size 0 として受理されること
+  let mut all_null_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
+  let mut ansh_i = 0;
+  while ansh_i < 12 {
+    all_null_size_h.set(124 + ansh_i, 0);
+    ansh_i = ansh_i + 1;
+  }
+  match inspect_tar_header(&all_null_size_h) {
+    Ok(entry) => {
+      if entry.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 23. 回帰テスト (再レビュー指摘: レガシーディレクトリヘッダの正規化と非ゼロサイズ拒否)
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は pure モード (effects none / trust none) で動作しており、
+  // 外部プロセス起動や実際のファイルシステムへのアーカイブ展開を行う実行機能を持たないため、
+  // 実ファイルシステム上での展開スモークテストは行えません。
+  // そのため、インメモリ Tar ヘッダおよびアーカイブの検査結果（エラー種別 LayerValidation および TarEntry フィールド）への含有・適合テストで代用します。
+  //
+  // (1) レガシーディレクトリヘッダ (safe/, typeflag NUL = 0, size 512):
+  // サイズ検査前にディレクトリとして正規化され、inspect_tar_header で非ゼロサイズ拒否 (LayerValidation) されること
+  let legacy_dir_bad_single = create_tar_header_fixture("safe/", "00000001000 ", 0, "");
+  match inspect_tar_header(&legacy_dir_bad_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) ディレクトリヘッダ (safe/, typeflag '0' = 48, size 512):
+  // サイズ検査前にディレクトリとして正規化され、inspect_tar_header で非ゼロサイズ拒否 (LayerValidation) されること
+  let zero_type_dir_bad_single = create_tar_header_fixture("safe/", "00000001000 ", 48, "");
+  match inspect_tar_header(&zero_type_dir_bad_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (3) 指摘の攻撃シナリオ: safe/ (typeflag NUL, size 512) の直後に ../escape ヘッダが続くアーカイブ
+  // safe/ が通常ファイルとして扱われて ../escape ヘッダが payload としてスキップされることなく、
+  // validate_tar_archive で LayerValidation により拒否されること
+  let escape_h = create_tar_header_fixture("../escape", "00000000000 ", 48, "");
+  let mut legacy_dir_attack_archive = Bytes.new();
+  legacy_dir_attack_archive.extend(&legacy_dir_bad_single);
+  legacy_dir_attack_archive.extend(&escape_h);
+  legacy_dir_attack_archive.extend(&zero_b);
+  match validate_tar_archive(&legacy_dir_attack_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) 正規のレガシーディレクトリエントリ (safe/, typeflag NUL = 0, size 0):
+  // ディレクトリ ('5' = 53) として正規化され、サイズ 0 で正常に受理されること
+  let legacy_dir_ok_single = create_tar_header_fixture("safe/", "00000000000 ", 0, "");
+  match inspect_tar_header(&legacy_dir_ok_single) {
+    Ok(e) => {
+      if e.typeflag != 53 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (5) 正規のディレクトリエントリ (safe/, typeflag '0' = 48, size 0):
+  // ディレクトリ ('5' = 53) として正規化され、サイズ 0 で正常に受理されること
+  let zero_type_dir_ok_single = create_tar_header_fixture("safe/", "00000000000 ", 48, "");
+  match inspect_tar_header(&zero_type_dir_ok_single) {
+    Ok(e) => {
+      if e.typeflag != 53 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (6) アーカイブ検査: 正規のレガシーディレクトリエントリ (safe/, typeflag NUL, size 0) を含むアーカイブが
+  // 後続の正常ファイル (safe/app.txt, size 0) と共に validate_tar_archive で正常に受理されること (count == 2)
+  let normal_subfile_h = create_tar_header_fixture("safe/app.txt", "00000000000 ", 48, "");
+  let mut legacy_dir_ok_archive = Bytes.new();
+  legacy_dir_ok_archive.extend(&legacy_dir_ok_single);
+  legacy_dir_ok_archive.extend(&normal_subfile_h);
+  legacy_dir_ok_archive.extend(&zero_b);
+  match validate_tar_archive(&legacy_dir_ok_archive) {
+    Ok(count) => {
+      if count != 2 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}

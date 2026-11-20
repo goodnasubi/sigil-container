@@ -1,0 +1,288 @@
+module container.oci_spec
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.spec.ContainerSpec;
+use container.spec.normalize_mount_path;
+use container.spec.validate_spec;
+
+// ADR 0053 決定 1・3: 決定的な OCI runtime-spec の bundle 生成
+// 仕様から OCI runtime-spec (config.json) を純粋関数 (effects none) かつ決定的に生成する。
+// 同じ仕様入力からはバイト単位で完全に同一の JSON が出力される。
+
+fn append_int_str(buf: &mut Bytes, n: Int)
+  intent "整数を 10 進文字列として Bytes に追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if n == 0 {
+    buf.push(48);  // '0'
+    return;
+  }
+  let mut val = n;
+  if val < 0 {
+    buf.push(45);  // '-'
+    val = -val;
+  }
+  let mut digits = List.new();
+  while val > 0 {
+    let d = val % 10;
+    digits.push(d);
+    val = val / 10;
+  }
+  let mut i = digits.len();
+  while i > 0 {
+    i = i - 1;
+    match digits.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+  }
+}
+
+fn hex_digit_char(n: Int) -> Int
+  intent "0..15 の数値を 16 進 ASCII 文字コード ('0'..'9', 'a'..'f') に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if n < 10 {
+    return 48 + n;
+  }
+  return 97 + (n - 10);
+}
+
+pub fn append_raw_escaped(buf: &mut Bytes, s: &String)
+  intent "文字列のエスケープ後バイト列を Bytes に追加する (前後のクォートなし)"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = s.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes.get(i).unwrap_or(0);
+    if b == 34 {
+      buf.push(92);  // '\'
+      buf.push(34);  // '"'
+    } else if b == 92 {
+      buf.push(92);  // '\'
+      buf.push(92);  // '\'
+    } else if b == 10 {
+      buf.push(92);
+      buf.push(110);  // 'n'
+    } else if b == 13 {
+      buf.push(92);
+      buf.push(114);  // 'r'
+    } else if b == 9 {
+      buf.push(92);
+      buf.push(116);  // 't'
+    } else if b < 32 {
+      buf.push(92);  // '\'
+      buf.push(117);  // 'u'
+      buf.push(48);  // '0'
+      buf.push(48);  // '0'
+      buf.push(hex_digit_char(b / 16));
+      buf.push(hex_digit_char(b % 16));
+    } else {
+      buf.push(b);
+    }
+    i = i + 1;
+  }
+}
+
+fn default_seccomp_json() -> String
+  intent "既定の seccomp 許可リスト (default_whitelist) の JSON 表現を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"architectures\":[\"SCMP_ARCH_X86_64\",\"SCMP_ARCH_X86\",\"SCMP_ARCH_X32\",\"SCMP_ARCH_ARM\",\"SCMP_ARCH_AARCH64\"],\"syscalls\":[{\"names\":[\"accept\",\"accept4\",\"access\",\"alarm\",\"arch_prctl\",\"bind\",\"brk\",\"chdir\",\"chmod\",\"chown\",\"clock_getres\",\"clock_gettime\",\"clock_nanosleep\",\"clone\",\"clone3\",\"close\",\"connect\",\"dup\",\"dup2\",\"dup3\",\"epoll_create\",\"epoll_create1\",\"epoll_ctl\",\"epoll_pwait\",\"epoll_wait\",\"eventfd\",\"eventfd2\",\"execve\",\"exit\",\"exit_group\",\"faccessat\",\"fadvise64\",\"fallocate\",\"fchdir\",\"fchmod\",\"fchmodat\",\"fchown\",\"fchownat\",\"fcntl\",\"fdatasync\",\"flock\",\"fstat\",\"fstatfs\",\"fsync\",\"ftruncate\",\"futex\",\"futimesat\",\"getcwd\",\"getdents\",\"getdents64\",\"getegid\",\"geteuid\",\"getgid\",\"getgroups\",\"getitimer\",\"getpeername\",\"getpgid\",\"getpgrp\",\"getpid\",\"getppid\",\"getrandom\",\"getresgid\",\"getresuid\",\"getrlimit\",\"getrusage\",\"getsid\",\"getsockname\",\"getsockopt\",\"gettimeofday\",\"getuid\",\"inotify_add_watch\",\"inotify_init\",\"inotify_init1\",\"inotify_rm_watch\",\"ioctl\",\"kill\",\"lchown\",\"link\",\"linkat\",\"listen\",\"lseek\",\"lstat\",\"madvise\",\"memfd_create\",\"mincore\",\"mkdir\",\"mkdirat\",\"mknod\",\"mknodat\",\"mmap\",\"mprotect\",\"mremap\",\"msync\",\"munmap\",\"nanosleep\",\"newfstatat\",\"open\",\"openat\",\"pause\",\"pipe\",\"pipe2\",\"poll\",\"ppoll\",\"pread64\",\"preadv\",\"prlimit64\",\"pselect6\",\"pwrite64\",\"pwritev\",\"read\",\"readlink\",\"readlinkat\",\"readv\",\"recvfrom\",\"recvmmsg\",\"recvmsg\",\"rename\",\"renameat\",\"renameat2\",\"restart_syscall\",\"rseq\",\"rt_sigaction\",\"rt_sigpending\",\"rt_sigprocmask\",\"rt_sigreturn\",\"rt_sigsuspend\",\"rt_sigtimedwait\",\"rt_tgsigqueueinfo\",\"sched_getaffinity\",\"sched_yield\",\"select\",\"semctl\",\"semget\",\"semop\",\"sendfile\",\"sendmmsg\",\"sendmsg\",\"sendto\",\"set_robust_list\",\"set_tid_address\",\"setitimer\",\"setsockopt\",\"shutdown\",\"sigaltstack\",\"socket\",\"socketpair\",\"splice\",\"stat\",\"statfs\",\"statx\",\"symlink\",\"symlinkat\",\"sync\",\"sync_file_range\",\"syncfs\",\"sysinfo\",\"tee\",\"tgkill\",\"time\",\"timer_create\",\"timer_delete\",\"timer_getoverrun\",\"timer_gettime\",\"timer_settime\",\"timerfd_create\",\"timerfd_gettime\",\"timerfd_settime\",\"times\",\"tkill\",\"truncate\",\"umask\",\"uname\",\"unlink\",\"unlinkat\",\"utime\",\"utimensat\",\"utimes\",\"vmsplice\",\"wait4\",\"waitid\",\"write\",\"writev\"],\"action\":\"SCMP_ACT_ALLOW\"}]}";
+}
+
+pub fn append_escaped_json_str(buf: &mut Bytes, s: &String)
+  intent "文字列を JSON 文字列リテラル用にエスケープして Bytes に追加する (前後にダブルクォート)"
+  requires none
+  ensures none
+  effects none
+{
+  buf.push(34);  // '"'
+  append_raw_escaped(&mut buf, &s);
+  buf.push(34);  // '"'
+}
+
+pub fn generate_oci_config_json(spec: &ContainerSpec) -> Result<String, ContainerError>
+  intent "ContainerSpec から決定的な OCI runtime-spec (config.json) を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  match validate_spec(&spec) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  if spec.isolation.seccomp_profile != "default_whitelist" && spec.isolation.seccomp_profile != "default" {
+    return Err(ContainerError.SpecValidation("未対応または解決できない seccomp プロファイルです。"));
+  }
+  let seccomp_json = default_seccomp_json();
+
+  // 決定的な固定 JSON を生成 (キー順固定、空白なし)
+  let mut buf = Bytes.new();
+  buf.extend(&"{\"ociVersion\":\"1.0.2\",".as_bytes());
+
+  // process オブジェクト
+  buf.extend(&"\"process\":{\"terminal\":false,\"user\":{\"uid\":".as_bytes());
+  append_int_str(&mut buf, spec.isolation.uid);
+  buf.extend(&",\"gid\":".as_bytes());
+  append_int_str(&mut buf, spec.isolation.gid);
+  buf.extend(&"},\"args\":[".as_bytes());
+
+  // args 配列
+  let mut arg_idx = 0;
+  while arg_idx < spec.args.len() {
+    if arg_idx > 0 {
+      buf.push(44);  // ','
+    }
+    match spec.args.get(arg_idx) {
+      Some(arg) => {
+        append_escaped_json_str(&mut buf, &arg);
+      }
+      None => {}
+    }
+    arg_idx = arg_idx + 1;
+  }
+  buf.extend(&"],\"env\":[".as_bytes());
+
+  // env 配列
+  let mut env_idx = 0;
+  while env_idx < spec.env_vars.len() {
+    if env_idx > 0 {
+      buf.push(44);  // ','
+    }
+    match spec.env_vars.get(env_idx) {
+      Some(ev) => {
+        buf.push(34);  // '"'
+        append_raw_escaped(&mut buf, &ev.key);
+        buf.push(61);  // '='
+        append_raw_escaped(&mut buf, &ev.value);
+        buf.push(34);  // '"'
+      }
+      None => {}
+    }
+    env_idx = env_idx + 1;
+  }
+  buf.extend(&"],\"cwd\":".as_bytes());
+  append_escaped_json_str(&mut buf, &spec.working_dir);
+  buf.extend(&",\"noNewPrivileges\":true,\"capabilities\":{".as_bytes());
+
+  // capabilities
+  let mut caps_buf = Bytes.new();
+  caps_buf.push(91);  // '['
+  let mut cap_i = 0;
+  while cap_i < spec.isolation.allowed_capabilities.len() {
+    if cap_i > 0 {
+      caps_buf.push(44);  // ','
+    }
+    match spec.isolation.allowed_capabilities.get(cap_i) {
+      Some(cap) => {
+        append_escaped_json_str(&mut caps_buf, &cap);
+      }
+      None => {}
+    }
+    cap_i = cap_i + 1;
+  }
+  caps_buf.push(93);  // ']'
+
+  buf.extend(&"\"ambient\":".as_bytes());
+  buf.extend(&caps_buf);
+  buf.extend(&",\"bounding\":".as_bytes());
+  buf.extend(&caps_buf);
+  buf.extend(&",\"effective\":".as_bytes());
+  buf.extend(&caps_buf);
+  buf.extend(&",\"inheritable\":".as_bytes());
+  buf.extend(&caps_buf);
+  buf.extend(&",\"permitted\":".as_bytes());
+  buf.extend(&caps_buf);
+  buf.extend(&"}},".as_bytes());  // end capabilities & process
+
+  // root オブジェクト
+  buf.extend(&"\"root\":{\"path\":\"rootfs\",\"readonly\":".as_bytes());
+  let ro_bytes = match spec.isolation.readonly_rootfs {
+    true => "true".as_bytes(),
+    false => "false".as_bytes(),
+  };
+  buf.extend(&ro_bytes);
+  buf.extend(&"},\"mounts\":[".as_bytes());
+
+  // mounts 配列
+  let mut mount_idx = 0;
+  while mount_idx < spec.mounts.len() {
+    if mount_idx > 0 {
+      buf.push(44);  // ','
+    }
+    match spec.mounts.get(mount_idx) {
+      Some(m) => {
+        let mut norm_dst = "";
+        match normalize_mount_path(&m.destination) {
+          Ok(p) => {
+            norm_dst = p;
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        }
+        let mut norm_src = "";
+        match normalize_mount_path(&m.source) {
+          Ok(p) => {
+            norm_src = p;
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        }
+        buf.extend(&"{\"destination\":".as_bytes());
+        append_escaped_json_str(&mut buf, &norm_dst);
+        buf.extend(&",\"source\":".as_bytes());
+        append_escaped_json_str(&mut buf, &norm_src);
+        buf.extend(&",\"type\":".as_bytes());
+        append_escaped_json_str(&mut buf, &m.mount_type);
+        buf.extend(&",\"options\":[".as_bytes());
+        if m.mount_type == "bind" {
+          buf.extend(&"\"bind\",".as_bytes());
+        } else if m.mount_type == "rbind" {
+          buf.extend(&"\"rbind\",".as_bytes());
+        }
+        if m.readonly {
+          buf.extend(&"\"ro\"]}".as_bytes());
+        } else {
+          buf.extend(&"\"rw\"]}".as_bytes());
+        }
+      }
+      None => {}
+    }
+    mount_idx = mount_idx + 1;
+  }
+  buf.extend(&"],\"linux\":{\"resources\":{\"memory\":{\"limit\":".as_bytes());
+
+  // resources
+  append_int_str(&mut buf, spec.resources.memory_max_bytes);
+  buf.extend(&"},\"cpu\":{\"quota\":".as_bytes());
+  append_int_str(&mut buf, spec.resources.cpu_quota_us);
+  buf.extend(&"},\"pids\":{\"limit\":".as_bytes());
+  append_int_str(&mut buf, spec.resources.pids_max);
+  buf.extend(&"}},\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"mount\"},{\"type\":\"network\"}],\"seccomp\":".as_bytes());
+  buf.extend(&seccomp_json.as_bytes());
+  buf.extend(&"}}".as_bytes());
+
+  return match buf.to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(ContainerError.Corrupt("UTF-8 符号化に失敗しました。")),
+  };
+}

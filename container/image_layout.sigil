@@ -1,0 +1,420 @@
+module container.image_layout
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_file_count;
+use container.limits.max_layer_size;
+use container.limits.max_path_depth;
+use container.limits.max_path_length;
+use container.limits.max_total_image_size;
+
+// ADR 0053 決定 1・3・6: OCI Image Layout の読み取りと層のパスの検査
+// 相対パス・上位参照・リンク・特殊ファイルを検査し、サイズ・個数・深さに上限を持つ。
+
+pub struct TarEntry {
+  path: String,
+  size: Int,
+  typeflag: Int,  // 0: file, 1: hardlink, 2: symlink, 5: dir
+  linkname: String,
+}
+
+// ---------------------------------------------------------------------------
+// 8進数 ASCII 文字列のパース
+// ---------------------------------------------------------------------------
+
+pub fn parse_octal(bytes: &Bytes, start: Int, len: Int) -> Result<Int, ContainerError>
+  intent "固定長バイト列内の 8 進数 ASCII 文字列をパースする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut val = 0;
+  let mut i = start;
+  let end = start + len;
+  let mut seen_digit = false;
+  let mut seen_null = false;
+  let mut done = false;
+
+  while i < end && !done {
+    let b = bytes.get(i).unwrap_or(0);
+    if b == 0 {
+      if seen_digit {
+        done = true;
+      } else {
+        seen_null = true;
+      }
+    } else if b == 32 {  // 空白
+      if seen_digit {
+        done = true;
+      }
+    } else if b >= 48 && b <= 55 {  // '0' .. '7'
+      if seen_null {
+        return Err(ContainerError.Corrupt("8進数フィールドの先頭 NUL の後に数字が含まれています。"));
+      }
+      seen_digit = true;
+      let digit = b - 48;
+      val = val * 8 + digit;
+      if val < 0 {
+        return Err(ContainerError.LimitExceeded("8進数フィールドのパースで整数オーバーフローが発生しました。"));
+      }
+    } else {
+      return Err(ContainerError.Corrupt("8進数フィールドに無効な文字が含まれています。"));
+    }
+    i = i + 1;
+  }
+  return Ok(val);
+}
+
+// ---------------------------------------------------------------------------
+// Null 終端文字列の抽出
+// ---------------------------------------------------------------------------
+
+pub fn extract_cstring(bytes: &Bytes, start: Int, max_len: Int) -> Result<String, ContainerError>
+  intent "バイト列から null 終端または最大長までの UTF-8 文字列を取り出す。無効な UTF-8 シーケンスが含まれる場合はエラーを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut len = 0;
+  let mut found_null = false;
+  while len < max_len && !found_null {
+    let b = bytes.get(start + len).unwrap_or(0);
+    if b == 0 {
+      found_null = true;
+    } else {
+      len = len + 1;
+    }
+  }
+  if len == 0 {
+    return Ok("");
+  }
+  let slice = bytes.slice(start, start + len).unwrap_or(Bytes.new());
+  return match slice.to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(ContainerError.LayerValidation("Tar ヘッダの文字列フィールドに無効な UTF-8 シーケンスが含まれています。")),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// パスの安全性検査 (トラバーサル、上位参照、深さ、長さ)
+// ---------------------------------------------------------------------------
+
+pub fn validate_path(path: &String) -> Result<Bool, ContainerError>
+  intent "層内パスの相対性、上位参照 (..)、パス長、深さを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = path.as_bytes();
+  if bytes.len() == 0 {
+    return Err(ContainerError.LayerValidation("パスが空です。"));
+  }
+
+  // 1. パス長上限
+  if bytes.len() > max_path_length() {
+    return Err(ContainerError.LimitExceeded("パス長が上限 (256 byte) を超過しています。"));
+  }
+
+  // 2. 絶対パスの拒否 (先頭が '/')
+  if bytes.get(0).unwrap_or(0) == 47 {
+    return Err(ContainerError.LayerValidation("絶対パスは拒否されます (相対パス必須)。"));
+  }
+
+  // 3. 上位参照 (..) および深さの検査
+  let mut depth = 0;
+  let mut i = 0;
+  let mut segment_start = 0;
+
+  while i <= bytes.len() {
+    let mut is_delim = false;
+    if i == bytes.len() {
+      is_delim = true;
+    } else {
+      if bytes.get(i).unwrap_or(0) == 47 {
+        is_delim = true;
+      }
+    }
+
+    if is_delim {
+      let seg_len = i - segment_start;
+      if seg_len == 2 {
+        let c1 = bytes.get(segment_start).unwrap_or(0);
+        let c2 = bytes.get(segment_start + 1).unwrap_or(0);
+        if c1 == 46 && c2 == 46 {  // ".."
+          return Err(ContainerError.LayerValidation("パストラバーサル・上位参照 (..) は拒否されます。"));
+        }
+      }
+      if seg_len > 0 {
+        // 有効なセグメント（'.' は深さに加算しない）
+        if seg_len != 1 || bytes.get(segment_start).unwrap_or(0) != 46 {
+          depth = depth + 1;
+          if depth > max_path_depth() {
+            return Err(ContainerError.LimitExceeded("パスの階層深さが上限 (16) を超過しています。"));
+          }
+        }
+      }
+      segment_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// 単一 Tar ヘッダ (512 byte) の検査
+// ---------------------------------------------------------------------------
+
+pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
+  intent "512 バイトの Tar ヘッダを検査・パースし、安全な TarEntry を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if header.len() != 512 {
+    return Err(ContainerError.Corrupt("Tar ヘッダのサイズが 512 バイトではありません。"));
+  }
+
+  // 全ゼロブロックの判定 (終端マーカー)
+  let mut all_zero = true;
+  let mut z_i = 0;
+  while z_i < 512 {
+    if header.get(z_i).unwrap_or(0) != 0 {
+      all_zero = false;
+      z_i = 512;  // 早期脱出
+    } else {
+      z_i = z_i + 1;
+    }
+  }
+  if all_zero {
+    return Ok(TarEntry { path: "", size: 0, typeflag: 255, linkname: "" });
+    // 終端マーカー
+  }
+
+  // 1. typeflag (156)
+  let mut typeflag = header.get(156).unwrap_or(48);  // '0' = 48
+
+  // 危険な特殊ファイルの拒否:
+  // '3': Character device
+  // '4': Block device
+  // '6': FIFO
+  if typeflag == 51 || typeflag == 52 || typeflag == 54 {
+    return Err(ContainerError.LayerValidation("デバイスノードまたは FIFO 等の特殊ファイルは拒否されます。"));
+  }
+
+  // 未対応の拡張ヘッダ型 (PAX / GNU) の拒否:
+  // 'x': 120 (PAX extended header)
+  // 'g': 103 (PAX global extended header)
+  // 'L': 76 (GNU long filename)
+  // 'K': 75 (GNU long linkname)
+  if typeflag == 120 || typeflag == 103 || typeflag == 76 || typeflag == 75 {
+    return Err(ContainerError.LayerValidation("未対応の拡張ヘッダ型 (PAX または GNU 拡張ヘッダ: x, g, L, K) は実効パス・リンク先検証が未対応のため拒否されます。"));
+  }
+
+  // GNU sparse エントリ ('S' = 83) の拒否:
+  // realsize フィールドによるサイズ上限の迂回を防ぐため、sparse メタデータと論理サイズの明示的な検証が未対応なエントリを拒否する
+  if typeflag == 83 {
+    return Err(ContainerError.LayerValidation("GNU sparse エントリ (typeflag 'S') は sparse メタデータと論理サイズの明示的な検証が未対応のため拒否されます。"));
+  }
+
+  // 2. ファイル名抽出 (0..100) と prefix (345..500)
+  let mut name_part = "";
+  match extract_cstring(&header, 0, 100) {
+    Ok(s) => {
+      name_part = s;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // ヘッダ形式 (magic / version) の確認とレイアウト判定:
+  // - POSIX ustar: magic "ustar\0" (257..263), version "00" (263..265) -> bytes 345..500 を pathname prefix として解釈
+  // - 旧 GNU 形式: magic "ustar " (257..263) -> bytes 345 以降は GNU メタデータ (atime 等) であり prefix ではない
+  // - V7 形式: magic がすべて 0 -> prefix は存在しない
+  // - 未対応の形式: それ以外の未知の magic はパス結合前に拒否
+  let m0 = header.get(257).unwrap_or(0);
+  let m1 = header.get(258).unwrap_or(0);
+  let m2 = header.get(259).unwrap_or(0);
+  let m3 = header.get(260).unwrap_or(0);
+  let m4 = header.get(261).unwrap_or(0);
+  let m5 = header.get(262).unwrap_or(0);
+  let v0 = header.get(263).unwrap_or(0);
+  let v1 = header.get(264).unwrap_or(0);
+
+  let is_ustar = m0 == 117 && m1 == 115 && m2 == 116 && m3 == 97 && m4 == 114 && m5 == 0 && v0 == 48 && v1 == 48;
+  let is_oldgnu = m0 == 117 && m1 == 115 && m2 == 116 && m3 == 97 && m4 == 114 && m5 == 32;
+  let is_v7 = m0 == 0 && m1 == 0 && m2 == 0 && m3 == 0 && m4 == 0 && m5 == 0;
+
+  if !is_ustar && !is_oldgnu && !is_v7 {
+    return Err(ContainerError.LayerValidation("未対応の tar ヘッダ形式 (magic/version) です。"));
+  }
+
+  let mut prefix_part = "";
+  if is_ustar {
+    match extract_cstring(&header, 345, 155) {
+      Ok(s) => {
+        prefix_part = s;
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  let mut full_path = name_part.clone();
+  if prefix_part.len() > 0 {
+    let mut p_buf = Bytes.new();
+    p_buf.extend(&prefix_part.as_bytes());
+    p_buf.push(47);  // '/'
+    p_buf.extend(&name_part.as_bytes());
+    match p_buf.to_string_utf8() {
+      Ok(s) => {
+        full_path = s;
+      }
+      Err(_) => {
+        return Err(ContainerError.LayerValidation("パスの結合結果が無効な UTF-8 シーケンスです。"));
+      }
+    }
+  }
+
+  // パスの安全性検査
+  match validate_path(&full_path) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // レガシーディレクトリヘッダの正規化:
+  // typeflag が NUL(0) または '0'(48) で名前が '/' で終わるエントリはディレクトリ ('5' = 53) として正規化する。
+  // これにより、非ゼロサイズを持つレガシーディレクトリエントリが通常ファイルとして扱われ、
+  // 後続の悪意あるヘッダがペイロードとしてスキップされる迂回を防ぐ。
+  let path_bytes = full_path.as_bytes();
+  if (typeflag == 0 || typeflag == 48) && path_bytes.len() > 0 && path_bytes.get(path_bytes.len() - 1).unwrap_or(0) == 47 {
+    typeflag = 53;
+  }
+
+  // 3. サイズ (124..136)
+  let mut size = 0;
+  match parse_octal(&header, 124, 12) {
+    Ok(s) => {
+      size = s;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 展開爆弾対策: 単一ファイルサイズの上限検査
+  if size > max_layer_size() {
+    return Err(ContainerError.LimitExceeded("ファイルサイズが層の最大容量 (1 GiB) を超過しています (展開爆弾拒否)。"));
+  }
+
+  // ディレクトリ ('5' = 53)、ハードリンク ('1' = 49)、シンボリックリンク ('2' = 50) で 0 でない payload サイズを拒否
+  // (無条件スキップが後続ヘッダの検証逃れを招くのを防止)
+  if (typeflag == 53 || typeflag == 49 || typeflag == 50) && size != 0 {
+    return Err(ContainerError.LayerValidation("ディレクトリ、ハードリンク、シンボリックリンクのエントリで 0 でないサイズが指定されています。"));
+  }
+
+  // 4. linkname (157..257) - シンボリックリンク / ハードリンク
+  let mut linkname = "";
+  if typeflag == 49 || typeflag == 50 {  // '1' (hardlink) または '2' (symlink)
+    match extract_cstring(&header, 157, 100) {
+      Ok(s) => {
+        linkname = s;
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+    // リンク先のトラバーサル検査: 絶対パスまたは上位参照 .. の拒否
+    match validate_path(&linkname) {
+      Ok(_) => {}
+      Err(_) => {
+        return Err(ContainerError.LayerValidation("リンク先が無効または上位参照を含んでいます。"));
+      }
+    }
+  }
+
+  return Ok(TarEntry { path: full_path, size: size, typeflag: typeflag, linkname: linkname });
+}
+
+// ---------------------------------------------------------------------------
+// 層全体の検査 (非圧縮 tar ストリームのシミュレーション検査)
+// ---------------------------------------------------------------------------
+
+pub fn validate_tar_archive(tar_bytes: &Bytes) -> Result<Int, ContainerError>
+  intent "非圧縮 tar アーカイブ全体を安全に検査し、総エントリ数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if tar_bytes.len() < 512 {
+    return Err(ContainerError.Corrupt("アーカイブが不正です: 1 ヘッダ (512 バイト) 未満の入力です。"));
+  }
+  if tar_bytes.len() % 512 != 0 {
+    return Err(ContainerError.Corrupt("アーカイブのサイズが 512 バイト境界に揃っていません (不完全な末尾ヘッダまたは断片)。"));
+  }
+  if tar_bytes.len() > max_layer_size() {
+    return Err(ContainerError.LimitExceeded("層のサイズが最大容量 (1 GiB) を超過しています。"));
+  }
+
+  let mut offset = 0;
+  let mut entry_count = 0;
+  let mut total_unpacked_size = 0;
+  let mut reached_end = false;
+
+  while offset + 512 <= tar_bytes.len() && !reached_end {
+    let header_slice = tar_bytes.slice(offset, offset + 512).unwrap_or(Bytes.new());
+    let mut entry = TarEntry { path: "", size: 0, typeflag: 0, linkname: "" };
+    match inspect_tar_header(&header_slice) {
+      Ok(e) => {
+        entry = e;
+      }
+      Err(err) => {
+        return Err(err);
+      }
+    }
+
+    if entry.typeflag == 255 {
+      // 終端マーカー
+      reached_end = true;
+      offset = offset + 512;
+    } else {
+      entry_count = entry_count + 1;
+      if entry_count > max_file_count() {
+        return Err(ContainerError.LimitExceeded("層内のファイル数が上限 (100,000) を超過しています。"));
+      }
+
+      total_unpacked_size = total_unpacked_size + entry.size;
+      if total_unpacked_size > max_total_image_size() {
+        return Err(ContainerError.LimitExceeded("層の展開合計サイズが上限 (4 GiB) を超過しています (展開爆弾拒否)。"));
+      }
+
+      // 512 バイトブロック境界へ切り上げ
+      let content_blocks = (entry.size + 511) / 512;
+      let payload_size = content_blocks * 512;
+      let next_offset = offset + 512 + payload_size;
+      if next_offset > tar_bytes.len() {
+        return Err(ContainerError.Corrupt("アーカイブが途中で切り詰められています: ペイロードがアーカイブ境界を超過しています。"));
+      }
+      offset = next_offset;
+    }
+  }
+
+  // 終端マーカー以降の検査: 残りブロックがある場合はすべて 0 でなければならない
+  if reached_end {
+    let mut rem_i = offset;
+    while rem_i < tar_bytes.len() {
+      if tar_bytes.get(rem_i).unwrap_or(0) != 0 {
+        return Err(ContainerError.Corrupt("終端マーカーの後に不正なデータが存在します。"));
+      }
+      rem_i = rem_i + 1;
+    }
+  } else if offset < tar_bytes.len() {
+    return Err(ContainerError.Corrupt("アーカイブに不完全な末尾ヘッダが存在します。"));
+  }
+
+  return Ok(entry_count);
+}

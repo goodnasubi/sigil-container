@@ -1,0 +1,29 @@
+module test_runner
+  targets server
+  trust none
+
+use tests.test_bundle.run_bundle_tests;
+use tests.test_spec.run_spec_tests;
+use tests.test_state.run_state_tests;
+use tests.test_tar_fuzz.run_tar_fuzz_tests;
+
+pub fn main() -> Int
+  intent "すべてのテストを実行し、全合格なら 0、不合格があればエラー番号を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !run_spec_tests() {
+    return 1;
+  }
+  if !run_bundle_tests() {
+    return 2;
+  }
+  if !run_tar_fuzz_tests() {
+    return 3;
+  }
+  if !run_state_tests() {
+    return 4;
+  }
+  return 0;
+}

@@ -1,0 +1,628 @@
+module container.spec
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.default_non_root_gid;
+use container.limits.default_non_root_uid;
+use container.limits.max_env_var_count;
+use container.limits.max_log_size;
+use container.limits.max_mount_count;
+use container.limits.max_port_count;
+use container.limits.max_spec_size;
+
+// ADR 0053 決定 1・3: バックエンド非依存のコンテナ仕様
+// 純 Sigil (effects none) の型・検証・変換として実装する。
+
+pub struct PortMapping {
+  host_port: Int,
+  container_port: Int,
+  protocol: String,
+  host_ip: String,
+}
+
+pub struct Mount {
+  source: String,
+  destination: String,
+  readonly: Bool,
+  mount_type: String,
+}
+
+pub struct EnvVar {
+  key: String,
+  value: String,
+}
+
+pub struct SecretFile {
+  name: String,
+  mount_path: String,
+}
+
+pub enum RestartPolicy {
+  No,
+  Always,
+  OnFailure(Int, Int),  // max_retries, backoff_ms
+}
+
+pub struct Resources {
+  memory_max_bytes: Int,
+  cpu_quota_us: Int,
+  pids_max: Int,
+  disk_max_bytes: Int,
+  log_max_bytes: Int,
+}
+
+pub struct Isolation {
+  uid: Int,
+  gid: Int,
+  privileged: Bool,
+  share_host_pid: Bool,
+  share_host_ipc: Bool,
+  share_host_uts: Bool,
+  share_host_net: Bool,
+  readonly_rootfs: Bool,
+  allowed_capabilities: List<String>,
+  seccomp_profile: String,
+}
+
+pub struct ContainerSpec {
+  image_digest: String,
+  args: List<String>,
+  env_vars: List<EnvVar>,
+  working_dir: String,
+  isolation: Isolation,
+  resources: Resources,
+  network_enabled: Bool,
+  ports: List<PortMapping>,
+  mounts: List<Mount>,
+  secrets: List<SecretFile>,
+  restart_policy: RestartPolicy,
+}
+
+pub fn new_port_mapping(host_port: Int, container_port: Int, protocol: String, host_ip: String) -> PortMapping
+  intent "PortMapping を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return PortMapping { host_port: host_port, container_port: container_port, protocol: protocol, host_ip: host_ip };
+}
+
+pub fn new_mount(source: String, destination: String, readonly: Bool, mount_type: String) -> Mount
+  intent "Mount を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return Mount { source: source, destination: destination, readonly: readonly, mount_type: mount_type };
+}
+
+pub fn new_env_var(key: String, value: String) -> EnvVar
+  intent "EnvVar を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return EnvVar { key: key, value: value };
+}
+
+pub fn new_secret_file(name: String, mount_path: String) -> SecretFile
+  intent "SecretFile を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return SecretFile { name: name, mount_path: mount_path };
+}
+
+pub fn new_resources(memory_max_bytes: Int, cpu_quota_us: Int, pids_max: Int, disk_max_bytes: Int, log_max_bytes: Int) -> Resources
+  intent "Resources を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return Resources { memory_max_bytes: memory_max_bytes, cpu_quota_us: cpu_quota_us, pids_max: pids_max, disk_max_bytes: disk_max_bytes, log_max_bytes: log_max_bytes };
+}
+
+pub fn new_container_spec(image_digest: String, args: List<String>, env_vars: List<EnvVar>, working_dir: String, isolation: Isolation, resources: Resources, network_enabled: Bool, ports: List<PortMapping>, mounts: List<Mount>, secrets: List<SecretFile>, restart_policy: RestartPolicy) -> ContainerSpec
+  intent "ContainerSpec を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return ContainerSpec { image_digest: image_digest, args: args, env_vars: env_vars, working_dir: working_dir, isolation: isolation, resources: resources, network_enabled: network_enabled, ports: ports, mounts: mounts, secrets: secrets, restart_policy: restart_policy };
+}
+
+// ---------------------------------------------------------------------------
+// 危険な Capability の判定
+// ---------------------------------------------------------------------------
+
+pub fn is_dangerous_capability(cap: &String) -> Bool
+  intent "危険な capability (SYS_ADMIN, NET_ADMIN 等) かどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if cap == "CAP_SYS_ADMIN" || cap == "SYS_ADMIN" {
+    return true;
+  }
+  if cap == "CAP_NET_ADMIN" || cap == "NET_ADMIN" {
+    return true;
+  }
+  if cap == "CAP_SYS_PTRACE" || cap == "SYS_PTRACE" {
+    return true;
+  }
+  if cap == "CAP_SYS_RAWIO" || cap == "SYS_RAWIO" {
+    return true;
+  }
+  if cap == "CAP_SYS_MODULE" || cap == "SYS_MODULE" {
+    return true;
+  }
+  if cap == "CAP_SYS_BOOT" || cap == "SYS_BOOT" {
+    return true;
+  }
+  if cap == "CAP_DAC_OVERRIDE" || cap == "DAC_OVERRIDE" {
+    return true;
+  }
+  if cap == "CAP_ALL" || cap == "ALL" {
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Digest 形式の検査 (sha256:<64 hex>)
+// ---------------------------------------------------------------------------
+
+fn is_hex_char(b: Int) -> Bool
+  intent "ASCII 16進小文字または数字かを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 48 && b <= 57 {
+    return true;
+  }
+  if b >= 97 && b <= 102 {
+    return true;
+  }
+  return false;
+}
+
+pub fn is_valid_sha256_digest(digest: &String) -> Bool
+  intent "イメージ参照が sha256:<64 hex> 形式かを厳格に判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = digest.as_bytes();
+  // "sha256:" (7文字) + 64 hex = 71 文字
+  if bytes.len() != 71 {
+    return false;
+  }
+  let prefix = bytes.slice(0, 7).unwrap_or(Bytes.new());
+  if prefix != "sha256:".as_bytes() {
+    return false;
+  }
+  let mut i = 7;
+  while i < 71 {
+    let b = bytes.get(i).unwrap_or(0);
+    if !is_hex_char(b) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// マウントパスの語彙的正規化と禁止パス判定
+// ---------------------------------------------------------------------------
+
+fn pop_component(components: &List<String>) -> List<String>
+  intent "末尾の要素を取り除いた新しい List を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut res = List.new();
+  let mut i = 0;
+  let target_len = components.len() - 1;
+  while i < target_len {
+    match components.get(i) {
+      Some(s) => {
+        res.push(s.clone());
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return res;
+}
+
+pub fn normalize_mount_path(path: &String) -> Result<String, ContainerError>
+  intent "マウントパスを語彙的に正規化 (. と .. の解決、重複スラッシュと末尾スラッシュの除去) する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = path.as_bytes();
+  if bytes.len() == 0 || bytes.get(0).unwrap_or(0) != 47 {
+    return Err(ContainerError.SpecValidation("マウントパスは絶対パスである必要があります。"));
+  }
+
+  let mut components = List.new();
+  let mut i = 1;
+  let mut seg_start = 1;
+
+  while i <= bytes.len() {
+    let mut is_delim = false;
+    if i == bytes.len() {
+      is_delim = true;
+    } else if bytes.get(i).unwrap_or(0) == 47 {
+      is_delim = true;
+    }
+
+    if is_delim {
+      let seg_len = i - seg_start;
+      if seg_len > 0 {
+        let seg_slice = bytes.slice(seg_start, i).unwrap_or(Bytes.new());
+        let mut seg_str = "";
+        match seg_slice.to_string_utf8() {
+          Ok(s) => {
+            seg_str = s;
+          }
+          Err(_) => {
+            return Err(ContainerError.SpecValidation("マウントパスに不正な UTF-8 バイトが含まれています。"));
+          }
+        }
+        if seg_str == "." {
+          // カレントディレクトリ参照は無視
+        } else if seg_str == ".." {
+          // 上位参照
+          if components.len() == 0 {
+            return Err(ContainerError.SpecValidation("マウントパスにルートを超える上位参照 (..) は使用できません。"));
+          }
+          components = pop_component(&components);
+        } else {
+          components.push(seg_str);
+        }
+      }
+      seg_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  if components.len() == 0 {
+    return Ok("/");
+  }
+
+  let mut buf = Bytes.new();
+  let mut comp_i = 0;
+  while comp_i < components.len() {
+    buf.push(47);  // '/'
+    match components.get(comp_i) {
+      Some(c) => {
+        buf.extend(&c.as_bytes());
+      }
+      None => {}
+    }
+    comp_i = comp_i + 1;
+  }
+
+  return match buf.to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(ContainerError.SpecValidation("マウントパスの正規化に失敗しました。")),
+  };
+}
+
+fn is_forbidden_mount_path(norm_path: &String) -> Bool
+  intent "正規化後のパスが /proc, /sys, /dev 直下または配下であるかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if norm_path == "/proc" || norm_path == "/sys" || norm_path == "/dev" {
+    return true;
+  }
+  let bytes = norm_path.as_bytes();
+  if bytes.slice(0, 6).unwrap_or(Bytes.new()) == "/proc/".as_bytes() {
+    return true;
+  }
+  if bytes.slice(0, 5).unwrap_or(Bytes.new()) == "/sys/".as_bytes() {
+    return true;
+  }
+  if bytes.slice(0, 5).unwrap_or(Bytes.new()) == "/dev/".as_bytes() {
+    return true;
+  }
+  return false;
+}
+
+pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
+  intent "コンテナ仕様内の可変長フィールド (args, env_vars, mounts, ports, secrets, working_dir, image_digest 等) のバイト長累積サイズを計算する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut total = 0;
+  total = total + spec.image_digest.as_bytes().len();
+  total = total + spec.working_dir.as_bytes().len();
+  total = total + spec.isolation.seccomp_profile.as_bytes().len();
+
+  let mut i = 0;
+  while i < spec.args.len() {
+    match spec.args.get(i) {
+      Some(a) => {
+        total = total + a.as_bytes().len();
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  let mut j = 0;
+  while j < spec.env_vars.len() {
+    match spec.env_vars.get(j) {
+      Some(e) => {
+        total = total + e.key.as_bytes().len();
+        total = total + e.value.as_bytes().len();
+      }
+      None => {}
+    }
+    j = j + 1;
+  }
+
+  let mut k = 0;
+  while k < spec.mounts.len() {
+    match spec.mounts.get(k) {
+      Some(m) => {
+        total = total + m.source.as_bytes().len();
+        total = total + m.destination.as_bytes().len();
+        total = total + m.mount_type.as_bytes().len();
+      }
+      None => {}
+    }
+    k = k + 1;
+  }
+
+  let mut c = 0;
+  while c < spec.isolation.allowed_capabilities.len() {
+    match spec.isolation.allowed_capabilities.get(c) {
+      Some(cap) => {
+        total = total + cap.as_bytes().len();
+      }
+      None => {}
+    }
+    c = c + 1;
+  }
+
+  let mut p = 0;
+  while p < spec.ports.len() {
+    match spec.ports.get(p) {
+      Some(port) => {
+        total = total + port.protocol.as_bytes().len();
+        total = total + port.host_ip.as_bytes().len();
+      }
+      None => {}
+    }
+    p = p + 1;
+  }
+
+  let mut s = 0;
+  while s < spec.secrets.len() {
+    match spec.secrets.get(s) {
+      Some(sec) => {
+        total = total + sec.name.as_bytes().len();
+        total = total + sec.mount_path.as_bytes().len();
+      }
+      None => {}
+    }
+    s = s + 1;
+  }
+
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// 既定拒否の安全な Isolation 生成ヘルパー
+// ---------------------------------------------------------------------------
+
+pub fn default_secure_isolation() -> Isolation
+  intent "既定拒否に準拠した安全な Isolation 設定を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return Isolation { uid: default_non_root_uid(), gid: default_non_root_gid(), privileged: false, share_host_pid: false, share_host_ipc: false, share_host_uts: false, share_host_net: false, readonly_rootfs: true, allowed_capabilities: List.new(), seccomp_profile: "default_whitelist" };
+}
+
+// ---------------------------------------------------------------------------
+// 仕様の検証 (ADR 0053 決定 1・3 準拠)
+// ---------------------------------------------------------------------------
+
+pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
+  intent "コンテナ仕様を既定拒否の規則に基づいて検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 0. 仕様全体の累積サイズ上限 (max_spec_size: 64 KiB = 65536 byte)
+  if calculate_spec_size(&spec) > max_spec_size() {
+    return Err(ContainerError.LimitExceeded("仕様全体のサイズが上限 (64 KiB) を超過しています。"));
+  }
+  // 1. イメージ参照: SHA-256 digest 固定 (タグ単体は拒否)
+  if !is_valid_sha256_digest(&spec.image_digest) {
+    return Err(ContainerError.SpecValidation("イメージ参照は内容の SHA-256 digest (sha256:<64 hex>) で固定する必要があります。タグ単体の参照は拒否されます。"));
+  }
+
+  // 2. 隔離プロファイル: 非 root 必須
+  if spec.isolation.uid == 0 || spec.isolation.gid == 0 {
+    return Err(ContainerError.SpecValidation("非 root 実行が必須です (UID 0 / GID 0 は拒否されます)。"));
+  }
+  if spec.isolation.uid < 0 || spec.isolation.gid < 0 {
+    return Err(ContainerError.SpecValidation("UID / GID は正の整数である必要があります。"));
+  }
+
+  // 3. 特権 (privileged) の禁止
+  if spec.isolation.privileged {
+    return Err(ContainerError.SpecValidation("privileged コンテナは許可されません (ADR 0053 決定 3: 既定拒否)。"));
+  }
+
+  // 4. host namespace 共有の禁止 (PID, IPC, UTS, Network)
+  if spec.isolation.share_host_pid {
+    return Err(ContainerError.SpecValidation("host PID namespace の共有は禁止されています。"));
+  }
+  if spec.isolation.share_host_ipc {
+    return Err(ContainerError.SpecValidation("host IPC namespace の共有は禁止されています。"));
+  }
+  if spec.isolation.share_host_uts {
+    return Err(ContainerError.SpecValidation("host UTS namespace の共有は禁止されています。"));
+  }
+  if spec.isolation.share_host_net {
+    return Err(ContainerError.SpecValidation("host network namespace の共有は禁止されています。"));
+  }
+
+  // 5. rootfs 読み取り専用の必須
+  if !spec.isolation.readonly_rootfs {
+    return Err(ContainerError.SpecValidation("rootfs は読み取り専用である必要があります (readonly_rootfs = true が必須)。書き込みは宣言した一時領域またはボリュームに限られます。"));
+  }
+
+  // 6. Capability: 危険な capability の禁止
+  let mut cap_idx = 0;
+  while cap_idx < spec.isolation.allowed_capabilities.len() {
+    match spec.isolation.allowed_capabilities.get(cap_idx) {
+      Some(cap) => {
+        if is_dangerous_capability(&cap) {
+          return Err(ContainerError.SpecValidation("危険な capability は拒否されます。"));
+        }
+      }
+      None => {}
+    }
+    cap_idx = cap_idx + 1;
+  }
+
+  // 7. Seccomp: 必須 (空は拒否、解決できないプロファイルは拒否)
+  if spec.isolation.seccomp_profile.len() == 0 {
+    return Err(ContainerError.SpecValidation("seccomp プロファイルの指定が必須です (既定は許可リスト)。"));
+  }
+  if spec.isolation.seccomp_profile != "default_whitelist" && spec.isolation.seccomp_profile != "default" {
+    return Err(ContainerError.SpecValidation("未対応または解決できない seccomp プロファイルです。"));
+  }
+
+  // 8. 資源上限: メモリ・CPU・pids・ディスク・ログがすべて必須 (> 0)
+  if spec.resources.memory_max_bytes <= 0 {
+    return Err(ContainerError.SpecValidation("メモリ上限 (memory_max_bytes) の指定が必須です (未指定または 0 以下は仕様エラー)。"));
+  }
+  if spec.resources.cpu_quota_us <= 0 {
+    return Err(ContainerError.SpecValidation("CPU クォータ (cpu_quota_us) の指定が disciplinary 必須です (未指定または 0 以下は仕様エラー)。"));
+  }
+  if spec.resources.pids_max <= 0 {
+    return Err(ContainerError.SpecValidation("プロセス数上限 (pids_max) の指定が必須です (未指定または 0 以下は仕様エラー)。"));
+  }
+  if spec.resources.disk_max_bytes <= 0 {
+    return Err(ContainerError.SpecValidation("ディスク上限 (disk_max_bytes) の指定が必須です (未指定または 0 以下は仕様エラー)。"));
+  }
+  if spec.resources.log_max_bytes <= 0 {
+    return Err(ContainerError.SpecValidation("ログ量上限 (log_max_bytes) の指定が必須です (未指定または 0 以下は仕様エラー)。"));
+  }
+  if spec.resources.log_max_bytes > max_log_size() {
+    return Err(ContainerError.LimitExceeded("ログ量上限がシステム最大許容値を超過しています。"));
+  }
+
+  // 9. ネットワーク: 既定で接続なし。無効時のポート公開は拒否
+  if !spec.network_enabled && spec.ports.len() > 0 {
+    return Err(ContainerError.SpecValidation("ネットワークが無効化されているコンテナでポートマッピングを宣言することはできません。"));
+  }
+  if spec.ports.len() > max_port_count() {
+    return Err(ContainerError.LimitExceeded("宣言されたポートマッピング数が上限を超過しています。"));
+  }
+  let mut p_idx = 0;
+  while p_idx < spec.ports.len() {
+    match spec.ports.get(p_idx) {
+      Some(p) => {
+        if p.container_port <= 0 || p.container_port > 65535 {
+          return Err(ContainerError.SpecValidation("コンテナポート番号が不正です。"));
+        }
+        if p.host_port <= 0 || p.host_port > 65535 {
+          return Err(ContainerError.SpecValidation("ホストポート番号が不正です。"));
+        }
+        // 初版は外部公開しないため、host_ip は 127.0.0.1 または内部アドレスのみ
+        if p.host_ip == "0.0.0.0" {
+          return Err(ContainerError.SpecValidation("ポートの全方位公開 (0.0.0.0) は拒否されます。ループバックまたは宣言された内部アドレスに限定してください。"));
+        }
+      }
+      None => {}
+    }
+    p_idx = p_idx + 1;
+  }
+
+  // 10. マウント: host パスは許可リストに載ったものに限り、/proc, /sys, デバイスは既定で出さない
+  if spec.mounts.len() > max_mount_count() {
+    return Err(ContainerError.LimitExceeded("宣言されたマウント数が上限を超過しています。"));
+  }
+  let mut m_idx = 0;
+  while m_idx < spec.mounts.len() {
+    match spec.mounts.get(m_idx) {
+      Some(m) => {
+        let mut norm_dst = "";
+        match normalize_mount_path(&m.destination) {
+          Ok(p) => {
+            norm_dst = p;
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        }
+        let mut norm_src = "";
+        match normalize_mount_path(&m.source) {
+          Ok(p) => {
+            norm_src = p;
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        }
+        if norm_dst == "/" {
+          return Err(ContainerError.SpecValidation("コンテナのルート (/) への直接上書きマウントは拒否されます。"));
+        }
+        if is_forbidden_mount_path(&norm_dst) {
+          return Err(ContainerError.SpecValidation("/proc, /sys, /dev 直下および配下へのマウントは拒否されます。"));
+        }
+        if norm_src == "/" {
+          return Err(ContainerError.SpecValidation("ホストのルート (/) のマウントは既定拒否されます。"));
+        }
+        if is_forbidden_mount_path(&norm_src) {
+          return Err(ContainerError.SpecValidation("ホストの /proc, /sys, /dev 直下および配下のマウントは既定拒否されます。"));
+        }
+      }
+      None => {}
+    }
+    m_idx = m_idx + 1;
+  }
+
+  // 11. 作業ディレクトリ: 絶対パス必須
+  if spec.working_dir.len() == 0 || spec.working_dir.as_bytes().get(0).unwrap_or(0) != 47 {
+    return Err(ContainerError.SpecValidation("working_dir は絶対パスである必要があります。"));
+  }
+
+  // 12. 環境変数個数上限
+  if spec.env_vars.len() > max_env_var_count() {
+    return Err(ContainerError.LimitExceeded("環境変数の個数が上限を超過しています。"));
+  }
+
+  // 13. 秘密: 秘密はファイル渡しであり、環境変数名にパスワードやシークレットを直接入れない
+  let mut env_idx = 0;
+  while env_idx < spec.env_vars.len() {
+    match spec.env_vars.get(env_idx) {
+      Some(env) => {
+        if env.key == "PASSWORD" || env.key == "SECRET" || env.key == "TOKEN" || env.key == "API_KEY" {
+          return Err(ContainerError.SpecValidation("秘密は環境変数でなくファイル (メモリ上) で渡す必要があります (仕様・状態・ログ・エラーに値を出さない)。"));
+        }
+      }
+      None => {}
+    }
+    env_idx = env_idx + 1;
+  }
+
+  return Ok(true);
+}

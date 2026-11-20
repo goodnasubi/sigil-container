@@ -1,0 +1,372 @@
+module tests.test_spec
+  targets server
+  trust none
+
+use container.error.error_kind_name;
+use container.limits.max_spec_size;
+use container.spec.ContainerSpec;
+use container.spec.RestartPolicy;
+use container.spec.calculate_spec_size;
+use container.spec.default_secure_isolation;
+use container.spec.new_container_spec;
+use container.spec.new_env_var;
+use container.spec.new_mount;
+use container.spec.new_port_mapping;
+use container.spec.new_resources;
+use container.spec.validate_spec;
+
+fn make_repeated_string(len: Int) -> String
+  intent "指定された長さの繰り返し文字列を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";  // 64 bytes
+  let mut buf = Bytes.new();
+  while buf.len() + 64 <= len {
+    buf.extend(&chunk.as_bytes());
+  }
+  let rem = len - buf.len();
+  if rem > 0 {
+    let rem_slice = chunk.as_bytes().slice(0, rem).unwrap_or(Bytes.new());
+    buf.extend(&rem_slice);
+  }
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
+
+fn create_valid_test_spec() -> ContainerSpec
+  intent "正常なテスト用 ContainerSpec を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut args = List.new();
+  args.push("/app");
+
+  let mut env_vars = List.new();
+  env_vars.push(new_env_var("APP_ENV", "production"));
+
+  let iso = default_secure_isolation();
+
+  let res = new_resources(536870912, 100000, 256, 1073741824, 10485760);
+
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 8080, "tcp", "127.0.0.1"));
+
+  let mut mounts = List.new();
+  mounts.push(new_mount("/var/data", "/app/data", true, "bind"));
+
+  return new_container_spec("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", args, env_vars, "/app", iso, res, true, ports, mounts, List.new(), RestartPolicy.Always);
+}
+
+pub fn run_spec_tests() -> Bool
+  intent "コンテナ仕様の型と検証、既定拒否の規則をテストする"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 正常な仕様の検証がパスすること
+  let spec = create_valid_test_spec();
+  match validate_spec(&spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 特権 (privileged) の拒否
+  let mut priv_spec = create_valid_test_spec();
+  priv_spec.isolation.privileged = true;
+  match validate_spec(&priv_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 3. host PID / IPC / UTS / Net namespace 共有の拒否
+  let mut pid_spec = create_valid_test_spec();
+  pid_spec.isolation.share_host_pid = true;
+  match validate_spec(&pid_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+  let mut net_spec = create_valid_test_spec();
+  net_spec.isolation.share_host_net = true;
+  match validate_spec(&net_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 4. root 実行 (uid 0) の拒否
+  let mut root_spec = create_valid_test_spec();
+  root_spec.isolation.uid = 0;
+  match validate_spec(&root_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 5. 危険な capability (CAP_SYS_ADMIN 等) の拒否
+  let mut cap_spec = create_valid_test_spec();
+  cap_spec.isolation.allowed_capabilities.push("CAP_SYS_ADMIN");
+  match validate_spec(&cap_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 6. rootfs 読み取り専用違反 (readonly_rootfs = false) の拒否
+  let mut rw_spec = create_valid_test_spec();
+  rw_spec.isolation.readonly_rootfs = false;
+  match validate_spec(&rw_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 7. 資源上限なし (メモリ 0 / 未指定) の拒否
+  let mut no_mem_spec = create_valid_test_spec();
+  no_mem_spec.resources.memory_max_bytes = 0;
+  match validate_spec(&no_mem_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 8. 資源上限なし (CPU 0) の拒否
+  let mut no_cpu_spec = create_valid_test_spec();
+  no_cpu_spec.resources.cpu_quota_us = 0;
+  match validate_spec(&no_cpu_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 9. 資源上限なし (pids 0) の拒否
+  let mut no_pids_spec = create_valid_test_spec();
+  no_pids_spec.resources.pids_max = 0;
+  match validate_spec(&no_pids_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 10. イメージ参照のタグのみ・不正 digest の拒否
+  let mut tag_spec = create_valid_test_spec();
+  tag_spec.image_digest = "sigil-app:latest";
+  match validate_spec(&tag_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 11. host マウント (/proc, /sys 等の既定露出) の拒否
+  let mut proc_spec = create_valid_test_spec();
+  proc_spec.mounts.push(new_mount("/proc", "/host_proc", true, "bind"));
+  match validate_spec(&proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 12. ポートの全方位公開 (0.0.0.0) の拒否
+  let mut pub_port_spec = create_valid_test_spec();
+  pub_port_spec.ports.push(new_port_mapping(9000, 9000, "tcp", "0.0.0.0"));
+  match validate_spec(&pub_port_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 13. 回帰テスト: 未解決 seccomp プロファイルの拒否
+  let mut seccomp_spec = create_valid_test_spec();
+  seccomp_spec.isolation.seccomp_profile = "unknown_profile";
+  match validate_spec(&seccomp_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14. 回帰テスト: マウントパス正規化と /proc, /sys, /dev の厳格な拒否
+  // 14a. 末尾スラッシュ付き /proc/ の拒否
+  let mut slash_proc_spec = create_valid_test_spec();
+  slash_proc_spec.mounts = List.new();
+  slash_proc_spec.mounts.push(new_mount("/proc/", "/host_proc", true, "bind"));
+  match validate_spec(&slash_proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14b. 上位参照を含む /var/../proc の拒否
+  let mut dotdot_proc_spec = create_valid_test_spec();
+  dotdot_proc_spec.mounts = List.new();
+  dotdot_proc_spec.mounts.push(new_mount("/var/../proc", "/host_proc", true, "bind"));
+  match validate_spec(&dotdot_proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14c. /sys/ 配下の拒否
+  let mut sys_sub_spec = create_valid_test_spec();
+  sys_sub_spec.mounts = List.new();
+  sys_sub_spec.mounts.push(new_mount("/sys/kernel", "/host_sys", true, "bind"));
+  match validate_spec(&sys_sub_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14d. /dev/ 配下の拒否
+  let mut dev_sub_spec = create_valid_test_spec();
+  dev_sub_spec.mounts = List.new();
+  dev_sub_spec.mounts.push(new_mount("/dev/shm", "/host_dev", true, "bind"));
+  match validate_spec(&dev_sub_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14e. マウント先 (destination) の /proc/, /sys/, /dev/ へのマウント拒否
+  let mut dst_proc_spec = create_valid_test_spec();
+  dst_proc_spec.mounts = List.new();
+  dst_proc_spec.mounts.push(new_mount("/var/data", "/proc/", true, "bind"));
+  match validate_spec(&dst_proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  let mut dst_dotdot_spec = create_valid_test_spec();
+  dst_dotdot_spec.mounts = List.new();
+  dst_dotdot_spec.mounts.push(new_mount("/var/data", "/var/../dev", true, "bind"));
+  match validate_spec(&dst_dotdot_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14f. 正規化後に安全なマウント (/var/data/../data -> /var/data) は通過すること
+  let mut norm_ok_spec = create_valid_test_spec();
+  norm_ok_spec.mounts = List.new();
+  norm_ok_spec.mounts.push(new_mount("/var/data/../data", "/app/data/.", true, "bind"));
+  match validate_spec(&norm_ok_spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 15a. 回帰テスト (指摘 2): 単一の引数が 64 KiB (65536 byte) を超える仕様の拒否
+  let mut large_arg_spec = create_valid_test_spec();
+  large_arg_spec.args.push(make_repeated_string(65537));
+  match validate_spec(&large_arg_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 15b. 回帰テスト (指摘 2): 単一の環境変数値が 64 KiB を超える仕様の拒否
+  let mut large_env_spec = create_valid_test_spec();
+  large_env_spec.env_vars.push(new_env_var("TEST_LARGE_ENV", make_repeated_string(65537)));
+  match validate_spec(&large_env_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 15c. 回帰テスト (指摘 2): 多数の引数の累積が 64 KiB を超える仕様の拒否
+  let mut many_args_spec = create_valid_test_spec();
+  let arg_chunk = make_repeated_string(1000);
+  let mut arg_c = 0;
+  while arg_c < 70 {
+    many_args_spec.args.push(arg_chunk.clone());
+    arg_c = arg_c + 1;
+  }
+  match validate_spec(&many_args_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 15d. 回帰テスト (指摘 2): 境界値検証 (累積サイズがちょうど 65536 byte は通過し、65537 byte は拒否)
+  let mut boundary_spec = create_valid_test_spec();
+  boundary_spec.args = List.new();
+  boundary_spec.env_vars = List.new();
+  boundary_spec.ports = List.new();
+  boundary_spec.mounts = List.new();
+  let base_size = calculate_spec_size(&boundary_spec);
+  let exact_arg_len = max_spec_size() - base_size;
+  boundary_spec.args.push(make_repeated_string(exact_arg_len));
+  if calculate_spec_size(&boundary_spec) != 65536 {
+    return false;
+  }
+  match validate_spec(&boundary_spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut over_boundary_spec = create_valid_test_spec();
+  over_boundary_spec.args = List.new();
+  over_boundary_spec.env_vars = List.new();
+  over_boundary_spec.ports = List.new();
+  over_boundary_spec.mounts = List.new();
+  over_boundary_spec.args.push(make_repeated_string(exact_arg_len + 1));
+  if calculate_spec_size(&over_boundary_spec) != 65537 {
+    return false;
+  }
+  match validate_spec(&over_boundary_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

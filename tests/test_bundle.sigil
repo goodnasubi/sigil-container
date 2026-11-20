@@ -1,0 +1,270 @@
+module tests.test_bundle
+  targets server
+  trust none
+
+use container.error.error_kind_name;
+use container.oci_spec.append_raw_escaped;
+use container.oci_spec.generate_oci_config_json;
+use container.spec.ContainerSpec;
+use container.spec.RestartPolicy;
+use container.spec.default_secure_isolation;
+use container.spec.new_container_spec;
+use container.spec.new_env_var;
+use container.spec.new_mount;
+use container.spec.new_port_mapping;
+use container.spec.new_resources;
+
+fn bytes_contains(haystack: &Bytes, needle: &Bytes) -> Bool
+  intent "haystack 内に needle バイト列が含まれるかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if needle.len() == 0 {
+    return true;
+  }
+  if haystack.len() < needle.len() {
+    return false;
+  }
+  let max_start = haystack.len() - needle.len();
+  let mut i = 0;
+  while i <= max_start {
+    let mut matched = true;
+    let mut j = 0;
+    while j < needle.len() && matched {
+      let b_h = haystack.get(i + j).unwrap_or(0);
+      let b_n = needle.get(j).unwrap_or(0);
+      if b_h != b_n {
+        matched = false;
+      }
+      j = j + 1;
+    }
+    if matched {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn create_sample_spec() -> ContainerSpec
+  intent "バンドル生成用の標準的な ContainerSpec を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut args = List.new();
+  args.push("/app");
+  args.push("--port");
+  args.push("8080");
+
+  let mut env_vars = List.new();
+  env_vars.push(new_env_var("APP_ENV", "production"));
+  env_vars.push(new_env_var("LOG_LEVEL", "info"));
+
+  let mut iso = default_secure_isolation();
+  iso.allowed_capabilities.push("CAP_NET_BIND_SERVICE");
+
+  let res = new_resources(268435456, 50000, 128, 536870912, 5242880);
+
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 8080, "tcp", "127.0.0.1"));
+
+  let mut mounts = List.new();
+  mounts.push(new_mount("/var/tmp", "/tmp", false, "tmpfs"));
+
+  return new_container_spec("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", args, env_vars, "/app", iso, res, true, ports, mounts, List.new(), RestartPolicy.Always);
+}
+
+pub fn run_bundle_tests() -> Bool
+  intent "決定的な OCI runtime-spec bundle 生成のテストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  let spec = create_sample_spec();
+
+  // 1回目生成
+  let mut json1 = "";
+  match generate_oci_config_json(&spec) {
+    Ok(j) => {
+      json1 = j;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2回目生成
+  let mut json2 = "";
+  match generate_oci_config_json(&spec) {
+    Ok(j) => {
+      json2 = j;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 完全一致の検証 (決定性: 同じ入力からはバイト単位で完全に同一の出力が出る)
+  if json1 != json2 {
+    return false;
+  }
+
+  // 必須キーの含有確認
+  if json1.len() == 0 {
+    return false;
+  }
+
+  // 1. 回帰テスト: seccomp 設定が linux オブジェクトに出力されていること
+  if !bytes_contains(&json1.as_bytes(), &"\"seccomp\":".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"defaultAction\":\"SCMP_ACT_ERRNO\"".as_bytes()) {
+    return false;
+  }
+
+  // 2. 回帰テスト: 未解決の seccomp プロファイルはエラーで拒否されること
+  let mut bad_seccomp_spec = create_sample_spec();
+  bad_seccomp_spec.isolation.seccomp_profile = "unknown_profile";
+  match generate_oci_config_json(&bad_seccomp_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 3. 回帰テスト: JSON 制御文字 (0x20 未満) の \u00XX エスケープ
+  let mut ctrl_bytes = Bytes.new();
+  ctrl_bytes.push(7);  // BEL (0x07)
+  ctrl_bytes.push(8);  // BS (0x08)
+  ctrl_bytes.push(12);  // FF (0x0c)
+  ctrl_bytes.push(27);  // ESC (0x1b)
+  let ctrl_str = match ctrl_bytes.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+  let mut out_buf = Bytes.new();
+  append_raw_escaped(&mut out_buf, &ctrl_str);
+  let escaped = match out_buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+  if escaped != "\\u0007\\u0008\\u000c\\u001b" {
+    return false;
+  }
+
+  // generate_oci_config_json を通した制御文字引数のエスケープ出力
+  let mut ctrl_spec = create_sample_spec();
+  ctrl_spec.args.push(ctrl_str);
+  match generate_oci_config_json(&ctrl_spec) {
+    Ok(j) => {
+      if !bytes_contains(&j.as_bytes(), &"\\u0007\\u0008\\u000c\\u001b".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 回帰テスト: マウントパスの正規化出力 (/var/tmp/../tmp/ -> /var/tmp, /app/data/. -> /app/data)
+  let mut norm_mount_spec = create_sample_spec();
+  norm_mount_spec.mounts = List.new();
+  norm_mount_spec.mounts.push(new_mount("/var/tmp/../tmp/", "/app/data/.", true, "bind"));
+  match generate_oci_config_json(&norm_mount_spec) {
+    Ok(j) => {
+      if !bytes_contains(&j.as_bytes(), &"\"source\":\"/var/tmp\"".as_bytes()) {
+        return false;
+      }
+      if !bytes_contains(&j.as_bytes(), &"\"destination\":\"/app/data\"".as_bytes()) {
+        return false;
+      }
+
+      // 6. 回帰テスト (指摘 3): bind マウントの options に "bind" およびアクセスモード (ro/rw) が含まれること
+      if !bytes_contains(&j.as_bytes(), &"\"options\":[\"bind\",\"ro\"]".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 5. 回帰テスト (指摘 1): 既定 seccomp 許可リストに arch_prctl, clone, clone3, rseq が含まれること (x86-64 glibc TLS 初期化およびスレッド作成用)
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は現在、pure モード (effects none / trust none / targets server) で動作しており、
+  // 外部プロセス起動 (fork/exec) や Linux seccomp フィルタの直接適用 (prctl/seccomp システムコール) を行う
+  // 実行機能を持たないため、Sigil 内での実際のフィルター下でのマルチスレッド実行ファイル検証は
+  // 不可能である。したがって、生成される OCI config JSON に arch_prctl, clone, clone3, rseq が含まれることの JSON presence テストで代用する。
+  if !bytes_contains(&json1.as_bytes(), &"\"arch_prctl\"".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"clone\"".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"clone3\"".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"rseq\"".as_bytes()) {
+    return false;
+  }
+
+  // 6 (続き). 回帰テスト (指摘 3): rw bind マウントおよび rbind マウントの options 出力
+  let mut rw_bind_spec = create_sample_spec();
+  rw_bind_spec.mounts = List.new();
+  rw_bind_spec.mounts.push(new_mount("/var/log", "/var/log", false, "bind"));
+  match generate_oci_config_json(&rw_bind_spec) {
+    Ok(j_rw) => {
+      if !bytes_contains(&j_rw.as_bytes(), &"\"options\":[\"bind\",\"rw\"]".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let mut rbind_spec = create_sample_spec();
+  rbind_spec.mounts = List.new();
+  rbind_spec.mounts.push(new_mount("/mnt/storage", "/storage", true, "rbind"));
+  match generate_oci_config_json(&rbind_spec) {
+    Ok(j_rb) => {
+      if !bytes_contains(&j_rb.as_bytes(), &"\"options\":[\"rbind\",\"ro\"]".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 7. 回帰テスト (指摘 2): 仕様サイズ上限超過時に generate_oci_config_json も LimitExceeded で拒否されること
+  let mut over_limit_spec = create_sample_spec();
+  let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";  // 64 bytes
+  let mut large_buf = Bytes.new();
+  while large_buf.len() < 66000 {
+    large_buf.extend(&chunk.as_bytes());
+  }
+  let large_str = match large_buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+  over_limit_spec.args.push(large_str);
+  match generate_oci_config_json(&over_limit_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 8. 回帰テスト (再レビュー指摘 2): CAP_NET_BIND_SERVICE を許可した spec の生成 JSON に ambient として同 capability が含まれること
+  if !bytes_contains(&json1.as_bytes(), &"\"ambient\":[\"CAP_NET_BIND_SERVICE\"]".as_bytes()) {
+    return false;
+  }
+
+  return true;
+}

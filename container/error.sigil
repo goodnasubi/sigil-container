@@ -1,0 +1,54 @@
+module container.error
+  targets server
+  trust none
+
+// ADR 0053 決定 1・3・6: コンテナ管理のエラー型定義
+// 注意: コンテナはカーネルを共有する。信頼できないコードの実行に対する完全な境界とは扱わず、
+// その用途はマイクロ VM のバックエンド（後続）を前提にする。
+
+pub enum ContainerError {
+  SpecValidation(String),
+  LayerValidation(String),
+  LimitExceeded(String),
+  Corrupt(String),
+  StateError(String),
+}
+
+pub fn error_kind_name(err: &ContainerError) -> String
+  intent "エラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    ContainerError.SpecValidation(_) => "SpecValidation",
+    ContainerError.LayerValidation(_) => "LayerValidation",
+    ContainerError.LimitExceeded(_) => "LimitExceeded",
+    ContainerError.Corrupt(_) => "Corrupt",
+    ContainerError.StateError(_) => "StateError",
+  };
+}
+
+pub fn error_message(err: &ContainerError) -> String
+  intent "エラーの詳細メッセージを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    ContainerError.SpecValidation(msg) => msg.clone(),
+    ContainerError.LayerValidation(msg) => msg.clone(),
+    ContainerError.LimitExceeded(msg) => msg.clone(),
+    ContainerError.Corrupt(msg) => msg.clone(),
+    ContainerError.StateError(msg) => msg.clone(),
+  };
+}
+
+pub fn isolation_boundary_notice() -> String
+  intent "コンテナの隔離境界に関する公式告知文を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "コンテナはカーネルを共有する。信頼できないコードの実行に対する完全な境界とは扱わず、その用途はマイクロ VM のバックエンド（後続）を前提にする。";
+}

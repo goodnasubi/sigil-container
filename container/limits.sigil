@@ -1,0 +1,137 @@
+module container.limits
+  targets server
+  trust none
+
+// ADR 0053 決定 3・6: コンテナ管理初版の上限値定数（純粋な核）
+// 上限（仕様の大きさ、層の数・サイズ、ファイル数、パスの長さ、ログの量）は、
+// 読み込む前に効く値として本段の実装で決め、超過は自動分割や黙った切り捨てをせず明示的に失敗する。
+
+// 仕様全体の最大バイトサイズ: 64 KiB (65,536 byte)
+pub fn max_spec_size() -> Int
+  intent "仕様全体の最大バイトサイズ (64 KiB = 65,536 byte) を返す"
+  requires none
+  ensures result == 65536
+  effects none
+{
+  return 65536;
+}
+
+// 1 つのコンテナが持てるイメージ層の最大数: 128
+pub fn max_layer_count() -> Int
+  intent "イメージ層の最大数 (128) を返す"
+  requires none
+  ensures result == 128
+  effects none
+{
+  return 128;
+}
+
+// 1 つの層の非圧縮最大サイズ: 1 GiB (1,073,741,824 byte)
+pub fn max_layer_size() -> Int
+  intent "1 層の非圧縮最大サイズ (1 GiB = 1,073,741,824 byte) を返す"
+  requires none
+  ensures result == 1073741824
+  effects none
+{
+  return 1073741824;
+}
+
+// 層の展開後合計サイズ上限: 4 GiB (4,294,967,296 byte)
+pub fn max_total_image_size() -> Int
+  intent "層の展開後合計サイズ上限 (4 GiB = 4,294,967,296 byte) を返す"
+  requires none
+  ensures result == 4294967296
+  effects none
+{
+  return 4294967296;
+}
+
+// 層内に展開可能なファイル・ディレクトリエントリの最大数: 100,000
+pub fn max_file_count() -> Int
+  intent "層内の最大ファイル・エントリ数 (100,000) を返す"
+  requires none
+  ensures result == 100000
+  effects none
+{
+  return 100000;
+}
+
+// ファイルパスの最大文字数: 256
+pub fn max_path_length() -> Int
+  intent "パスの最大長 (256 byte) を返す"
+  requires none
+  ensures result == 256
+  effects none
+{
+  return 256;
+}
+
+// ディレクトリ階層の最大深さ: 16
+pub fn max_path_depth() -> Int
+  intent "ディレクトリ階層の最大深さ (16) を返す"
+  requires none
+  ensures result == 16
+  effects none
+{
+  return 16;
+}
+
+// コンテナログの最大容量上限: 100 MiB (104,857,600 byte)
+pub fn max_log_size() -> Int
+  intent "コンテナログの最大容量 (100 MiB = 104,857,600 byte) を返す"
+  requires none
+  ensures result == 104857600
+  effects none
+{
+  return 104857600;
+}
+
+// 環境変数の最大個数: 256
+pub fn max_env_var_count() -> Int
+  intent "環境変数の最大個数 (256) を返す"
+  requires none
+  ensures result == 256
+  effects none
+{
+  return 256;
+}
+
+// 宣言可能なポートマッピングの最大数: 64
+pub fn max_port_count() -> Int
+  intent "宣言可能なポートマッピング最大数 (64) を返す"
+  requires none
+  ensures result == 64
+  effects none
+{
+  return 64;
+}
+
+// 宣言可能なマウントの最大数: 32
+pub fn max_mount_count() -> Int
+  intent "宣言可能なマウント最大数 (32) を返す"
+  requires none
+  ensures result == 32
+  effects none
+{
+  return 32;
+}
+
+// ADR 0035 既定の非 root UID: 65532
+pub fn default_non_root_uid() -> Int
+  intent "ADR 0035 準拠の非 root UID (65532) を返す"
+  requires none
+  ensures result == 65532
+  effects none
+{
+  return 65532;
+}
+
+// ADR 0035 既定の非 root GID: 65532
+pub fn default_non_root_gid() -> Int
+  intent "ADR 0035 準拠の非 root GID (65532) を返す"
+  requires none
+  ensures result == 65532
+  effects none
+{
+  return 65532;
+}
