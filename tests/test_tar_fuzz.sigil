@@ -135,6 +135,128 @@ fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: 
   return bytes;
 }
 
+fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int, atime_str: String) -> Bytes
+  intent "テスト用の 512 バイト旧 GNU Tar ヘッダを構築する (magic 'ustar ', version ' \\0', 345..357 に atime)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let name_b = name.as_bytes();
+  let mut i = 0;
+  while i < 100 {
+    if i < name_b.len() {
+      bytes.push(name_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode ("0000644\0")
+  let mode_b = "0000644".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid ("0000000\0")
+  let uid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid ("0000000\0")
+  let gid_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size
+  let size_b = size_octal.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < size_b.len() {
+      bytes.push(size_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 136..148: mtime
+  let mtime_b = "00000000000".as_bytes();
+  i = 0;
+  while i < 11 {
+    bytes.push(mtime_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum (ダミー)
+  let chk_b = "0000000".as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(chk_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname (ゼロ埋め)
+  while bytes.len() < 257 {
+    bytes.push(0);
+  }
+
+  // 257..263: magic ("ustar ")
+  let magic_b = "ustar ".as_bytes();
+  i = 0;
+  while i < 6 {
+    bytes.push(magic_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+
+  // 263..265: version (" \0")
+  bytes.push(32);  // ' '
+  bytes.push(0);  // '\0'
+
+  // 265..345: ゼロ埋め
+  while bytes.len() < 345 {
+    bytes.push(0);
+  }
+
+  // 345..357: atime (12 bytes)
+  let atime_b = atime_str.as_bytes();
+  i = 0;
+  while i < 12 {
+    if i < atime_b.len() {
+      bytes.push(atime_b.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 357..512: ゼロ埋め
+  while bytes.len() < 512 {
+    bytes.push(0);
+  }
+
+  return bytes;
+}
+
 fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: Int, linkname: String) -> Bytes
   intent "テスト用の 512 バイト Tar ヘッダを構築する"
   requires none
@@ -788,6 +910,78 @@ pub fn run_tar_fuzz_tests() -> Bool
   sparse_archive.extend(&dummy_payload);
   sparse_archive.extend(&zero_b);
   match validate_tar_archive(&sparse_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 21. 回帰テスト (再レビュー指摘: 旧 GNU ヘッダのメタデータフィールドとレイアウト解釈)
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は pure モード (effects none / trust none) で動作しており、
+  // 外部プロセス起動や実際のファイルシステムへのアーカイブ展開を行う実行機能を持たないため、
+  // 実ファイルシステム上での展開スモークテストは行えません。
+  // そのため、インメモリ Tar ヘッダおよびアーカイブの検査結果（エラー種別 LayerValidation および TarEntry フィールド）への含有・適合テストで代用します。
+  //
+  // (1) 旧 GNU ヘッダ (magic "ustar ", version " \0") で name が "/escape", atime (bytes 345..357) が "00000000001" の場合:
+  // bytes 345 以降は prefix ではなく GNU メタデータ (atime) であるため、prefix 結合されず full_path は "/escape" となり、
+  // inspect_tar_header で絶対パス拒否 (LayerValidation) されること
+  let gnu_escape_h = create_oldgnu_tar_header("/escape", "00000000000 ", 48, "00000000001");
+  match inspect_tar_header(&gnu_escape_h) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) 旧 GNU ヘッダで name が安全な相対パス "safe/app.txt", atime が "00000000001" の場合:
+  // atime は prefix として結合されず、full_path が "safe/app.txt" として正常に受理されること
+  let gnu_safe_h = create_oldgnu_tar_header("safe/app.txt", "00000000000 ", 48, "00000000001");
+  match inspect_tar_header(&gnu_safe_h) {
+    Ok(entry) => {
+      if entry.path != "safe/app.txt" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (3) 旧 GNU ヘッダ (name "/escape", atime "00000000001") を含むアーカイブが validate_tar_archive で LayerValidation により拒否されること
+  let mut gnu_escape_archive = Bytes.new();
+  gnu_escape_archive.extend(&gnu_escape_h);
+  gnu_escape_archive.extend(&zero_b);
+  match validate_tar_archive(&gnu_escape_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) 未対応の未知の magic (例: "badmag") を持つヘッダが inspect_tar_header で LayerValidation により拒否されること
+  let mut bad_magic_h = Bytes.new();
+  bad_magic_h.extend(&gnu_safe_h);
+  // 257..263 を "badmag" に書き換え
+  let bad_m_bytes = "badmag".as_bytes();
+  let mut bm_i = 0;
+  while bm_i < 6 {
+    bad_magic_h.set(257 + bm_i, bad_m_bytes.get(bm_i).unwrap_or(0));
+    bm_i = bm_i + 1;
+  }
+  match inspect_tar_header(&bad_magic_h) {
     Ok(_) => {
       return false;
     }

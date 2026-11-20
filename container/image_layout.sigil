@@ -218,13 +218,38 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
       return Err(e);
     }
   }
+
+  // ヘッダ形式 (magic / version) の確認とレイアウト判定:
+  // - POSIX ustar: magic "ustar\0" (257..263), version "00" (263..265) -> bytes 345..500 を pathname prefix として解釈
+  // - 旧 GNU 形式: magic "ustar " (257..263) -> bytes 345 以降は GNU メタデータ (atime 等) であり prefix ではない
+  // - V7 形式: magic がすべて 0 -> prefix は存在しない
+  // - 未対応の形式: それ以外の未知の magic はパス結合前に拒否
+  let m0 = header.get(257).unwrap_or(0);
+  let m1 = header.get(258).unwrap_or(0);
+  let m2 = header.get(259).unwrap_or(0);
+  let m3 = header.get(260).unwrap_or(0);
+  let m4 = header.get(261).unwrap_or(0);
+  let m5 = header.get(262).unwrap_or(0);
+  let v0 = header.get(263).unwrap_or(0);
+  let v1 = header.get(264).unwrap_or(0);
+
+  let is_ustar = m0 == 117 && m1 == 115 && m2 == 116 && m3 == 97 && m4 == 114 && m5 == 0 && v0 == 48 && v1 == 48;
+  let is_oldgnu = m0 == 117 && m1 == 115 && m2 == 116 && m3 == 97 && m4 == 114 && m5 == 32;
+  let is_v7 = m0 == 0 && m1 == 0 && m2 == 0 && m3 == 0 && m4 == 0 && m5 == 0;
+
+  if !is_ustar && !is_oldgnu && !is_v7 {
+    return Err(ContainerError.LayerValidation("未対応の tar ヘッダ形式 (magic/version) です。"));
+  }
+
   let mut prefix_part = "";
-  match extract_cstring(&header, 345, 155) {
-    Ok(s) => {
-      prefix_part = s;
-    }
-    Err(e) => {
-      return Err(e);
+  if is_ustar {
+    match extract_cstring(&header, 345, 155) {
+      Ok(s) => {
+        prefix_part = s;
+      }
+      Err(e) => {
+        return Err(e);
+      }
     }
   }
   let mut full_path = name_part.clone();
