@@ -327,6 +327,39 @@ fn create_test_elf_payload(e_type: Int, ph_type: Int) -> Bytes
   return elf;
 }
 
+fn mode_parses_to_for_test(name: &String, elf: &Bytes, dest: &String, mode_str: &String, expected: Int) -> Bool
+  intent "指定した mode 文字列を持つ層が展開でき、entry.mode が期待値になることを確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  let hdr = create_tar_header_raw_for_test(&name, 120, &mode_str, 48, &"0000000", &"0000000");
+  let mut tar = Bytes.new();
+  tar.extend(&hdr);
+  tar.extend(&elf);
+  let mut i = elf.len();
+  while i < 512 {
+    tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut tar, 2);
+  let mut matched = false;
+  match unpack_layer_archive(&tar, &dest) {
+    Ok(m) => {
+      match m.entries.get(0) {
+        Some(entry) => {
+          if entry.mode == expected {
+            matched = true;
+          }
+        }
+        None => {}
+      }
+    }
+    Err(_) => {}
+  }
+  return matched;
+}
+
 pub fn run_rootfs_tests() -> Bool
   intent "rootfs 展開、ADR 0035 検証、状態保存のテストを実行する"
   requires none
@@ -918,6 +951,40 @@ pub fn run_rootfs_tests() -> Bool
     Err(_) => {
       return false;
     }
+  }
+
+  // 14. mode 8 進数パースおよびエラー伝播テスト (Issue #7)
+  // (a) 不正な 8 進数「0000008」の mode を持つ層が拒否されること (Corrupt)
+  let bad_mode_hdr = create_tar_header_raw_for_test(&app_name, 120, &"0000008", 48, &"0000000", &"0000000");
+  let mut bad_mode_tar = Bytes.new();
+  bad_mode_tar.extend(&bad_mode_hdr);
+  bad_mode_tar.extend(&valid_elf);
+  i = valid_elf.len();
+  while i < 512 {
+    bad_mode_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut bad_mode_tar, 2);
+  match unpack_layer_archive(&bad_mode_tar, &dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "Corrupt" {
+        return false;
+      }
+    }
+  }
+
+  // (b) 正しい 8 進数の mode (0, 0644=420, 0755=493) が正しくパースされること
+  if !mode_parses_to_for_test(&app_name, &valid_elf, &dest, &"0000000", 0) {
+    return false;
+  }
+  if !mode_parses_to_for_test(&app_name, &valid_elf, &dest, &"0000644", 420) {
+    return false;
+  }
+  if !mode_parses_to_for_test(&app_name, &valid_elf, &dest, &"0000755", 493) {
+    return false;
   }
 
   return true;
