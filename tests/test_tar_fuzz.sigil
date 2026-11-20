@@ -619,5 +619,184 @@ pub fn run_tar_fuzz_tests() -> Bool
     }
   }
 
+  // 19. 回帰テスト (再レビュー指摘 1): ディレクトリ ('5' = 53)・ハードリンク ('1' = 49)・シンボリックリンク ('2' = 50) の非ゼロサイズ拒否およびサイズ 0 の受理
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は pure モード (effects none / trust none) で動作しており、
+  // 外部プロセス起動や実際のファイルシステムへのアーカイブ展開を行う実行機能を持たないため、
+  // 実ファイルシステム上での展開スモークテストは行えません。
+  // そのため、インメモリ Tar ヘッダおよびアーカイブの検査結果（エラー種別 LayerValidation および TarEntry フィールド）への含有・適合テストで代用しています。
+
+  // (1) ディレクトリ ('5' = 53): 非ゼロサイズ (512 byte) の単体ヘッダ拒否 (LayerValidation)
+  let bad_dir_single = create_tar_header_fixture("test_dir", "00000001000 ", 53, "");
+  match inspect_tar_header(&bad_dir_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) ディレクトリ ('5' = 53): サイズ 0 の単体ヘッダ受理
+  let ok_dir_single = create_tar_header_fixture("test_dir", "00000000000 ", 53, "");
+  match inspect_tar_header(&ok_dir_single) {
+    Ok(e) => {
+      if e.typeflag != 53 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (3) ハードリンク ('1' = 49): 非ゼロサイズ (512 byte) の単体ヘッダ拒否 (LayerValidation)
+  let bad_hardlink_single = create_tar_header_fixture("link_hard", "00000001000 ", 49, "target_file");
+  match inspect_tar_header(&bad_hardlink_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) ハードリンク ('1' = 49): サイズ 0 かつ妥当な linkname の単体ヘッダ受理
+  let ok_hardlink_single = create_tar_header_fixture("link_hard", "00000000000 ", 49, "target_file");
+  match inspect_tar_header(&ok_hardlink_single) {
+    Ok(e) => {
+      if e.typeflag != 49 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (5) シンボリックリンク ('2' = 50): 非ゼロサイズ (512 byte) の単体ヘッダ拒否 (LayerValidation)
+  let bad_symlink_single = create_tar_header_fixture("link_sym", "00000001000 ", 50, "target_file");
+  match inspect_tar_header(&bad_symlink_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (6) シンボリックリンク ('2' = 50): サイズ 0 かつ妥当な linkname の単体ヘッダ受理
+  let ok_symlink_single = create_tar_header_fixture("link_sym", "00000000000 ", 50, "target_file");
+  match inspect_tar_header(&ok_symlink_single) {
+    Ok(e) => {
+      if e.typeflag != 50 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (7) アーカイブ単位での検証: 非ゼロサイズのディレクトリエントリを含むアーカイブの拒否 (LayerValidation)
+  let mut bad_dir_archive = Bytes.new();
+  bad_dir_archive.extend(&bad_dir_single);
+  bad_dir_archive.extend(&dummy_payload);
+  bad_dir_archive.extend(&zero_b);
+  match validate_tar_archive(&bad_dir_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (8) アーカイブ単位での検証: 非ゼロサイズのハードリンクエントリを含むアーカイブの拒否 (LayerValidation)
+  let mut bad_hardlink_archive = Bytes.new();
+  bad_hardlink_archive.extend(&bad_hardlink_single);
+  bad_hardlink_archive.extend(&dummy_payload);
+  bad_hardlink_archive.extend(&zero_b);
+  match validate_tar_archive(&bad_hardlink_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (9) アーカイブ単位での検証: 非ゼロサイズのシンボリックリンクエントリを含むアーカイブの拒否 (LayerValidation)
+  let mut bad_symlink_archive = Bytes.new();
+  bad_symlink_archive.extend(&bad_symlink_single);
+  bad_symlink_archive.extend(&dummy_payload);
+  bad_symlink_archive.extend(&zero_b);
+  match validate_tar_archive(&bad_symlink_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (10) アーカイブ単位での検証: サイズ 0 のディレクトリおよびシンボリックリンクを含む正常アーカイブの受理
+  let mut ok_dir_sym_archive = Bytes.new();
+  ok_dir_sym_archive.extend(&ok_dir_single);
+  ok_dir_sym_archive.extend(&ok_symlink_single);
+  ok_dir_sym_archive.extend(&zero_b);
+  match validate_tar_archive(&ok_dir_sym_archive) {
+    Ok(count) => {
+      if count != 2 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 20. 回帰テスト (再レビュー指摘 2): GNU sparse エントリ ('S' = 83) の拒否
+  // (1) GNU sparse ヘッダ単体 ('S' = 83) が inspect_tar_header で LayerValidation により拒否されること
+  let sparse_single = create_tar_header_fixture("sparse_file", "00000001000 ", 83, "");
+  match inspect_tar_header(&sparse_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) GNU sparse エントリを含むアーカイブが validate_tar_archive で LayerValidation により拒否されること
+  let mut sparse_archive = Bytes.new();
+  sparse_archive.extend(&sparse_single);
+  sparse_archive.extend(&dummy_payload);
+  sparse_archive.extend(&zero_b);
+  match validate_tar_archive(&sparse_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
   return true;
 }

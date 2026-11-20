@@ -202,6 +202,12 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
     return Err(ContainerError.LayerValidation("未対応の拡張ヘッダ型 (PAX または GNU 拡張ヘッダ: x, g, L, K) は実効パス・リンク先検証が未対応のため拒否されます。"));
   }
 
+  // GNU sparse エントリ ('S' = 83) の拒否:
+  // realsize フィールドによるサイズ上限の迂回を防ぐため、sparse メタデータと論理サイズの明示的な検証が未対応なエントリを拒否する
+  if typeflag == 83 {
+    return Err(ContainerError.LayerValidation("GNU sparse エントリ (typeflag 'S') は sparse メタデータと論理サイズの明示的な検証が未対応のため拒否されます。"));
+  }
+
   // 2. ファイル名抽出 (0..100) と prefix (345..500)
   let mut name_part = "";
   match extract_cstring(&header, 0, 100) {
@@ -259,6 +265,12 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
   // 展開爆弾対策: 単一ファイルサイズの上限検査
   if size > max_layer_size() {
     return Err(ContainerError.LimitExceeded("ファイルサイズが層の最大容量 (1 GiB) を超過しています (展開爆弾拒否)。"));
+  }
+
+  // ディレクトリ ('5' = 53)、ハードリンク ('1' = 49)、シンボリックリンク ('2' = 50) で 0 でない payload サイズを拒否
+  // (無条件スキップが後続ヘッダの検証逃れを招くのを防止)
+  if (typeflag == 53 || typeflag == 49 || typeflag == 50) && size != 0 {
+    return Err(ContainerError.LayerValidation("ディレクトリ、ハードリンク、シンボリックリンクのエントリで 0 でないサイズが指定されています。"));
   }
 
   // 4. linkname (157..257) - シンボリックリンク / ハードリンク
