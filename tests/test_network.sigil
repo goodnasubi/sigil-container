@@ -1,0 +1,1589 @@
+module tests.test_network
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_egress_rules;
+use container.limits.max_network_endpoints;
+use container.limits.max_peer_rules;
+use container.limits.max_port_count;
+use container.network.attach_container;
+use container.network.build_resolver;
+use container.network.can_communicate_containers;
+use container.network.can_egress;
+use container.network.collect_published_ports;
+use container.network.decode_endpoint_record;
+use container.network.default_bridge_config;
+use container.network.default_disabled_network_spec;
+use container.network.default_endpoint;
+use container.network.detach_container;
+use container.network.encode_endpoint_key;
+use container.network.encode_endpoint_record;
+use container.network.evaluate_packet;
+use container.network.find_endpoint;
+use container.network.find_endpoint_by_ip;
+use container.network.match_ip_or_cidr;
+use container.network.new_bridge_network;
+use container.network.new_network_endpoint_record;
+use container.network.new_network_spec;
+use container.network.publish_ports;
+use container.network.resolve_name;
+use container.network.route_inbound_port;
+use container.network.validate_network_spec;
+use container.spec.ContainerSpec;
+use container.spec.EgressRule;
+use container.spec.PeerConnection;
+use container.spec.PortMapping;
+use container.spec.Resources;
+use container.spec.RestartPolicy;
+use container.spec.default_secure_isolation;
+use container.spec.new_container_spec_full;
+use container.spec.new_egress_rule;
+use container.spec.new_peer_connection;
+use container.spec.new_port_mapping;
+use container.spec.new_resources;
+use container.spec.validate_destination_cidr_or_ip;
+use container.spec.validate_spec;
+
+// ---------------------------------------------------------------------------
+// テスト用ヘルパー
+// ---------------------------------------------------------------------------
+
+fn int_to_str(val: Int) -> String
+  intent "非負整数を 10 進文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if val <= 0 {
+    return "0";
+  }
+  let mut n = val;
+  let mut digits = List.new();
+  while n > 0 {
+    let d = n % 10;
+    digits.push(d);
+    n = n / 10;
+  }
+  let mut buf = Bytes.new();
+  let mut i = digits.len();
+  while i > 0 {
+    i = i - 1;
+    match digits.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+  }
+  return match buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "0",
+  };
+}
+
+fn concat_str(prefix: &String, s: &String) -> String
+  intent "接頭辞と文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.extend(&prefix.as_bytes());
+  buf.extend(&s.as_bytes());
+  return match buf.to_string_utf8() {
+    Ok(res) => res,
+    Err(_) => "",
+  };
+}
+
+fn create_test_resources() -> Resources
+  intent "正常なテスト用 Resources を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return new_resources(536870912, 100000, 1024, 1073741824, 10485760);
+}
+
+fn create_test_spec(net_enabled: Bool, ports: List<PortMapping>, egress: List<EgressRule>, peers: List<PeerConnection>, share_net: Bool) -> ContainerSpec
+  intent "ネットワーク設定を含むテスト用 ContainerSpec を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut iso = default_secure_isolation();
+  iso.share_host_net = share_net;
+  let res = create_test_resources();
+  let args = List.new();
+  let env_vars = List.new();
+  let mounts = List.new();
+  let secrets = List.new();
+  return new_container_spec_full("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", args, env_vars, "/app", iso, res, net_enabled, ports, egress, peers, mounts, secrets, RestartPolicy.Always);
+}
+
+// ---------------------------------------------------------------------------
+// 1. 既定拒否 (ネットワーク無効・接続なし) のテスト
+// ---------------------------------------------------------------------------
+
+fn test_default_deny() -> Bool
+  intent "既定拒否 (接続なし) の規則を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // ネットワーク無効時にポートマッピングがある仕様は拒否
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 80, "tcp", "127.0.0.1"));
+  let spec_bad_port = create_test_spec(false, ports, List.new(), List.new(), false);
+  match validate_spec(&spec_bad_port) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // ネットワーク無効時に外向き規則がある仕様は拒否
+  let mut egress = List.new();
+  egress.push(new_egress_rule("198.51.100.1", 443, "tcp"));
+  let spec_bad_eg = create_test_spec(false, List.new(), egress, List.new(), false);
+  match validate_spec(&spec_bad_eg) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // ネットワーク無効時にピア接続がある仕様は拒否
+  let mut peers = List.new();
+  peers.push(new_peer_connection("db", 5432, "tcp"));
+  let spec_bad_peer = create_test_spec(false, List.new(), List.new(), peers, false);
+  match validate_spec(&spec_bad_peer) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // ネットワーク無効のコンテナはブリッジに接続できない
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let disabled_spec = default_disabled_network_spec();
+  match attach_container(&mut bridge, "no-net", "wl-none", disabled_spec, false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // パケット評価で無効なコンテナからの通信はすべて拒否
+  let resolver = build_resolver(&bridge.endpoints);
+  let decision = evaluate_packet(&bridge, &resolver, &"no-net", &"10.244.0.2", 80, &"tcp");
+  if decision.allowed {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 2. host network の拒否テスト
+// ---------------------------------------------------------------------------
+
+fn test_host_network_rejection() -> Bool
+  intent "host network namespace の共有が仕様エラーとして拒否されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // validate_spec で拒否
+  let host_net_spec = create_test_spec(true, List.new(), List.new(), List.new(), true);
+  match validate_spec(&host_net_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(msg)) => {
+      if msg != "host network namespace の共有は禁止されています。" {
+        return false;
+      }
+    }
+    _ => {
+      return false;
+    }
+  }
+
+  // attach_container でも拒否
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let valid_net_spec = new_network_spec(true, List.new(), List.new(), List.new());
+  match attach_container(&mut bridge, "inst-hn", "wl-hn", valid_net_spec, true) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3. ポートの公開と待ち受けアドレスのテスト
+// ---------------------------------------------------------------------------
+
+fn test_port_publishing() -> Bool
+  intent "宣言したポートの公開および待ち受けアドレスの制限 (許可リスト方式) を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 0.0.0.0 の全方位公開は拒否
+  let mut bad_ports = List.new();
+  bad_ports.push(new_port_mapping(8080, 80, "tcp", "0.0.0.0"));
+  let bad_spec = create_test_spec(true, bad_ports, List.new(), List.new(), false);
+  match validate_spec(&bad_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(msg)) => {
+      if msg != "ホスト公開アドレスはループバック (127.0.0.0/8) または宣言された内部アドレス (RFC 1918) である必要があります。" {
+        return false;
+      }
+    }
+    _ => {
+      return false;
+    }
+  }
+
+  // 2. 正常なループバック (127.0.0.1) および内部アドレス (10.0.1.5) のポート公開
+  let mut good_ports = List.new();
+  good_ports.push(new_port_mapping(8080, 80, "tcp", "127.0.0.1"));
+  good_ports.push(new_port_mapping(8443, 443, "tcp", "10.0.1.5"));
+  let good_spec = create_test_spec(true, good_ports, List.new(), List.new(), false);
+  match validate_spec(&good_spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. publish_ports と route_inbound_port の検証
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let net_spec = new_network_spec(true, good_spec.ports.clone(), List.new(), List.new());
+  let mut ep = default_endpoint();
+  match attach_container(&mut bridge, "web-1", "web", net_spec, false) {
+    Ok(e) => {
+      ep = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let pub_list_res = publish_ports(&ep);
+  let mut pub_list = List.new();
+  match pub_list_res {
+    Ok(l) => {
+      pub_list = l;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if pub_list.len() != 2 {
+    return false;
+  }
+
+  // 宣言したポート宛ては正常に解決される
+  match route_inbound_port(&pub_list, &"127.0.0.1", 8080, &"tcp") {
+    Ok(p) => {
+      if p.container_port != 80 || p.container_ip != ep.ip_address {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 宣言していないポート宛ては拒否される
+  match route_inbound_port(&pub_list, &"127.0.0.1", 9999, &"tcp") {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. ノード内の名前解決テスト
+// ---------------------------------------------------------------------------
+
+fn test_name_resolution() -> Bool
+  intent "ノード内のワークロードおよびインスタンス名による名前解決を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge = new_bridge_network(default_bridge_config());
+
+  // web インスタンスを接続 (10.244.0.2)
+  let net_web = new_network_spec(true, List.new(), List.new(), List.new());
+  match attach_container(&mut bridge, "web-1", "web", net_web, false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // db インスタンスを接続 (10.244.0.3)
+  let net_db = new_network_spec(true, List.new(), List.new(), List.new());
+  match attach_container(&mut bridge, "db-1", "db", net_db, false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let resolver = build_resolver(&bridge.endpoints);
+
+  // 1. ワークロード名による解決
+  match resolve_name(&resolver, &"web") {
+    Ok(ip) => {
+      if ip != "10.244.0.2" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match resolve_name(&resolver, &"db") {
+    Ok(ip) => {
+      if ip != "10.244.0.3" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. インスタンス名による解決
+  match resolve_name(&resolver, &"web-1") {
+    Ok(ip) => {
+      if ip != "10.244.0.2" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match resolve_name(&resolver, &"db-1") {
+    Ok(ip) => {
+      if ip != "10.244.0.3" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 宣言に無い名前は解決しない (エラーとして拒否)
+  match resolve_name(&resolver, &"unknown-service") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 4. 外部ドメイン名は解決しない
+  match resolve_name(&resolver, &"example.com") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 5. コンテナ間の分離テスト
+// ---------------------------------------------------------------------------
+
+fn test_inter_container_isolation() -> Bool
+  intent "宣言した接続のないコンテナ間の通信が遮断され、宣言した接続のみ許可されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge = new_bridge_network(default_bridge_config());
+
+  // web は db:5432 tcp への通信を宣言
+  let mut web_peers = List.new();
+  web_peers.push(new_peer_connection("db", 5432, "tcp"));
+  let net_web = new_network_spec(true, List.new(), List.new(), web_peers);
+
+  // db は接続を一切宣言しない (独立)
+  let net_db = new_network_spec(true, List.new(), List.new(), List.new());
+
+  // cache も接続を一切宣言しない
+  let net_cache = new_network_spec(true, List.new(), List.new(), List.new());
+
+  let mut ep_web = default_endpoint();
+  match attach_container(&mut bridge, "web-1", "web", net_web, false) {
+    Ok(e) => {
+      ep_web = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut ep_db = default_endpoint();
+  match attach_container(&mut bridge, "db-1", "db", net_db, false) {
+    Ok(e) => {
+      ep_db = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut ep_cache = default_endpoint();
+  match attach_container(&mut bridge, "cache-1", "cache", net_cache, false) {
+    Ok(e) => {
+      ep_cache = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 1. web -> db:5432 (tcp): 宣言されているため許可 (ALLOWED)
+  if !can_communicate_containers(&ep_web, &ep_db, 5432, &"tcp") {
+    return false;
+  }
+
+  // 2. web -> db:8080 (tcp): 宣言にないポートは遮断 (DENIED)
+  if can_communicate_containers(&ep_web, &ep_db, 8080, &"tcp") {
+    return false;
+  }
+
+  // 3. web -> db:5432 (udp): 宣言にないプロトコルは遮断 (DENIED)
+  if can_communicate_containers(&ep_web, &ep_db, 5432, &"udp") {
+    return false;
+  }
+
+  // 4. db -> web:5432 (tcp): db からの接続は宣言されていないため遮断 (DENIED)
+  if can_communicate_containers(&ep_db, &ep_web, 5432, &"tcp") {
+    return false;
+  }
+
+  // 5. web -> cache:6379 (tcp): cache への接続は宣言されていないため遮断 (DENIED)
+  if can_communicate_containers(&ep_web, &ep_cache, 6379, &"tcp") {
+    return false;
+  }
+
+  // 6. cache -> db:5432 (tcp): 宣言がないため遮断 (DENIED)
+  if can_communicate_containers(&ep_cache, &ep_db, 5432, &"tcp") {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 6. 外向き通信の許可と遮断テスト
+// ---------------------------------------------------------------------------
+
+fn test_egress_filtering() -> Bool
+  intent "外向き通信の許可宣言と既定拒否 (未許可の遮断) を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. CIDR マッチングの単体検証
+  if !match_ip_or_cidr(&"198.51.100.1", &"198.51.100.1") {
+    return false;
+  }
+  if match_ip_or_cidr(&"198.51.100.1", &"198.51.100.2") {
+    return false;
+  }
+  if !match_ip_or_cidr(&"198.51.100.0/24", &"198.51.100.5") {
+    return false;
+  }
+  if match_ip_or_cidr(&"198.51.100.0/24", &"198.51.101.1") {
+    return false;
+  }
+  if !match_ip_or_cidr(&"192.168.1.0/24", &"192.168.1.254") {
+    return false;
+  }
+  if match_ip_or_cidr(&"192.168.1.0/24", &"192.168.2.1") {
+    return false;
+  }
+
+  // 2. 外向き許可規則を持つエンドポイント
+  let mut egress_rules = List.new();
+  egress_rules.push(new_egress_rule("93.184.216.34", 443, "tcp"));
+  egress_rules.push(new_egress_rule("198.51.100.0/24", 53, "udp"));
+
+  let net_spec = new_network_spec(true, List.new(), egress_rules, List.new());
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let mut ep = default_endpoint();
+  match attach_container(&mut bridge, "app-1", "app", net_spec, false) {
+    Ok(e) => {
+      ep = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 宣言された宛先・ポート・プロトコルは許可 (ALLOWED)
+  if !can_egress(&ep, &"93.184.216.34", 443, &"tcp") {
+    return false;
+  }
+  if !can_egress(&ep, &"198.51.100.5", 53, &"udp") {
+    return false;
+  }
+
+  // 宣言されていないポートは遮断 (DENIED)
+  if can_egress(&ep, &"93.184.216.34", 80, &"tcp") {
+    return false;
+  }
+
+  // 宣言されていないプロトコルは遮断 (DENIED)
+  if can_egress(&ep, &"93.184.216.34", 443, &"udp") {
+    return false;
+  }
+
+  // 宣言されていない宛先 IP (8.8.8.8) は遮断 (DENIED)
+  if can_egress(&ep, &"8.8.8.8", 53, &"udp") {
+    return false;
+  }
+  if can_egress(&ep, &"8.8.8.8", 443, &"tcp") {
+    return false;
+  }
+
+  // 外向き規則が空のコンテナは全外向き通信が遮断される
+  let net_no_egress = new_network_spec(true, List.new(), List.new(), List.new());
+  let mut ep_no_eg = default_endpoint();
+  match attach_container(&mut bridge, "iso-1", "iso", net_no_egress, false) {
+    Ok(e) => {
+      ep_no_eg = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if can_egress(&ep_no_eg, &"93.184.216.34", 443, &"tcp") {
+    return false;
+  }
+  if can_egress(&ep_no_eg, &"198.51.100.1", 53, &"udp") {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 7. パケット総合評価テスト
+// ---------------------------------------------------------------------------
+
+fn test_packet_evaluation() -> Bool
+  intent "名前解決・コンテナ間分離・外向き規則を含む総合パケット評価を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge = new_bridge_network(default_bridge_config());
+
+  let mut web_peers = List.new();
+  web_peers.push(new_peer_connection("db", 5432, "tcp"));
+  let mut web_egress = List.new();
+  web_egress.push(new_egress_rule("93.184.216.34", 443, "tcp"));
+
+  let net_web = new_network_spec(true, List.new(), web_egress, web_peers);
+  let net_db = new_network_spec(true, List.new(), List.new(), List.new());
+
+  match attach_container(&mut bridge, "web-inst", "web", net_web, false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "db-inst", "db", net_db, false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let resolver = build_resolver(&bridge.endpoints);
+
+  // 1. web -> db (ワークロード名): 許可
+  let d1 = evaluate_packet(&bridge, &resolver, &"web-inst", &"db", 5432, &"tcp");
+  if !d1.allowed || d1.resolved_ip != "10.244.0.3" {
+    return false;
+  }
+
+  // 2. web -> db (未宣言ポート 8080): 遮断
+  let d2 = evaluate_packet(&bridge, &resolver, &"web-inst", &"db", 8080, &"tcp");
+  if d2.allowed {
+    return false;
+  }
+
+  // 3. web -> 93.184.216.34:443 (外向き規則合致): 許可
+  let d3 = evaluate_packet(&bridge, &resolver, &"web-inst", &"93.184.216.34", 443, &"tcp");
+  if !d3.allowed {
+    return false;
+  }
+
+  // 4. web -> 8.8.8.8:53 (外向き規則なし): 遮断
+  let d4 = evaluate_packet(&bridge, &resolver, &"web-inst", &"8.8.8.8", 53, &"udp");
+  if d4.allowed {
+    return false;
+  }
+
+  // 5. web -> 未宣言の名前 (no-host): 遮断
+  let d5 = evaluate_packet(&bridge, &resolver, &"web-inst", &"no-host", 80, &"tcp");
+  if d5.allowed {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 8. 上限超過の検証
+// ---------------------------------------------------------------------------
+
+fn test_network_limits() -> Bool
+  intent "ポート数・外向き規則数・ピア接続数の上限超過が明示的に失敗することを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. ポート数超過 (> 64)
+  let mut too_many_ports = List.new();
+  let mut i = 0;
+  while i < max_port_count() + 1 {
+    too_many_ports.push(new_port_mapping(10000 + i, 10000 + i, "tcp", "127.0.0.1"));
+    i = i + 1;
+  }
+  let spec_p = create_test_spec(true, too_many_ports, List.new(), List.new(), false);
+  match validate_spec(&spec_p) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.LimitExceeded(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 2. 外向き規則数超過 (> 64)
+  let mut too_many_egress = List.new();
+  let mut j = 0;
+  while j < max_egress_rules() + 1 {
+    too_many_egress.push(new_egress_rule("198.51.100.1", 80, "tcp"));
+    j = j + 1;
+  }
+  let spec_eg = create_test_spec(true, List.new(), too_many_egress, List.new(), false);
+  match validate_spec(&spec_eg) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.LimitExceeded(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 3. ピア接続数超過 (> 64)
+  let mut too_many_peers = List.new();
+  let mut k = 0;
+  while k < max_peer_rules() + 1 {
+    too_many_peers.push(new_peer_connection("db", 5000 + k, "tcp"));
+    k = k + 1;
+  }
+  let spec_pr = create_test_spec(true, List.new(), List.new(), too_many_peers, false);
+  match validate_spec(&spec_pr) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.LimitExceeded(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 9. P4 DB 状態保存形式のテスト
+// ---------------------------------------------------------------------------
+
+fn test_state_persistence() -> Bool
+  intent "NetworkEndpointRecord の符号化・復号が正確に行われることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let rec = new_network_endpoint_record("t-inst-1", "t-wl-1", "10.244.0.10", "02:42:0a:f4:00:0a", true, 2, 3, 1);
+
+  // キーの符号化
+  let key_res = encode_endpoint_key(&rec.instance_id);
+  match key_res {
+    Ok(k) => {
+      if k.len() == 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 行の符号化と復号の往復一致
+  let row_bytes_res = encode_endpoint_record(&rec);
+  let mut row_bytes = Bytes.new();
+  match row_bytes_res {
+    Ok(b) => {
+      row_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let decoded_res = decode_endpoint_record(&row_bytes);
+  match decoded_res {
+    Ok(d) => {
+      if d.instance_id != rec.instance_id || d.workload_id != rec.workload_id || d.ip_address != rec.ip_address || d.mac_address != rec.mac_address || d.network_enabled != rec.network_enabled || d.published_port_count != rec.published_port_count || d.egress_rule_count != rec.egress_rule_count || d.peer_rule_count != rec.peer_rule_count {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 不正バイト列の復号失敗
+  let mut invalid_bytes = Bytes.new();
+  invalid_bytes.push(99);
+  match decode_endpoint_record(&invalid_bytes) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 10. ブリッジ接続・検索・切り離しのテスト
+// ---------------------------------------------------------------------------
+
+fn test_bridge_attach_detach_and_lookup() -> Bool
+  intent "ブリッジへの接続・検索 (IDおよびIP)・切り離しを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let net_spec = new_network_spec(true, List.new(), List.new(), List.new());
+
+  // validate_network_spec の単体検証
+  match validate_network_spec(&net_spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 1. 接続
+  match attach_container(&mut bridge, "t-inst-1", "test-wl", net_spec, false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 検索 (instance_id)
+  match find_endpoint(&bridge.endpoints, &"t-inst-1") {
+    Some(ep) => {
+      if ep.workload_id != "test-wl" {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 検索 (ip_address)
+  match find_endpoint_by_ip(&bridge.endpoints, &"10.244.0.2") {
+    Some(ep) => {
+      if ep.instance_id != "t-inst-1" {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 存在しない instance_id の検索
+  match find_endpoint(&bridge.endpoints, &"nonexist") {
+    Some(_) => {
+      return false;
+    }
+    None => {}
+  }
+
+  // 3. 切り離し (detach)
+  match detach_container(&mut bridge, &"t-inst-1") {
+    Ok(found) => {
+      if !found {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 切り離し後は検索できない
+  match find_endpoint(&bridge.endpoints, &"t-inst-1") {
+    Some(_) => {
+      return false;
+    }
+    None => {}
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 11. 要対応 1: 識別子の検証と重複 attach の拒否
+// ---------------------------------------------------------------------------
+
+fn test_identifier_validation() -> Bool
+  intent "instance_id と workload_id の 1〜8 文字制限、文字種、重複 attach の拒否を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let net_spec = new_network_spec(true, List.new(), List.new(), List.new());
+
+  // 空文字は拒否
+  match attach_container(&mut bridge, "", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "inst-1", "", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 8 文字超 (9文字以上) は Linux IFNAMSIZ 制約により拒否
+  match attach_container(&mut bridge, "toolongid", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "inst-1", "toolongid", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 不正文字 (大文字、アンダースコア、ドット、スラッシュ、パストラバーサル ..) の拒否
+  match attach_container(&mut bridge, "INST-1", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "inst_1", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "inst..1", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "../esc", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // instance_id と workload_id が同一の場合は拒否 (名前解決衝突の防止)
+  match attach_container(&mut bridge, "web", "web", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 正常な attach
+  match attach_container(&mut bridge, "inst-1", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 同一 instance_id の二重 attach 拒否
+  match attach_container(&mut bridge, "inst-1", "wl-2", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // instance_id が既存の workload_id と重複する場合は拒否
+  match attach_container(&mut bridge, "wl-1", "wl-2", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // workload_id が既存の instance_id と重複する場合は拒否
+  match attach_container(&mut bridge, "inst-2", "inst-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 12. 要対応 2: 公開アドレスの許可リスト方式への変更
+// ---------------------------------------------------------------------------
+
+fn test_public_address_allowlist() -> Bool
+  intent "host_ip の許可リスト方式 (127.0.0.0/8 または RFC 1918) および変種拒否を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 空文字の拒否
+  let mut p_empty = List.new();
+  p_empty.push(new_port_mapping(8080, 80, "tcp", ""));
+  let spec_empty = create_test_spec(true, p_empty, List.new(), List.new(), false);
+  match validate_spec(&spec_empty) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 2. IPv6 (::) の拒否
+  let mut p_v6 = List.new();
+  p_v6.push(new_port_mapping(8080, 80, "tcp", "::"));
+  let spec_v6 = create_test_spec(true, p_v6, List.new(), List.new(), false);
+  match validate_spec(&spec_v6) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 3. 単体 '0' の拒否
+  let mut p_zero = List.new();
+  p_zero.push(new_port_mapping(8080, 80, "tcp", "0"));
+  let spec_zero = create_test_spec(true, p_zero, List.new(), List.new(), false);
+  match validate_spec(&spec_zero) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 4. '0.0.0.00' (先頭ゼロ) の拒否
+  let mut p_zero_lead = List.new();
+  p_zero_lead.push(new_port_mapping(8080, 80, "tcp", "0.0.0.00"));
+  let spec_zero_lead = create_test_spec(true, p_zero_lead, List.new(), List.new(), false);
+  match validate_spec(&spec_zero_lead) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 5. '010.1.1.1' (オクテット先頭ゼロ) の拒否
+  let mut p_oct_lead = List.new();
+  p_oct_lead.push(new_port_mapping(8080, 80, "tcp", "010.1.1.1"));
+  let spec_oct_lead = create_test_spec(true, p_oct_lead, List.new(), List.new(), false);
+  match validate_spec(&spec_oct_lead) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 6. ホスト名 ('localhost') の拒否
+  let mut p_host = List.new();
+  p_host.push(new_port_mapping(8080, 80, "tcp", "localhost"));
+  let spec_host = create_test_spec(true, p_host, List.new(), List.new(), false);
+  match validate_spec(&spec_host) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 7. 空白付き文字列 ('127.0.0.1 ') の拒否
+  let mut p_space = List.new();
+  p_space.push(new_port_mapping(8080, 80, "tcp", "127.0.0.1 "));
+  let spec_space = create_test_spec(true, p_space, List.new(), List.new(), false);
+  match validate_spec(&spec_space) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 8. パブリック外部アドレス ('8.8.8.8') の拒否 (初版は外部非公開)
+  let mut p_pub = List.new();
+  p_pub.push(new_port_mapping(8080, 80, "tcp", "8.8.8.8"));
+  let spec_pub = create_test_spec(true, p_pub, List.new(), List.new(), false);
+  match validate_spec(&spec_pub) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 9. 特権ホストポート (< 1024) の拒否
+  let mut p_priv = List.new();
+  p_priv.push(new_port_mapping(80, 80, "tcp", "127.0.0.1"));
+  let spec_priv = create_test_spec(true, p_priv, List.new(), List.new(), false);
+  match validate_spec(&spec_priv) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 13. 要対応 3: 外向き規則の構文検証と危険な規則の拒否
+// ---------------------------------------------------------------------------
+
+fn test_egress_destination_syntax_and_dangerous_rules() -> Bool
+  intent "外向き通信宛先の厳格な構文検証 (空prefix長拒否、先頭ゼロ拒否) と危険規則拒否を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 空のプレフィックス長 ('10.0.0.0/') の拒否 (Codex Cloud P1 指摘)
+  match validate_destination_cidr_or_ip(&"10.0.0.0/") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 2. プレフィックス長 0 ('0.0.0.0/0') の明示的拒否
+  match validate_destination_cidr_or_ip(&"0.0.0.0/0") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 3. プレフィックス長超過 ('10.0.0.0/33') の拒否
+  match validate_destination_cidr_or_ip(&"10.0.0.0/33") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 4. 数字以外のプレフィックス長 ('abc/8') の拒否
+  match validate_destination_cidr_or_ip(&"abc/8") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 5. 先頭ゼロ ('010.1.1.1' および '10.0.0.0/024') の拒否
+  match validate_destination_cidr_or_ip(&"010.1.1.1") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match validate_destination_cidr_or_ip(&"10.0.0.0/024") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 6. ブリッジのゲートウェイ ('10.244.0.1') を含む規則の拒否
+  match validate_destination_cidr_or_ip(&"10.244.0.1") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 7. ブリッジサブネット ('10.244.0.0/24' および内包アドレス '10.244.0.5') の拒否
+  match validate_destination_cidr_or_ip(&"10.244.0.0/24") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match validate_destination_cidr_or_ip(&"10.244.0.5") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 8. ブリッジサブネットを丸ごと包含する広範な規則 ('10.0.0.0/8') の拒否
+  match validate_destination_cidr_or_ip(&"10.0.0.0/8") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 9. リンクローカル ('169.254.0.0/16' および '169.254.1.1') の拒否
+  match validate_destination_cidr_or_ip(&"169.254.0.0/16") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match validate_destination_cidr_or_ip(&"169.254.1.1") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 10. 安全な宛先 ('93.184.216.34', '198.51.100.0/24') の許可
+  match validate_destination_cidr_or_ip(&"93.184.216.34") {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_destination_cidr_or_ip(&"198.51.100.0/24") {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 14. 要対応 4: MAC アドレスの 16 進 2 桁化と IP の再利用・上限テスト
+// ---------------------------------------------------------------------------
+
+fn test_mac_and_ip_reuse_and_exhaustion() -> Bool
+  intent "MAC アドレスの 2 桁 16 進生成、detach 後の IP 再利用、および 253 個の上限を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let net_spec = new_network_spec(true, List.new(), List.new(), List.new());
+
+  // 1. エンドポイント接続時の MAC アドレス (2 桁 16 進数表記)
+  let mut ep1 = default_endpoint();
+  match attach_container(&mut bridge, "inst-1", "wl-1", net_spec.clone(), false) {
+    Ok(e) => {
+      ep1 = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  // ホスト 2 -> 16進 02
+  if ep1.ip_address != "10.244.0.2" || ep1.mac_address != "02:42:0a:f4:00:02" {
+    return false;
+  }
+
+  let mut ep2 = default_endpoint();
+  match attach_container(&mut bridge, "inst-2", "wl-2", net_spec.clone(), false) {
+    Ok(e) => {
+      ep2 = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  // ホスト 3 -> 16進 03
+  if ep2.ip_address != "10.244.0.3" || ep2.mac_address != "02:42:0a:f4:00:03" {
+    return false;
+  }
+
+  // 2. inst-1 を detach してアドレス再利用を検証
+  match detach_container(&mut bridge, &"inst-1") {
+    Ok(found) => {
+      if !found {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // inst-3 を接続すると、空いた 10.244.0.2 が再利用される
+  let mut ep3 = default_endpoint();
+  match attach_container(&mut bridge, "inst-3", "wl-3", net_spec.clone(), false) {
+    Ok(e) => {
+      ep3 = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if ep3.ip_address != "10.244.0.2" || ep3.mac_address != "02:42:0a:f4:00:02" {
+    return false;
+  }
+
+  // 3. 上限と枯渇の検証:
+  // 現在 bridge には inst-2 (10.244.0.3) と inst-3 (10.244.0.2) の 2 件が接続中
+  // 残り 251 件を接続して上限 253 件に到達させる
+  let mut idx = 4;
+  while idx <= 254 {
+    let i_name = concat_str(&"i-", &int_to_str(idx));
+    let w_name = concat_str(&"w-", &int_to_str(idx));
+    match attach_container(&mut bridge, i_name, w_name, net_spec.clone(), false) {
+      Ok(_) => {}
+      Err(_) => {
+        return false;
+      }
+    }
+    idx = idx + 1;
+  }
+
+  // 現在 253 件 (容量上限)
+  if bridge.endpoints.len() != max_network_endpoints() {
+    return false;
+  }
+
+  // 254 件目の接続は上限超過 (LimitExceeded) で拒否される
+  match attach_container(&mut bridge, "i-over", "w-over", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.LimitExceeded(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 1 件 detach すると再度接続可能になる
+  match detach_container(&mut bridge, &"i-4") {
+    Ok(found) => {
+      if !found {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "i-re", "w-re", net_spec.clone(), false) {
+    Ok(e) => {
+      if e.ip_address != "10.244.0.4" || e.mac_address != "02:42:0a:f4:00:04" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 15. 要対応 5: ホストポートの競合検査
+// ---------------------------------------------------------------------------
+
+fn test_host_port_collision() -> Bool
+  intent "同一仕様内および複数コンテナ間でのホストポート重複検出を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 同一仕様内でのホストポート重複宣言の拒否
+  let mut dup_ports = List.new();
+  dup_ports.push(new_port_mapping(8080, 80, "tcp", "127.0.0.1"));
+  dup_ports.push(new_port_mapping(8080, 8080, "tcp", "127.0.0.1"));
+  let spec_dup = create_test_spec(true, dup_ports, List.new(), List.new(), false);
+  match validate_spec(&spec_dup) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(msg)) => {
+      if msg != "同一仕様内で同一のホストポートマッピング (host_ip, host_port, protocol) が重複して宣言されています。" {
+        return false;
+      }
+    }
+    _ => {
+      return false;
+    }
+  }
+
+  // プロトコルが異なる場合は同一ポート番号でも共存可能 (TCP / UDP)
+  let mut proto_diff_ports = List.new();
+  proto_diff_ports.push(new_port_mapping(8080, 80, "tcp", "127.0.0.1"));
+  proto_diff_ports.push(new_port_mapping(8080, 80, "udp", "127.0.0.1"));
+  let spec_proto_diff = create_test_spec(true, proto_diff_ports, List.new(), List.new(), false);
+  match validate_spec(&spec_proto_diff) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 複数コンテナ間でのホストポート重複 attach の拒否
+  let mut bridge = new_bridge_network(default_bridge_config());
+  let mut p1 = List.new();
+  p1.push(new_port_mapping(8080, 80, "tcp", "127.0.0.1"));
+  let net1 = new_network_spec(true, p1, List.new(), List.new());
+
+  match attach_container(&mut bridge, "c-1", "w-1", net1, false) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut p2 = List.new();
+  p2.push(new_port_mapping(8080, 8080, "tcp", "127.0.0.1"));
+  let net2 = new_network_spec(true, p2, List.new(), List.new());
+
+  match attach_container(&mut bridge, "c-2", "w-2", net2, false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(msg)) => {
+      if msg != "ホストポートの競合が検出されました: 既存のエンドポイントと同一のホストポート (host_ip:host_port/protocol) が宣言されています。" {
+        return false;
+      }
+    }
+    _ => {
+      return false;
+    }
+  }
+
+  // 3. collect_published_ports による集約と重複検査
+  let pub_collected = collect_published_ports(&bridge.endpoints);
+  match pub_collected {
+    Ok(l) => {
+      if l.len() != 1 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// エントリポイント
+// ---------------------------------------------------------------------------
+
+pub fn run_network_tests() -> Bool
+  intent "すべてのネットワークテストを実行し、全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_default_deny() {
+    return false;
+  }
+  if !test_host_network_rejection() {
+    return false;
+  }
+  if !test_port_publishing() {
+    return false;
+  }
+  if !test_name_resolution() {
+    return false;
+  }
+  if !test_inter_container_isolation() {
+    return false;
+  }
+  if !test_egress_filtering() {
+    return false;
+  }
+  if !test_packet_evaluation() {
+    return false;
+  }
+  if !test_network_limits() {
+    return false;
+  }
+  if !test_state_persistence() {
+    return false;
+  }
+  if !test_bridge_attach_detach_and_lookup() {
+    return false;
+  }
+  if !test_identifier_validation() {
+    return false;
+  }
+  if !test_public_address_allowlist() {
+    return false;
+  }
+  if !test_egress_destination_syntax_and_dangerous_rules() {
+    return false;
+  }
+  if !test_mac_and_ip_reuse_and_exhaustion() {
+    return false;
+  }
+  if !test_host_port_collision() {
+    return false;
+  }
+  return true;
+}
