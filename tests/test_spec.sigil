@@ -170,5 +170,92 @@ pub fn run_spec_tests() -> Bool
     Err(_) => {}
   }
 
+  // 13. 回帰テスト: 未解決 seccomp プロファイルの拒否
+  let mut seccomp_spec = create_valid_test_spec();
+  seccomp_spec.isolation.seccomp_profile = "unknown_profile";
+  match validate_spec(&seccomp_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14. 回帰テスト: マウントパス正規化と /proc, /sys, /dev の厳格な拒否
+  // 14a. 末尾スラッシュ付き /proc/ の拒否
+  let mut slash_proc_spec = create_valid_test_spec();
+  slash_proc_spec.mounts = List.new();
+  slash_proc_spec.mounts.push(new_mount("/proc/", "/host_proc", true, "bind"));
+  match validate_spec(&slash_proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14b. 上位参照を含む /var/../proc の拒否
+  let mut dotdot_proc_spec = create_valid_test_spec();
+  dotdot_proc_spec.mounts = List.new();
+  dotdot_proc_spec.mounts.push(new_mount("/var/../proc", "/host_proc", true, "bind"));
+  match validate_spec(&dotdot_proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14c. /sys/ 配下の拒否
+  let mut sys_sub_spec = create_valid_test_spec();
+  sys_sub_spec.mounts = List.new();
+  sys_sub_spec.mounts.push(new_mount("/sys/kernel", "/host_sys", true, "bind"));
+  match validate_spec(&sys_sub_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14d. /dev/ 配下の拒否
+  let mut dev_sub_spec = create_valid_test_spec();
+  dev_sub_spec.mounts = List.new();
+  dev_sub_spec.mounts.push(new_mount("/dev/shm", "/host_dev", true, "bind"));
+  match validate_spec(&dev_sub_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14e. マウント先 (destination) の /proc/, /sys/, /dev/ へのマウント拒否
+  let mut dst_proc_spec = create_valid_test_spec();
+  dst_proc_spec.mounts = List.new();
+  dst_proc_spec.mounts.push(new_mount("/var/data", "/proc/", true, "bind"));
+  match validate_spec(&dst_proc_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  let mut dst_dotdot_spec = create_valid_test_spec();
+  dst_dotdot_spec.mounts = List.new();
+  dst_dotdot_spec.mounts.push(new_mount("/var/data", "/var/../dev", true, "bind"));
+  match validate_spec(&dst_dotdot_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 14f. 正規化後に安全なマウント (/var/data/../data -> /var/data) は通過すること
+  let mut norm_ok_spec = create_valid_test_spec();
+  norm_ok_spec.mounts = List.new();
+  norm_ok_spec.mounts.push(new_mount("/var/data/../data", "/app/data/.", true, "bind"));
+  match validate_spec(&norm_ok_spec) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
   return true;
 }

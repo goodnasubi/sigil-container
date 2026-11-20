@@ -248,5 +248,54 @@ pub fn run_tar_fuzz_tests() -> Bool
     }
   }
 
+  // 14. 回帰テスト: 1 ヘッダ未満の入力 (< 512 バイト) は Ok(0) ではなくエラーを返すこと
+  let mut short_b = Bytes.new();
+  let mut s_i = 0;
+  while s_i < 100 {
+    short_b.push(0);
+    s_i = s_i + 1;
+  }
+  match validate_tar_archive(&short_b) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+  let empty_b = Bytes.new();
+  match validate_tar_archive(&empty_b) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 15. 回帰テスト: 宣言ペイロードが入力を超える切り詰め tar の拒否
+  // valid_h は 512 バイトのファイルサイズを宣言しているが、ペイロードが存在しない (ヘッダのみ 512 バイト)
+  let mut trunc_tar = Bytes.new();
+  trunc_tar.extend(&valid_h);
+  match validate_tar_archive(&trunc_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 16. 回帰テスト: 不完全な末尾ヘッダ (512 バイト境界未満の断片) の拒否
+  let zero_size_h = create_tar_header_fixture("empty_file", "00000000000 ", 48, "");
+  let mut frag_tar = Bytes.new();
+  frag_tar.extend(&zero_size_h);
+  // 100 バイトの不完全なヘッダー断片を追加
+  let mut f_i = 0;
+  while f_i < 100 {
+    frag_tar.push(0);
+    f_i = f_i + 1;
+  }
+  match validate_tar_archive(&frag_tar) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
   return true;
 }

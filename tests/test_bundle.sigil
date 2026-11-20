@@ -2,6 +2,7 @@ module tests.test_bundle
   targets server
   trust none
 
+use container.oci_spec.append_raw_escaped;
 use container.oci_spec.generate_oci_config_json;
 use container.spec.ContainerSpec;
 use container.spec.RestartPolicy;
@@ -11,6 +12,39 @@ use container.spec.new_env_var;
 use container.spec.new_mount;
 use container.spec.new_port_mapping;
 use container.spec.new_resources;
+
+fn bytes_contains(haystack: &Bytes, needle: &Bytes) -> Bool
+  intent "haystack 内に needle バイト列が含まれるかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if needle.len() == 0 {
+    return true;
+  }
+  if haystack.len() < needle.len() {
+    return false;
+  }
+  let max_start = haystack.len() - needle.len();
+  let mut i = 0;
+  while i <= max_start {
+    let mut matched = true;
+    let mut j = 0;
+    while j < needle.len() && matched {
+      let b_h = haystack.get(i + j).unwrap_or(0);
+      let b_n = needle.get(j).unwrap_or(0);
+      if b_h != b_n {
+        matched = false;
+      }
+      j = j + 1;
+    }
+    if matched {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
 
 fn create_sample_spec() -> ContainerSpec
   intent "バンドル生成用の標準的な ContainerSpec を生成する"
@@ -79,6 +113,76 @@ pub fn run_bundle_tests() -> Bool
   // 必須キーの含有確認
   if json1.len() == 0 {
     return false;
+  }
+
+  // 1. 回帰テスト: seccomp 設定が linux オブジェクトに出力されていること
+  if !bytes_contains(&json1.as_bytes(), &"\"seccomp\":".as_bytes()) {
+    return false;
+  }
+  if !bytes_contains(&json1.as_bytes(), &"\"defaultAction\":\"SCMP_ACT_ERRNO\"".as_bytes()) {
+    return false;
+  }
+
+  // 2. 回帰テスト: 未解決の seccomp プロファイルはエラーで拒否されること
+  let mut bad_seccomp_spec = create_sample_spec();
+  bad_seccomp_spec.isolation.seccomp_profile = "unknown_profile";
+  match generate_oci_config_json(&bad_seccomp_spec) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // 3. 回帰テスト: JSON 制御文字 (0x20 未満) の \u00XX エスケープ
+  let mut ctrl_bytes = Bytes.new();
+  ctrl_bytes.push(7);  // BEL (0x07)
+  ctrl_bytes.push(8);  // BS (0x08)
+  ctrl_bytes.push(12);  // FF (0x0c)
+  ctrl_bytes.push(27);  // ESC (0x1b)
+  let ctrl_str = match ctrl_bytes.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+  let mut out_buf = Bytes.new();
+  append_raw_escaped(&mut out_buf, &ctrl_str);
+  let escaped = match out_buf.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+  if escaped != "\\u0007\\u0008\\u000c\\u001b" {
+    return false;
+  }
+
+  // generate_oci_config_json を通した制御文字引数のエスケープ出力
+  let mut ctrl_spec = create_sample_spec();
+  ctrl_spec.args.push(ctrl_str);
+  match generate_oci_config_json(&ctrl_spec) {
+    Ok(j) => {
+      if !bytes_contains(&j.as_bytes(), &"\\u0007\\u0008\\u000c\\u001b".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 回帰テスト: マウントパスの正規化出力 (/var/tmp/../tmp/ -> /var/tmp, /app/data/. -> /app/data)
+  let mut norm_mount_spec = create_sample_spec();
+  norm_mount_spec.mounts = List.new();
+  norm_mount_spec.mounts.push(new_mount("/var/tmp/../tmp/", "/app/data/.", true, "bind"));
+  match generate_oci_config_json(&norm_mount_spec) {
+    Ok(j) => {
+      if !bytes_contains(&j.as_bytes(), &"\"source\":\"/var/tmp\"".as_bytes()) {
+        return false;
+      }
+      if !bytes_contains(&j.as_bytes(), &"\"destination\":\"/app/data\"".as_bytes()) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
   }
 
   return true;

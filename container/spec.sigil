@@ -215,6 +215,129 @@ pub fn is_valid_sha256_digest(digest: &String) -> Bool
 }
 
 // ---------------------------------------------------------------------------
+// マウントパスの語彙的正規化と禁止パス判定
+// ---------------------------------------------------------------------------
+
+fn pop_component(components: &List<String>) -> List<String>
+  intent "末尾の要素を取り除いた新しい List を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut res = List.new();
+  let mut i = 0;
+  let target_len = components.len() - 1;
+  while i < target_len {
+    match components.get(i) {
+      Some(s) => {
+        res.push(s.clone());
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return res;
+}
+
+pub fn normalize_mount_path(path: &String) -> Result<String, ContainerError>
+  intent "マウントパスを語彙的に正規化 (. と .. の解決、重複スラッシュと末尾スラッシュの除去) する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = path.as_bytes();
+  if bytes.len() == 0 || bytes.get(0).unwrap_or(0) != 47 {
+    return Err(ContainerError.SpecValidation("マウントパスは絶対パスである必要があります。"));
+  }
+
+  let mut components = List.new();
+  let mut i = 1;
+  let mut seg_start = 1;
+
+  while i <= bytes.len() {
+    let mut is_delim = false;
+    if i == bytes.len() {
+      is_delim = true;
+    } else if bytes.get(i).unwrap_or(0) == 47 {
+      is_delim = true;
+    }
+
+    if is_delim {
+      let seg_len = i - seg_start;
+      if seg_len > 0 {
+        let seg_slice = bytes.slice(seg_start, i).unwrap_or(Bytes.new());
+        let mut seg_str = "";
+        match seg_slice.to_string_utf8() {
+          Ok(s) => {
+            seg_str = s;
+          }
+          Err(_) => {
+            return Err(ContainerError.SpecValidation("マウントパスに不正な UTF-8 バイトが含まれています。"));
+          }
+        }
+        if seg_str == "." {
+          // カレントディレクトリ参照は無視
+        } else if seg_str == ".." {
+          // 上位参照
+          if components.len() == 0 {
+            return Err(ContainerError.SpecValidation("マウントパスにルートを超える上位参照 (..) は使用できません。"));
+          }
+          components = pop_component(&components);
+        } else {
+          components.push(seg_str);
+        }
+      }
+      seg_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  if components.len() == 0 {
+    return Ok("/");
+  }
+
+  let mut buf = Bytes.new();
+  let mut comp_i = 0;
+  while comp_i < components.len() {
+    buf.push(47);  // '/'
+    match components.get(comp_i) {
+      Some(c) => {
+        buf.extend(&c.as_bytes());
+      }
+      None => {}
+    }
+    comp_i = comp_i + 1;
+  }
+
+  return match buf.to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(ContainerError.SpecValidation("マウントパスの正規化に失敗しました。")),
+  };
+}
+
+fn is_forbidden_mount_path(norm_path: &String) -> Bool
+  intent "正規化後のパスが /proc, /sys, /dev 直下または配下であるかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if norm_path == "/proc" || norm_path == "/sys" || norm_path == "/dev" {
+    return true;
+  }
+  let bytes = norm_path.as_bytes();
+  if bytes.slice(0, 6).unwrap_or(Bytes.new()) == "/proc/".as_bytes() {
+    return true;
+  }
+  if bytes.slice(0, 5).unwrap_or(Bytes.new()) == "/sys/".as_bytes() {
+    return true;
+  }
+  if bytes.slice(0, 5).unwrap_or(Bytes.new()) == "/dev/".as_bytes() {
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // 既定拒否の安全な Isolation 生成ヘルパー
 // ---------------------------------------------------------------------------
 
@@ -288,9 +411,12 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
     cap_idx = cap_idx + 1;
   }
 
-  // 7. Seccomp: 必須 (空は拒否)
+  // 7. Seccomp: 必須 (空は拒否、解決できないプロファイルは拒否)
   if spec.isolation.seccomp_profile.len() == 0 {
     return Err(ContainerError.SpecValidation("seccomp プロファイルの指定が必須です (既定は許可リスト)。"));
+  }
+  if spec.isolation.seccomp_profile != "default_whitelist" && spec.isolation.seccomp_profile != "default" {
+    return Err(ContainerError.SpecValidation("未対応または解決できない seccomp プロファイルです。"));
   }
 
   // 8. 資源上限: メモリ・CPU・pids・ディスク・ログがすべて必須 (> 0)
@@ -348,18 +474,35 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
   while m_idx < spec.mounts.len() {
     match spec.mounts.get(m_idx) {
       Some(m) => {
-        if m.destination.len() == 0 || m.destination.as_bytes().get(0).unwrap_or(0) != 47 {
-          return Err(ContainerError.SpecValidation("マウント先は絶対パスである必要があります。"));
+        let mut norm_dst = "";
+        match normalize_mount_path(&m.destination) {
+          Ok(p) => {
+            norm_dst = p;
+          }
+          Err(e) => {
+            return Err(e);
+          }
         }
-        if m.destination == "/proc" || m.destination == "/sys" || m.destination == "/dev" {
-          return Err(ContainerError.SpecValidation("/proc, /sys, /dev への直接上書きマウントは拒否されます。"));
+        let mut norm_src = "";
+        match normalize_mount_path(&m.source) {
+          Ok(p) => {
+            norm_src = p;
+          }
+          Err(e) => {
+            return Err(e);
+          }
         }
-        if m.source == "/proc" || m.source == "/sys" || m.source == "/dev" {
-          return Err(ContainerError.SpecValidation("ホストの /proc, /sys, /dev のマウントは既定拒否されます。"));
+        if norm_dst == "/" {
+          return Err(ContainerError.SpecValidation("コンテナのルート (/) への直接上書きマウントは拒否されます。"));
         }
-        // 上位参照の検査
-        if m.source.as_bytes().slice(0, 3).unwrap_or(Bytes.new()) == "../".as_bytes() || m.destination.as_bytes().slice(0, 3).unwrap_or(Bytes.new()) == "../".as_bytes() {
-          return Err(ContainerError.SpecValidation("マウントパスに上位参照 (..) は使用できません。"));
+        if is_forbidden_mount_path(&norm_dst) {
+          return Err(ContainerError.SpecValidation("/proc, /sys, /dev 直下および配下へのマウントは拒否されます。"));
+        }
+        if norm_src == "/" {
+          return Err(ContainerError.SpecValidation("ホストのルート (/) のマウントは既定拒否されます。"));
+        }
+        if is_forbidden_mount_path(&norm_src) {
+          return Err(ContainerError.SpecValidation("ホストの /proc, /sys, /dev 直下および配下のマウントは既定拒否されます。"));
         }
       }
       None => {}
