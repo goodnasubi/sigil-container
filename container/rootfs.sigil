@@ -1,0 +1,200 @@
+module container.rootfs
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.image_layout.inspect_tar_header;
+use container.image_layout.parse_octal;
+use container.limits.default_non_root_gid;
+use container.limits.default_non_root_uid;
+use container.limits.max_file_count;
+use container.limits.max_total_image_size;
+use container.state.RootfsRecord;
+use container.state.new_rootfs_record;
+
+// ADR 0053 決定 1・3・6 / ADR 0035: rootfs の展開と検証
+// P5-1 の OCI Image Layout 読み取りと層パスの検査を使い、
+// ADR 0035 のイメージ（単一層、静的 ELF /app、User 65532:65532、Entrypoint ["/app"]、WorkingDir /）
+// の rootfs を展開・検証する。展開先は P5-1 の状態保存形式（RootfsRecord）で管理する。
+
+pub struct RootfsEntry {
+  path: String,
+  size: Int,
+  mode: Int,
+  uid: Int,
+  gid: Int,
+  is_dir: Bool,
+}
+
+pub struct RootfsManifest {
+  destination_path: String,
+  entries: List<RootfsEntry>,
+  total_bytes: Int,
+  file_count: Int,
+}
+
+pub fn new_rootfs_entry(path: String, size: Int, mode: Int, uid: Int, gid: Int, is_dir: Bool) -> RootfsEntry
+  intent "RootfsEntry を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return RootfsEntry { path: path, size: size, mode: mode, uid: uid, gid: gid, is_dir: is_dir };
+}
+
+pub fn new_rootfs_manifest(destination_path: String, entries: List<RootfsEntry>, total_bytes: Int, file_count: Int) -> RootfsManifest
+  intent "RootfsManifest を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return RootfsManifest { destination_path: destination_path, entries: entries, total_bytes: total_bytes, file_count: file_count };
+}
+
+fn is_null_block(bytes: &Bytes, offset: Int) -> Bool
+  intent "512 バイトブロックがすべてゼロ (null ブロック) かどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < 512 {
+    let b = bytes.get(offset + i).unwrap_or(0);
+    if b != 0 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn unpack_layer_archive(tar_bytes: &Bytes, destination_path: &String) -> Result<RootfsManifest, ContainerError>
+  intent "非圧縮 tar バイト列から rootfs エントリ群を安全に展開・検証し、RootfsManifest を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let total_len = tar_bytes.len();
+  if total_len % 512 != 0 {
+    return Err(ContainerError.Corrupt("Tar アーカイブのサイズが 512 バイト境界に揃っていません。"));
+  }
+
+  let mut offset = 0;
+  let mut entries = List.new();
+  let mut total_bytes = 0;
+  let mut file_count = 0;
+  let mut consecutive_null_blocks = 0;
+  let mut done = false;
+
+  while offset < total_len && !done {
+    if is_null_block(&tar_bytes, offset) {
+      consecutive_null_blocks = consecutive_null_blocks + 1;
+      offset = offset + 512;
+      if consecutive_null_blocks >= 2 {
+        // 終端 (2 つの 512 バイトゼロブロック) に到達
+        done = true;
+      }
+    } else {
+      if consecutive_null_blocks > 0 {
+        return Err(ContainerError.Corrupt("終端ゼロブロックの後にデータブロックが存在します。"));
+      }
+
+      let header = tar_bytes.slice(offset, offset + 512).unwrap_or(Bytes.new());
+      match inspect_tar_header(&header) {
+        Ok(tar_entry) => {
+          // mode (100..108), uid (108..116), gid (116..124) のパース
+          let mode = parse_octal(&header, 100, 8).unwrap_or(0);
+          let uid = parse_octal(&header, 108, 8).unwrap_or(0);
+          let gid = parse_octal(&header, 116, 8).unwrap_or(0);
+
+          // 上限検査
+          file_count = file_count + 1;
+          if file_count > max_file_count() {
+            return Err(ContainerError.LimitExceeded("展開エントリ数が上限 (100,000) を超過しました。"));
+          }
+
+          total_bytes = total_bytes + tar_entry.size;
+          if total_bytes > max_total_image_size() {
+            return Err(ContainerError.LimitExceeded("展開後合計サイズが上限 (4 GiB) を超過しました。"));
+          }
+
+          let is_dir = tar_entry.typeflag == 53;  // '5'
+
+          // ADR 0035 では通常ファイル ('0' = 48 または NUL = 0) とディレクトリ ('5' = 53) のみを許可。
+          // シンボリックリンクやハードリンクは ADR 0035 の仕様外として拒否
+          if tar_entry.typeflag != 0 && tar_entry.typeflag != 48 && tar_entry.typeflag != 53 {
+            return Err(ContainerError.LayerValidation("ADR 0035 仕様外のリンクまたは特殊ファイルエントリです。"));
+          }
+
+          let rootfs_entry = RootfsEntry { path: tar_entry.path, size: tar_entry.size, mode: mode, uid: uid, gid: gid, is_dir: is_dir };
+          entries.push(rootfs_entry);
+
+          // ヘッダ 512 バイト + ペイロード (512 バイト切り上げ)
+          let payload_blocks = (tar_entry.size + 511) / 512 * 512;
+          offset = offset + 512 + payload_blocks;
+          if offset > total_len {
+            return Err(ContainerError.Corrupt("Tar エントリのペイロードがアーカイブ末尾を超過しています。"));
+          }
+        }
+        Err(err) => {
+          return Err(err);
+        }
+      }
+    }
+  }
+
+  return Ok(RootfsManifest { destination_path: destination_path.clone(), entries: entries, total_bytes: total_bytes, file_count: file_count });
+}
+
+pub fn validate_adr0035_rootfs(manifest: &RootfsManifest) -> Result<Bool, ContainerError>
+  intent "展開された rootfs が ADR 0035 仕様 (単一層、静的 ELF /app、User 65532:65532、実行可能) を満たすかを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut found_app = false;
+  let mut i = 0;
+  while i < manifest.entries.len() {
+    match manifest.entries.get(i) {
+      Some(entry) => {
+        if entry.path == "app" || entry.path == "/app" {
+          if entry.is_dir {
+            return Err(ContainerError.LayerValidation("/app がディレクトリとして配置されています (通常 ELF ファイルである必要があります)。"));
+          }
+          if entry.size == 0 {
+            return Err(ContainerError.LayerValidation("/app のサイズが 0 バイトです。"));
+          }
+          // 実行権限の確認: mode 0555 (365) または少なくとも user 実行権限 (mode & 0o100 != 0)
+          if entry.mode / 64 % 2 == 0 {
+            return Err(ContainerError.LayerValidation("/app に実行権限が付与されていません。"));
+          }
+          // ADR 0035 の UID/GID (65532 または 0)
+          if entry.uid != 0 && entry.uid != default_non_root_uid() {
+            return Err(ContainerError.LayerValidation("/app の UID が ADR 0035 規定値 (0 または 65532) に一致しません。"));
+          }
+          if entry.gid != 0 && entry.gid != default_non_root_gid() {
+            return Err(ContainerError.LayerValidation("/app の GID が ADR 0035 規定値 (0 または 65532) に一致しません。"));
+          }
+          found_app = true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  if !found_app {
+    return Err(ContainerError.LayerValidation("ADR 0035 の静的 ELF /app が rootfs に存在しません。"));
+  }
+
+  return Ok(true);
+}
+
+pub fn manifest_to_rootfs_record(rootfs_id: String, workload_id: String, manifest: &RootfsManifest, status: String) -> RootfsRecord
+  intent "RootfsManifest から状態保存用の RootfsRecord を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return new_rootfs_record(rootfs_id, workload_id, manifest.destination_path.clone(), manifest.total_bytes, manifest.file_count, status);
+}

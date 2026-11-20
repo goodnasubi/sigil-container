@@ -39,4 +39,11 @@ $SIGIL build --root . test_runner.sigil main -o "$TMP_BIN"
 rm -f "$TMP_BIN"
 echo "Native binary tests passed"
 
+if [ -x "./tests/test_runtime_e2e.sh" ] && (command -v crun >/dev/null 2>&1 || command -v runc >/dev/null 2>&1); then
+  echo "=== 5. Running real OCI runtime integration and negative tests ==="
+  ./tests/test_runtime_e2e.sh
+else
+  echo "=== 5. Skipping real OCI runtime integration (neither runc nor crun found on PATH) ==="
+fi
+
 echo "=== All tests passed successfully! Evaluator and native match verified. ==="

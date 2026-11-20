@@ -1,0 +1,294 @@
+module tests.test_runtime
+  targets server
+  trust none
+
+use container.error.error_kind_name;
+use container.runtime.LifecycleAction;
+use container.runtime.RuntimeKind;
+use container.runtime.append_log;
+use container.runtime.build_runtime_command;
+use container.runtime.compare_runtime_outputs;
+use container.runtime.evaluate_cleanup_outcome;
+use container.runtime.map_oci_status_to_instance_status;
+use container.runtime.new_log_buffer;
+use container.runtime.new_oci_state_info;
+use container.runtime.parse_oci_state_json;
+use container.runtime.parse_runtime_kind;
+use container.runtime.plan_forced_cleanup;
+use container.runtime.runtime_isolation_notice;
+use container.state.decode_runtime_state_record;
+use container.state.encode_runtime_state_key;
+use container.state.encode_runtime_state_record;
+use container.state.new_instance_record;
+use container.state.new_runtime_state_record;
+
+fn check_arg(args: &List<String>, idx: Int, expected: &String) -> Bool
+  intent "引数リストの指定インデックスが期待値と一致するかを調べる"
+  requires none
+  ensures none
+  effects none
+{
+  return match args.get(idx) {
+    Some(s) => s == expected,
+    None => false,
+  };
+}
+
+pub fn run_runtime_tests() -> Bool
+  intent "OCI ランタイム接続、ライフサイクルコマンド、状態パース、ログ上限、後始末のテストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. ランタイム種類の選択とパース
+  match parse_runtime_kind(&"runc") {
+    Ok(RuntimeKind.Runc) => {}
+    _ => {
+      return false;
+    }
+  }
+  match parse_runtime_kind(&"crun") {
+    Ok(RuntimeKind.Crun) => {}
+    _ => {
+      return false;
+    }
+  }
+  match parse_runtime_kind(&"docker") {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "SpecValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 2. ライフサイクルコマンド行引数の生成
+  let cid = "ctr-001";
+  let root = "/run/sigil";
+  let bdir = "/bundle";
+
+  // Create
+  let create_cmd = build_runtime_command(&RuntimeKind.Crun, &root, &LifecycleAction.Create, &cid, &bdir);
+  if create_cmd.program != "crun" {
+    return false;
+  }
+  if create_cmd.args.len() != 6 {
+    return false;
+  }
+  if !check_arg(&create_cmd.args, 0, &"--root") {
+    return false;
+  }
+  if !check_arg(&create_cmd.args, 2, &"create") {
+    return false;
+  }
+  if !check_arg(&create_cmd.args, 3, &"--bundle") {
+    return false;
+  }
+  if !check_arg(&create_cmd.args, 5, &cid) {
+    return false;
+  }
+
+  // Start
+  let start_cmd = build_runtime_command(&RuntimeKind.Runc, &"", &LifecycleAction.Start, &cid, &bdir);
+  if start_cmd.program != "runc" {
+    return false;
+  }
+  if start_cmd.args.len() != 2 {
+    return false;
+  }
+  if !check_arg(&start_cmd.args, 0, &"start") {
+    return false;
+  }
+
+  // Stop (TERM)
+  let stop_cmd = build_runtime_command(&RuntimeKind.Crun, &"", &LifecycleAction.Stop(15), &cid, &bdir);
+  if stop_cmd.args.len() != 3 {
+    return false;
+  }
+  if !check_arg(&stop_cmd.args, 0, &"kill") {
+    return false;
+  }
+  if !check_arg(&stop_cmd.args, 2, &"TERM") {
+    return false;
+  }
+
+  // Kill (KILL)
+  let kill_cmd = build_runtime_command(&RuntimeKind.Runc, &"", &LifecycleAction.Kill(9), &cid, &bdir);
+  if !check_arg(&kill_cmd.args, 2, &"KILL") {
+    return false;
+  }
+
+  // Delete (--force)
+  let del_cmd = build_runtime_command(&RuntimeKind.Crun, &"", &LifecycleAction.Delete(true), &cid, &bdir);
+  if !check_arg(&del_cmd.args, 0, &"delete") {
+    return false;
+  }
+  if !check_arg(&del_cmd.args, 1, &"--force") {
+    return false;
+  }
+
+  // State
+  let state_cmd = build_runtime_command(&RuntimeKind.Runc, &"", &LifecycleAction.State, &cid, &bdir);
+  if !check_arg(&state_cmd.args, 0, &"state") {
+    return false;
+  }
+
+  // 3. OCI state 出力 JSON のパース
+  let sample_state_json = "{\"ociVersion\":\"1.0.0\",\"id\":\"ctr-001\",\"pid\":8899,\"status\":\"running\",\"bundle\":\"/bundle\",\"rootfs\":\"rootfs\"}";
+  let mut state_info = parse_oci_state_json(&sample_state_json).unwrap_or(new_oci_state_info("", "", 0, "", ""));
+  if state_info.id != "ctr-001" || state_info.status != "running" || state_info.pid != 8899 {
+    return false;
+  }
+  if map_oci_status_to_instance_status(&state_info.status) != "Running" {
+    return false;
+  }
+  if map_oci_status_to_instance_status(&"created") != "Creating" {
+    return false;
+  }
+  if map_oci_status_to_instance_status(&"stopped") != "Stopped" {
+    return false;
+  }
+
+  // 4. ログバッファと 100 MiB 上限
+  let mut log_buf = new_log_buffer();
+  let mut normal_chunk = Bytes.new();
+  normal_chunk.extend(&"log entry 1\n".as_bytes());
+  match append_log(&mut log_buf, &normal_chunk) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+  if log_buf.current_bytes != normal_chunk.len() {
+    return false;
+  }
+
+  // 上限超過のシミュレーション: max_bytes を一時的に現在値に設定して超過させる
+  let mut restricted_log_buf = new_log_buffer();
+  restricted_log_buf.max_bytes = 10;
+  let mut large_chunk = Bytes.new();
+  let mut j = 0;
+  while j < 20 {
+    large_chunk.push(65);
+    j = j + 1;
+  }
+  match append_log(&mut restricted_log_buf, &large_chunk) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LimitExceeded" {
+        return false;
+      }
+    }
+  }
+
+  // 5. 強制終了時の後始末計画と評価
+  let inst = new_instance_record("ctr-001", "wl-001", "node-1", "Running", 0);
+  let cleanup_target = plan_forced_cleanup(&inst, &"/var/lib/sigil/bundle", &"/var/lib/sigil/rootfs", 8899);
+
+  // 正常な後始末完了
+  let empty_failed = List.new();
+  match evaluate_cleanup_outcome(&cleanup_target, &empty_failed) {
+    Ok(report) => {
+      if !report.success || report.resulting_status != "Stopped" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 後始末に失敗した資源がある場合 (黙って成功にしない)
+  let mut failed_items = List.new();
+  failed_items.push("process 8899 kill failed");
+  match evaluate_cleanup_outcome(&cleanup_target, &failed_items) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "StateError" {
+        return false;
+      }
+    }
+  }
+
+  // 6. 出力照合 (DiffRecord)
+  let diffs = compare_runtime_outputs(&"/bundle/a", &"/bundle/b", &"Running", &"Running");
+  if diffs.len() != 2 {
+    return false;
+  }
+  match diffs.get(0) {
+    Some(d) => {
+      if !d.is_different {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+  match diffs.get(1) {
+    Some(d) => {
+      if d.is_different {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 7. 隔離境界告知文の検証
+  let notice = runtime_isolation_notice();
+  if notice.len() == 0 {
+    return false;
+  }
+
+  // 8. RuntimeStateRecord の符号化と復号
+  let rt_rec = new_runtime_state_record("ctr-001", "crun", 8899, "running", 0, "");
+  let mut rt_key = Bytes.new();
+  match encode_runtime_state_key(&rt_rec.instance_id) {
+    Ok(k) => {
+      rt_key = k;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if rt_key.len() == 0 {
+    return false;
+  }
+
+  let mut rt_bytes = Bytes.new();
+  match encode_runtime_state_record(&rt_rec) {
+    Ok(b) => {
+      rt_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded_rt = new_runtime_state_record("", "", 0, "", 0, "");
+  match decode_runtime_state_record(&rt_bytes) {
+    Ok(d) => {
+      decoded_rt = d;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  if decoded_rt.instance_id != rt_rec.instance_id || decoded_rt.runtime_kind != rt_rec.runtime_kind {
+    return false;
+  }
+  if decoded_rt.pid != rt_rec.pid || decoded_rt.status != rt_rec.status {
+    return false;
+  }
+
+  return true;
+}

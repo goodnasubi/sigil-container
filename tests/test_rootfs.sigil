@@ -1,0 +1,333 @@
+module tests.test_rootfs
+  targets server
+  trust none
+
+use container.error.error_kind_name;
+use container.rootfs.manifest_to_rootfs_record;
+use container.rootfs.new_rootfs_manifest;
+use container.rootfs.unpack_layer_archive;
+use container.rootfs.validate_adr0035_rootfs;
+use container.state.decode_rootfs_record;
+use container.state.encode_rootfs_key;
+use container.state.encode_rootfs_record;
+
+fn create_tar_header_for_test(name: &String, size: Int, mode_str: &String, typeflag_byte: Int, uid: Int, gid: Int) -> Bytes
+  intent "テスト用の 512 バイト USTAR ヘッダを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.with_capacity(512);
+
+  // 0..100: name
+  let name_bytes = name.as_bytes();
+  let mut i = 0;
+  while i < 100 {
+    if i < name_bytes.len() {
+      bytes.push(name_bytes.get(i).unwrap_or(0));
+    } else {
+      bytes.push(0);
+    }
+    i = i + 1;
+  }
+
+  // 100..108: mode (e.g. "0000555" + 0)
+  let mode_b = mode_str.as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(mode_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 108..116: uid (e.g. 65532 -> "0177774")
+  let mut uid_str = "0177774";
+  if uid == 0 {
+    uid_str = "0000000";
+  }
+  let uid_b = uid_str.as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(uid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 116..124: gid
+  let mut gid_str = "0177774";
+  if gid == 0 {
+    gid_str = "0000000";
+  }
+  let gid_b = gid_str.as_bytes();
+  i = 0;
+  while i < 7 {
+    bytes.push(gid_b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 124..136: size (8進数)
+  // 簡易的に 0..4095 のサイズに対応
+  let mut s_buf = Bytes.new();
+  s_buf.push(48);  // '0'
+  s_buf.push(48);
+  s_buf.push(48);
+  s_buf.push(48);
+  s_buf.push(48);
+  s_buf.push(48);
+  s_buf.push(48);
+  s_buf.push(48);
+  s_buf.push(48 + size / 64 % 8);
+  s_buf.push(48 + size / 8 % 8);
+  s_buf.push(48 + size % 8);
+  s_buf.push(32);  // ' '
+  i = 0;
+  while i < 12 {
+    bytes.push(s_buf.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+
+  // 136..148: mtime ("00000000000" + 0)
+  i = 0;
+  while i < 11 {
+    bytes.push(48);
+    i = i + 1;
+  }
+  bytes.push(0);
+
+  // 148..156: chksum (最初は空白 8 個)
+  i = 0;
+  while i < 8 {
+    bytes.push(32);
+    i = i + 1;
+  }
+
+  // 156: typeflag
+  bytes.push(typeflag_byte);
+
+  // 157..257: linkname (all 0)
+  i = 0;
+  while i < 100 {
+    bytes.push(0);
+    i = i + 1;
+  }
+
+  // 257..263: magic ("ustar\0")
+  bytes.push(117);  // 'u'
+  bytes.push(115);  // 's'
+  bytes.push(116);  // 't'
+  bytes.push(97);  // 'a'
+  bytes.push(114);  // 'r'
+  bytes.push(0);
+
+  // 263..265: version ("00")
+  bytes.push(48);  // '0'
+  bytes.push(48);  // '0'
+
+  // 残り 265..512 を 0 で埋める
+  i = 265;
+  while i < 512 {
+    bytes.push(0);
+    i = i + 1;
+  }
+
+  // チェックサム計算 (全 512 バイトの unsigned 値の合計)
+  let mut sum = 0;
+  i = 0;
+  while i < 512 {
+    sum = sum + bytes.get(i).unwrap_or(0);
+    i = i + 1;
+  }
+
+  // チェックサムを 148..156 に書き込む: 6桁 8進 + NUL + 空白
+  let mut c_buf = Bytes.new();
+  c_buf.push(48);
+  c_buf.push(48 + sum / 4096 % 8);
+  c_buf.push(48 + sum / 512 % 8);
+  c_buf.push(48 + sum / 64 % 8);
+  c_buf.push(48 + sum / 8 % 8);
+  c_buf.push(48 + sum % 8);
+  c_buf.push(0);
+  c_buf.push(32);
+
+  let mut final_bytes = Bytes.with_capacity(512);
+  i = 0;
+  while i < 512 {
+    if i >= 148 && i < 156 {
+      final_bytes.push(c_buf.get(i - 148).unwrap_or(0));
+    } else {
+      final_bytes.push(bytes.get(i).unwrap_or(0));
+    }
+    i = i + 1;
+  }
+
+  return final_bytes;
+}
+
+fn append_null_blocks(buf: &mut Bytes, count: Int)
+  intent "指定された個数の 512 バイトゼロブロックを追加する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = 0;
+  while b < count {
+    let mut i = 0;
+    while i < 512 {
+      buf.push(0);
+      i = i + 1;
+    }
+    b = b + 1;
+  }
+}
+
+pub fn run_rootfs_tests() -> Bool
+  intent "rootfs 展開、ADR 0035 検証、状態保存のテストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. ADR 0035 の正常イメージアーカイブの構築と展開
+  // 単一層、静的 ELF app (16 バイト, mode 0555, user 65532:65532)
+  let app_name = "app";
+  let app_hdr = create_tar_header_for_test(&app_name, 16, &"0000555", 48, 65532, 65532);
+
+  let mut valid_tar = Bytes.new();
+  valid_tar.extend(&app_hdr);
+  // payload 16 bytes + padding to 512 bytes
+  let mut i = 0;
+  while i < 16 {
+    valid_tar.push(127);  // ELF magic dummy
+    i = i + 1;
+  }
+  while i < 512 {
+    valid_tar.push(0);
+    i = i + 1;
+  }
+  // 終端ゼロブロック 2 個
+  append_null_blocks(&mut valid_tar, 2);
+
+  let dest = "/var/lib/sigil/containers/c1/rootfs";
+  let mut manifest = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&valid_tar, &dest) {
+    Ok(m) => {
+      manifest = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  if manifest.file_count != 1 {
+    return false;
+  }
+  if manifest.total_bytes != 16 {
+    return false;
+  }
+
+  // 2. ADR 0035 の仕様検証が成功すること
+  match validate_adr0035_rootfs(&manifest) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 実行権限がないファイルの場合、LayerValidation で拒否されること
+  let no_exec_hdr = create_tar_header_for_test(&app_name, 16, &"0000444", 48, 65532, 65532);
+  let mut no_exec_tar = Bytes.new();
+  no_exec_tar.extend(&no_exec_hdr);
+  i = 0;
+  while i < 512 {
+    no_exec_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut no_exec_tar, 2);
+
+  let mut bad_manifest = new_rootfs_manifest("", List.new(), 0, 0);
+  match unpack_layer_archive(&no_exec_tar, &dest) {
+    Ok(m) => {
+      bad_manifest = m;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match validate_adr0035_rootfs(&bad_manifest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 4. パストラバーサルを含むアーカイブが拒否されること
+  let trav_name = "../etc/passwd";
+  let trav_hdr = create_tar_header_for_test(&trav_name, 16, &"0000644", 48, 0, 0);
+  let mut trav_tar = Bytes.new();
+  trav_tar.extend(&trav_hdr);
+  i = 0;
+  while i < 512 {
+    trav_tar.push(0);
+    i = i + 1;
+  }
+  append_null_blocks(&mut trav_tar, 2);
+
+  match unpack_layer_archive(&trav_tar, &dest) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // 5. 状態保存 (RootfsRecord) のエンコード・デコード照合
+  let record = manifest_to_rootfs_record("rf-001", "wl-sample", &manifest, "Unpacked");
+  let mut key_bytes = Bytes.new();
+  match encode_rootfs_key(&record.rootfs_id) {
+    Ok(k) => {
+      key_bytes = k;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if key_bytes.len() == 0 {
+    return false;
+  }
+
+  let mut rec_bytes = Bytes.new();
+  match encode_rootfs_record(&record) {
+    Ok(b) => {
+      rec_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded = manifest_to_rootfs_record("", "", &manifest, "");
+  match decode_rootfs_record(&rec_bytes) {
+    Ok(d) => {
+      decoded = d;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  if decoded.rootfs_id != record.rootfs_id || decoded.destination_path != record.destination_path {
+    return false;
+  }
+  if decoded.total_bytes != record.total_bytes || decoded.file_count != record.file_count {
+    return false;
+  }
+
+  return true;
+}

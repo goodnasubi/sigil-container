@@ -3,6 +3,8 @@ module test_runner
   trust none
 
 use tests.test_bundle.run_bundle_tests;
+use tests.test_rootfs.run_rootfs_tests;
+use tests.test_runtime.run_runtime_tests;
 use tests.test_spec.run_spec_tests;
 use tests.test_state.run_state_tests;
 use tests.test_tar_fuzz.run_tar_fuzz_tests;
@@ -24,6 +26,12 @@ pub fn main() -> Int
   }
   if !run_state_tests() {
     return 4;
+  }
+  if !run_rootfs_tests() {
+    return 5;
+  }
+  if !run_runtime_tests() {
+    return 6;
   }
   return 0;
 }
