@@ -193,7 +193,7 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
   }
 
   // 1. typeflag (156)
-  let typeflag = header.get(156).unwrap_or(48);  // '0' = 48
+  let mut typeflag = header.get(156).unwrap_or(48);  // '0' = 48
 
   // 危険な特殊ファイルの拒否:
   // '3': Character device
@@ -284,6 +284,15 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
     Err(e) => {
       return Err(e);
     }
+  }
+
+  // レガシーディレクトリヘッダの正規化:
+  // typeflag が NUL(0) または '0'(48) で名前が '/' で終わるエントリはディレクトリ ('5' = 53) として正規化する。
+  // これにより、非ゼロサイズを持つレガシーディレクトリエントリが通常ファイルとして扱われ、
+  // 後続の悪意あるヘッダがペイロードとしてスキップされる迂回を防ぐ。
+  let path_bytes = full_path.as_bytes();
+  if (typeflag == 0 || typeflag == 48) && path_bytes.len() > 0 && path_bytes.get(path_bytes.len() - 1).unwrap_or(0) == 47 {
+    typeflag = 53;
   }
 
   // 3. サイズ (124..136)

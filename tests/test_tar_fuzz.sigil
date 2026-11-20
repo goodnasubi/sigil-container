@@ -1102,5 +1102,105 @@ pub fn run_tar_fuzz_tests() -> Bool
     }
   }
 
+  // 23. 回帰テスト (再レビュー指摘: レガシーディレクトリヘッダの正規化と非ゼロサイズ拒否)
+  // [実行スモークテストの検討に関する注記]
+  // Sigil コンパイラおよび評価器は pure モード (effects none / trust none) で動作しており、
+  // 外部プロセス起動や実際のファイルシステムへのアーカイブ展開を行う実行機能を持たないため、
+  // 実ファイルシステム上での展開スモークテストは行えません。
+  // そのため、インメモリ Tar ヘッダおよびアーカイブの検査結果（エラー種別 LayerValidation および TarEntry フィールド）への含有・適合テストで代用します。
+  //
+  // (1) レガシーディレクトリヘッダ (safe/, typeflag NUL = 0, size 512):
+  // サイズ検査前にディレクトリとして正規化され、inspect_tar_header で非ゼロサイズ拒否 (LayerValidation) されること
+  let legacy_dir_bad_single = create_tar_header_fixture("safe/", "00000001000 ", 0, "");
+  match inspect_tar_header(&legacy_dir_bad_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (2) ディレクトリヘッダ (safe/, typeflag '0' = 48, size 512):
+  // サイズ検査前にディレクトリとして正規化され、inspect_tar_header で非ゼロサイズ拒否 (LayerValidation) されること
+  let zero_type_dir_bad_single = create_tar_header_fixture("safe/", "00000001000 ", 48, "");
+  match inspect_tar_header(&zero_type_dir_bad_single) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (3) 指摘の攻撃シナリオ: safe/ (typeflag NUL, size 512) の直後に ../escape ヘッダが続くアーカイブ
+  // safe/ が通常ファイルとして扱われて ../escape ヘッダが payload としてスキップされることなく、
+  // validate_tar_archive で LayerValidation により拒否されること
+  let escape_h = create_tar_header_fixture("../escape", "00000000000 ", 48, "");
+  let mut legacy_dir_attack_archive = Bytes.new();
+  legacy_dir_attack_archive.extend(&legacy_dir_bad_single);
+  legacy_dir_attack_archive.extend(&escape_h);
+  legacy_dir_attack_archive.extend(&zero_b);
+  match validate_tar_archive(&legacy_dir_attack_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if error_kind_name(&e) != "LayerValidation" {
+        return false;
+      }
+    }
+  }
+
+  // (4) 正規のレガシーディレクトリエントリ (safe/, typeflag NUL = 0, size 0):
+  // ディレクトリ ('5' = 53) として正規化され、サイズ 0 で正常に受理されること
+  let legacy_dir_ok_single = create_tar_header_fixture("safe/", "00000000000 ", 0, "");
+  match inspect_tar_header(&legacy_dir_ok_single) {
+    Ok(e) => {
+      if e.typeflag != 53 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (5) 正規のディレクトリエントリ (safe/, typeflag '0' = 48, size 0):
+  // ディレクトリ ('5' = 53) として正規化され、サイズ 0 で正常に受理されること
+  let zero_type_dir_ok_single = create_tar_header_fixture("safe/", "00000000000 ", 48, "");
+  match inspect_tar_header(&zero_type_dir_ok_single) {
+    Ok(e) => {
+      if e.typeflag != 53 || e.size != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // (6) アーカイブ検査: 正規のレガシーディレクトリエントリ (safe/, typeflag NUL, size 0) を含むアーカイブが
+  // 後続の正常ファイル (safe/app.txt, size 0) と共に validate_tar_archive で正常に受理されること (count == 2)
+  let normal_subfile_h = create_tar_header_fixture("safe/app.txt", "00000000000 ", 48, "");
+  let mut legacy_dir_ok_archive = Bytes.new();
+  legacy_dir_ok_archive.extend(&legacy_dir_ok_single);
+  legacy_dir_ok_archive.extend(&normal_subfile_h);
+  legacy_dir_ok_archive.extend(&zero_b);
+  match validate_tar_archive(&legacy_dir_ok_archive) {
+    Ok(count) => {
+      if count != 2 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
   return true;
 }
