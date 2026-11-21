@@ -35,9 +35,18 @@ echo "SIR evaluator tests passed (result = 0)"
 echo "=== 4. Building and running native binary (sigil build) ==="
 TMP_BIN="$(mktemp -t sigil_container_test_XXXXXX)"
 $SIGIL build --root . test_runner.sigil main -o "$TMP_BIN"
-"$TMP_BIN"
+NATIVE_STATUS=0
+NATIVE_OUTPUT="$("$TMP_BIN")" || NATIVE_STATUS=$?
 rm -f "$TMP_BIN"
-echo "Native binary tests passed"
+if [ "$NATIVE_STATUS" -ne 0 ]; then
+  echo "Native binary exited with status $NATIVE_STATUS" >&2
+  exit "$NATIVE_STATUS"
+fi
+if [ "$NATIVE_OUTPUT" != "0" ]; then
+  echo "Test failure in native binary: expected 0, got $NATIVE_OUTPUT" >&2
+  exit 1
+fi
+echo "Native binary tests passed (result = 0)"
 
 if [ -x "./tests/test_runtime_e2e.sh" ] && (command -v crun >/dev/null 2>&1 || command -v runc >/dev/null 2>&1); then
   echo "=== 5. Running real OCI runtime integration and negative tests ==="
