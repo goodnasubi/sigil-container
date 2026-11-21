@@ -167,7 +167,7 @@ pub fn build_runtime_command(kind: &RuntimeKind, root_dir: &String, action: &Lif
   let prog = runtime_kind_name(&kind);
   let mut args = List.new();
 
-  if root_dir.len() > 0 {
+  if root_dir.byte_len() > 0 {
     args.push("--root");
     args.push(root_dir.clone());
   }
@@ -265,8 +265,8 @@ fn find_json_string_value(json: &String, key: &String) -> String
 {
   let bytes = json.as_bytes();
   let key_bytes = key.as_bytes();
-  let klen = key_bytes.len();
-  let blen = bytes.len();
+  let klen = key_bytes.byte_len();
+  let blen = bytes.byte_len();
 
   let mut i = 0;
   while i + klen + 4 < blen {
@@ -386,8 +386,8 @@ fn find_json_int_value(json: &String, key: &String) -> Int
 {
   let bytes = json.as_bytes();
   let key_bytes = key.as_bytes();
-  let klen = key_bytes.len();
-  let blen = bytes.len();
+  let klen = key_bytes.byte_len();
+  let blen = bytes.byte_len();
 
   let mut i = 0;
   while i + klen + 4 < blen {
@@ -438,7 +438,7 @@ pub fn parse_oci_state_json(json_str: &String) -> Result<OciStateInfo, Container
   ensures none
   effects none
 {
-  if json_str.len() == 0 {
+  if json_str.byte_len() == 0 {
     return Err(ContainerError.Corrupt("OCI state 出力が空です。"));
   }
 
@@ -448,7 +448,7 @@ pub fn parse_oci_state_json(json_str: &String) -> Result<OciStateInfo, Container
   let bundle = find_json_string_value(&json_str, &"\"bundle\"");
   let rootfs = find_json_string_value(&json_str, &"\"rootfs\"");
 
-  if id.len() == 0 || status.len() == 0 {
+  if id.byte_len() == 0 || status.byte_len() == 0 {
     return Err(ContainerError.Corrupt("OCI state 出力に必要なキー ('id', 'status') が含まれていません。"));
   }
 
@@ -492,7 +492,7 @@ pub fn append_log(buf: &mut LogBuffer, chunk: &Bytes) -> Result<Bool, ContainerE
   ensures none
   effects none
 {
-  let next_bytes = buf.current_bytes + chunk.len();
+  let next_bytes = buf.current_bytes + chunk.byte_len();
   if next_bytes > buf.max_bytes {
     return Err(ContainerError.LimitExceeded("コンテナログ容量上限 (100 MiB) を超過しました。"));
   }

@@ -23,10 +23,10 @@ fn make_repeated_string(len: Int) -> String
 {
   let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";  // 64 bytes
   let mut buf = Bytes.new();
-  while buf.len() + 64 <= len {
+  while buf.byte_len() + 64 <= len {
     buf.extend(&chunk.as_bytes());
   }
-  let rem = len - buf.len();
+  let rem = len - buf.byte_len();
   if rem > 0 {
     let rem_slice = chunk.as_bytes().slice(0, rem).unwrap_or(Bytes.new());
     buf.extend(&rem_slice);

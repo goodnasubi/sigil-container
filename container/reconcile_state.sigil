@@ -140,7 +140,7 @@ pub fn validate_policy(p: &PolicyRecord) -> Result<Bool, ContainerError>
   ensures none
   effects none
 {
-  if p.workload_id.len() == 0 {
+  if p.workload_id.byte_len() == 0 {
     return Err(ContainerError.SpecValidation("ワークロード ID が空です。"));
   }
   if p.restart_kind == "no" {

@@ -673,7 +673,7 @@ fn test_runtime_fault() -> Int
   if op_field_of(&store, &"create", &"status") != "Pending" || op_field_of(&store, &"create", &"attempts") != "1" {
     return 5;
   }
-  if op_field_of(&store, &"create", &"error").len() == 0 {
+  if op_field_of(&store, &"create", &"error").byte_len() == 0 {
     return 6;
   }
   if op_field_of(&store, &"start", &"attempts") != "0" {

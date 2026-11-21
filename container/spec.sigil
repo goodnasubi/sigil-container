@@ -240,7 +240,7 @@ pub fn is_valid_sha256_digest(digest: &String) -> Bool
 {
   let bytes = digest.as_bytes();
   // "sha256:" (7文字) + 64 hex = 71 文字
-  if bytes.len() != 71 {
+  if bytes.byte_len() != 71 {
     return false;
   }
   let prefix = bytes.slice(0, 7).unwrap_or(Bytes.new());
@@ -290,7 +290,7 @@ pub fn normalize_mount_path(path: &String) -> Result<String, ContainerError>
   effects none
 {
   let bytes = path.as_bytes();
-  if bytes.len() == 0 || bytes.get(0).unwrap_or(0) != 47 {
+  if bytes.byte_len() == 0 || bytes.get(0).unwrap_or(0) != 47 {
     return Err(ContainerError.SpecValidation("マウントパスは絶対パスである必要があります。"));
   }
 
@@ -298,9 +298,9 @@ pub fn normalize_mount_path(path: &String) -> Result<String, ContainerError>
   let mut i = 1;
   let mut seg_start = 1;
 
-  while i <= bytes.len() {
+  while i <= bytes.byte_len() {
     let mut is_delim = false;
-    if i == bytes.len() {
+    if i == bytes.byte_len() {
       is_delim = true;
     } else if bytes.get(i).unwrap_or(0) == 47 {
       is_delim = true;
@@ -388,15 +388,15 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   effects none
 {
   let mut total = 0;
-  total = total + spec.image_digest.as_bytes().len();
-  total = total + spec.working_dir.as_bytes().len();
-  total = total + spec.isolation.seccomp_profile.as_bytes().len();
+  total = total + spec.image_digest.as_bytes().byte_len();
+  total = total + spec.working_dir.as_bytes().byte_len();
+  total = total + spec.isolation.seccomp_profile.as_bytes().byte_len();
 
   let mut i = 0;
   while i < spec.args.len() {
     match spec.args.get(i) {
       Some(a) => {
-        total = total + a.as_bytes().len();
+        total = total + a.as_bytes().byte_len();
       }
       None => {}
     }
@@ -407,8 +407,8 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while j < spec.env_vars.len() {
     match spec.env_vars.get(j) {
       Some(e) => {
-        total = total + e.key.as_bytes().len();
-        total = total + e.value.as_bytes().len();
+        total = total + e.key.as_bytes().byte_len();
+        total = total + e.value.as_bytes().byte_len();
       }
       None => {}
     }
@@ -419,9 +419,9 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while k < spec.mounts.len() {
     match spec.mounts.get(k) {
       Some(m) => {
-        total = total + m.source.as_bytes().len();
-        total = total + m.destination.as_bytes().len();
-        total = total + m.mount_type.as_bytes().len();
+        total = total + m.source.as_bytes().byte_len();
+        total = total + m.destination.as_bytes().byte_len();
+        total = total + m.mount_type.as_bytes().byte_len();
       }
       None => {}
     }
@@ -432,7 +432,7 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while c < spec.isolation.allowed_capabilities.len() {
     match spec.isolation.allowed_capabilities.get(c) {
       Some(cap) => {
-        total = total + cap.as_bytes().len();
+        total = total + cap.as_bytes().byte_len();
       }
       None => {}
     }
@@ -443,8 +443,8 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while p < spec.ports.len() {
     match spec.ports.get(p) {
       Some(port) => {
-        total = total + port.protocol.as_bytes().len();
-        total = total + port.host_ip.as_bytes().len();
+        total = total + port.protocol.as_bytes().byte_len();
+        total = total + port.host_ip.as_bytes().byte_len();
       }
       None => {}
     }
@@ -455,8 +455,8 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while eg_i < spec.egress_rules.len() {
     match spec.egress_rules.get(eg_i) {
       Some(eg) => {
-        total = total + eg.destination.as_bytes().len();
-        total = total + eg.protocol.as_bytes().len();
+        total = total + eg.destination.as_bytes().byte_len();
+        total = total + eg.protocol.as_bytes().byte_len();
       }
       None => {}
     }
@@ -467,8 +467,8 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while pc_i < spec.peer_connections.len() {
     match spec.peer_connections.get(pc_i) {
       Some(pc) => {
-        total = total + pc.target_workload.as_bytes().len();
-        total = total + pc.protocol.as_bytes().len();
+        total = total + pc.target_workload.as_bytes().byte_len();
+        total = total + pc.protocol.as_bytes().byte_len();
       }
       None => {}
     }
@@ -479,8 +479,8 @@ pub fn calculate_spec_size(spec: &ContainerSpec) -> Int
   while s < spec.secrets.len() {
     match spec.secrets.get(s) {
       Some(sec) => {
-        total = total + sec.name.as_bytes().len();
-        total = total + sec.mount_path.as_bytes().len();
+        total = total + sec.name.as_bytes().byte_len();
+        total = total + sec.mount_path.as_bytes().byte_len();
       }
       None => {}
     }
@@ -554,15 +554,15 @@ pub fn parse_strict_ipv4(ip_str: &String) -> Option<List<Int>>
   effects none
 {
   let bytes = ip_str.as_bytes();
-  if bytes.len() < 7 || bytes.len() > 15 {
+  if bytes.byte_len() < 7 || bytes.byte_len() > 15 {
     return None;
   }
   let mut octets = List.new();
   let mut seg_start = 0;
   let mut i = 0;
-  while i <= bytes.len() {
+  while i <= bytes.byte_len() {
     let mut is_delim = false;
-    if i == bytes.len() {
+    if i == bytes.byte_len() {
       is_delim = true;
     } else {
       if bytes.get(i).unwrap_or(0) == 46 {
@@ -657,7 +657,7 @@ pub fn validate_network_identifier(id: &String) -> Result<Bool, ContainerError>
   effects none
 {
   let bytes = id.as_bytes();
-  if bytes.len() < 1 || bytes.len() > 8 {
+  if bytes.byte_len() < 1 || bytes.byte_len() > 8 {
     return Err(ContainerError.SpecValidation("識別子の長さは 1〜8 文字である必要があります (Linux IFNAMSIZ 制約および安全のため)。"));
   }
   let first_b = bytes.get(0).unwrap_or(0);
@@ -667,7 +667,7 @@ pub fn validate_network_identifier(id: &String) -> Result<Bool, ContainerError>
     return Err(ContainerError.SpecValidation("識別子の先頭文字は英小文字または数字である必要があります (ハイフンで始まる識別子はコマンド引数注入防止のため禁止)。"));
   }
   let mut i = 0;
-  while i < bytes.len() {
+  while i < bytes.byte_len() {
     let b = bytes.get(i).unwrap_or(0);
     let is_lower = b >= 97 && b <= 122;  // 'a'..'z'
     let is_digit = b >= 48 && b <= 57;  // '0'..'9'
@@ -686,14 +686,14 @@ pub fn validate_destination_cidr_or_ip(dest: &String) -> Result<Bool, ContainerE
   ensures none
   effects none
 {
-  if dest.len() == 0 {
+  if dest.byte_len() == 0 {
     return Err(ContainerError.SpecValidation("外向き通信許可の宛先が空です。"));
   }
   let bytes = dest.as_bytes();
   let mut slash_pos = 0 - 1;
   let mut slash_count = 0;
   let mut i = 0;
-  while i < bytes.len() {
+  while i < bytes.byte_len() {
     if bytes.get(i).unwrap_or(0) == 47 {  // '/'
       slash_pos = i;
       slash_count = slash_count + 1;
@@ -708,11 +708,11 @@ pub fn validate_destination_cidr_or_ip(dest: &String) -> Result<Bool, ContainerE
   let mut prefix_len = 32;
 
   if slash_count == 1 {
-    if slash_pos == 0 || slash_pos == bytes.len() - 1 {
+    if slash_pos == 0 || slash_pos == bytes.byte_len() - 1 {
       return Err(ContainerError.SpecValidation("CIDR の構文が不正です: スラッシュの前後に値が必要です。"));
     }
     let ip_bytes = bytes.slice(0, slash_pos).unwrap_or(Bytes.new());
-    let mask_bytes = bytes.slice(slash_pos + 1, bytes.len()).unwrap_or(Bytes.new());
+    let mask_bytes = bytes.slice(slash_pos + 1, bytes.byte_len()).unwrap_or(Bytes.new());
     match ip_bytes.to_string_utf8() {
       Ok(s) => {
         base_ip_str = s;
@@ -721,15 +721,15 @@ pub fn validate_destination_cidr_or_ip(dest: &String) -> Result<Bool, ContainerE
         return Err(ContainerError.SpecValidation("CIDR IP アドレス部分が UTF-8 として不正です。"));
       }
     }
-    if mask_bytes.len() < 1 || mask_bytes.len() > 2 {
+    if mask_bytes.byte_len() < 1 || mask_bytes.byte_len() > 2 {
       return Err(ContainerError.SpecValidation("CIDR プレフィックス長が不正です (1〜32)。"));
     }
-    if mask_bytes.len() > 1 && mask_bytes.get(0).unwrap_or(0) == 48 {
+    if mask_bytes.byte_len() > 1 && mask_bytes.get(0).unwrap_or(0) == 48 {
       return Err(ContainerError.SpecValidation("CIDR プレフィックス長に先頭ゼロは許可されません。"));
     }
     let mut plen = 0;
     let mut m_idx = 0;
-    while m_idx < mask_bytes.len() {
+    while m_idx < mask_bytes.byte_len() {
       let b = mask_bytes.get(m_idx).unwrap_or(0);
       if b < 48 || b > 57 {
         return Err(ContainerError.SpecValidation("CIDR プレフィックス長に数字以外の文字が含まれています。"));
@@ -996,7 +996,7 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
   }
 
   // 7. Seccomp: 必須 (空は拒否、解決できないプロファイルは拒否)
-  if spec.isolation.seccomp_profile.len() == 0 {
+  if spec.isolation.seccomp_profile.byte_len() == 0 {
     return Err(ContainerError.SpecValidation("seccomp プロファイルの指定が必須です (既定は許可リスト)。"));
   }
   if spec.isolation.seccomp_profile != "default_whitelist" && spec.isolation.seccomp_profile != "default" {
@@ -1076,7 +1076,7 @@ pub fn validate_spec(spec: &ContainerSpec) -> Result<Bool, ContainerError>
   }
 
   // 11. 作業ディレクトリ: 絶対パス必須
-  if spec.working_dir.len() == 0 || spec.working_dir.as_bytes().get(0).unwrap_or(0) != 47 {
+  if spec.working_dir.byte_len() == 0 || spec.working_dir.as_bytes().get(0).unwrap_or(0) != 47 {
     return Err(ContainerError.SpecValidation("working_dir は絶対パスである必要があります。"));
   }
 

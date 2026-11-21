@@ -740,7 +740,7 @@ pub fn match_ip_or_cidr(rule_dest: &String, target_ip: &String) -> Bool
   let mut slash_pos = 0 - 1;
   let mut slash_count = 0;
   let mut i = 0;
-  while i < bytes.len() {
+  while i < bytes.byte_len() {
     if bytes.get(i).unwrap_or(0) == 47 {  // '/'
       slash_pos = i;
       slash_count = slash_count + 1;
@@ -770,15 +770,15 @@ pub fn match_ip_or_cidr(rule_dest: &String, target_ip: &String) -> Bool
   }
 
   // slash_count == 1: 空 prefix (例: 10.0.0.0/) や先頭・末尾スラッシュは拒否
-  if slash_pos == 0 || slash_pos == bytes.len() - 1 {
+  if slash_pos == 0 || slash_pos == bytes.byte_len() - 1 {
     return false;
   }
   let ip_slice = bytes.slice(0, slash_pos).unwrap_or(Bytes.new());
-  let mask_slice = bytes.slice(slash_pos + 1, bytes.len()).unwrap_or(Bytes.new());
-  if mask_slice.len() < 1 || mask_slice.len() > 2 {
+  let mask_slice = bytes.slice(slash_pos + 1, bytes.byte_len()).unwrap_or(Bytes.new());
+  if mask_slice.byte_len() < 1 || mask_slice.byte_len() > 2 {
     return false;
   }
-  if mask_slice.len() > 1 && mask_slice.get(0).unwrap_or(0) == 48 {
+  if mask_slice.byte_len() > 1 && mask_slice.get(0).unwrap_or(0) == 48 {
     return false;
   }
   let mut base_ip_str = "";
@@ -792,7 +792,7 @@ pub fn match_ip_or_cidr(rule_dest: &String, target_ip: &String) -> Bool
   }
   let mut mask_bits = 0;
   let mut m_idx = 0;
-  while m_idx < mask_slice.len() {
+  while m_idx < mask_slice.byte_len() {
     let mb = mask_slice.get(m_idx).unwrap_or(0);
     if mb < 48 || mb > 57 {
       return false;

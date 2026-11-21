@@ -81,7 +81,7 @@ fn bytes_to_hex(b: &Bytes) -> String
 {
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let byte_val = b.get(i).unwrap_or(0);
     out.push(hex_char(byte_val >> 4 & 15));
     out.push(hex_char(byte_val & 15));
@@ -113,11 +113,11 @@ fn starts_with(s: &String, prefix: &String) -> Bool
 {
   let sb = s.as_bytes();
   let pb = prefix.as_bytes();
-  if sb.len() < pb.len() {
+  if sb.byte_len() < pb.byte_len() {
     return false;
   }
   let mut i = 0;
-  while i < pb.len() {
+  while i < pb.byte_len() {
     if sb.get(i).unwrap_or(0) != pb.get(i).unwrap_or(0) {
       return false;
     }
@@ -140,9 +140,9 @@ pub fn compute_archive_checksum(entries: &List<StoreEntry>) -> String
     match entries.get(i) {
       Some(entry) => {
         let key_bytes = entry.key.as_bytes();
-        push_u32_be(&mut combined, key_bytes.len());
+        push_u32_be(&mut combined, key_bytes.byte_len());
         combined.extend(&key_bytes);
-        push_u32_be(&mut combined, entry.row.len());
+        push_u32_be(&mut combined, entry.row.byte_len());
         combined.extend(&entry.row);
       }
       None => {}
@@ -159,7 +159,7 @@ pub fn create_backup(store: &StateStore, backup_id: String, now_ms: Int) -> Resu
   ensures none
   effects none
 {
-  if backup_id.len() == 0 {
+  if backup_id.byte_len() == 0 {
     return Err(ContainerError.SpecValidation("backup_id は空にできません。".clone()));
   }
 
@@ -199,7 +199,7 @@ pub fn verify_backup(archive: &BackupArchive) -> Result<Bool, ContainerError>
   }
 
   // 2. マニフェストサイズ上限検査 (64 KiB)
-  let manifest_size = archive.manifest.backup_id.len() + archive.manifest.checksum_hex.len() + 32;
+  let manifest_size = archive.manifest.backup_id.byte_len() + archive.manifest.checksum_hex.byte_len() + 32;
   if manifest_size > max_backup_manifest_size() {
     return Err(ContainerError.LimitExceeded("バックアップマニフェストのサイズが上限 (64 KiB) を超過しています。".clone()));
   }
@@ -224,11 +224,11 @@ fn key_matches_id(key: &String, prefix_len: Int, id: &String) -> Bool
   ensures none
   effects none
 {
-  if id.len() == 0 {
+  if id.byte_len() == 0 {
     return false;
   }
   let key_bytes = key.as_bytes();
-  let suffix = key_bytes.slice(prefix_len, key_bytes.len()).unwrap_or(Bytes.new());
+  let suffix = key_bytes.slice(prefix_len, key_bytes.byte_len()).unwrap_or(Bytes.new());
   return match suffix.to_string_utf8() {
     Ok(value) => value == id,
     Err(_) => false,
@@ -257,7 +257,7 @@ fn valid_instance_id(id: &String) -> Bool
     return true;
   }
   let bytes = id.as_bytes();
-  let mut split = bytes.len() - 1;
+  let mut split = bytes.byte_len() - 1;
   while split > 0 && bytes.get(split).unwrap_or(0) != 45 {
     split = split - 1;
   }
@@ -383,7 +383,7 @@ pub fn restore_backup(target_store: &mut StateStore, archive: &BackupArchive) ->
   while row_idx < archive.entries.len() {
     match archive.entries.get(row_idx) {
       Some(entry) => {
-        if entry.row.len() > max_row_encoded_size() {
+        if entry.row.byte_len() > max_row_encoded_size() {
           return Err(ContainerError.LimitExceeded("バックアップ行のサイズが上限を超過しています。"));
         }
       }

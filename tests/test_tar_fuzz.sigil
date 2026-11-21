@@ -20,7 +20,7 @@ fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: 
   // 0..100: name
   let mut i = 0;
   while i < 100 {
-    if i < name_bytes.len() {
+    if i < name_bytes.byte_len() {
       bytes.push(name_bytes.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -59,7 +59,7 @@ fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: 
   let size_b = size_octal.as_bytes();
   i = 0;
   while i < 12 {
-    if i < size_b.len() {
+    if i < size_b.byte_len() {
       bytes.push(size_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -91,7 +91,7 @@ fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: 
   // 157..257: linkname
   i = 0;
   while i < 100 {
-    if i < link_bytes.len() {
+    if i < link_bytes.byte_len() {
       bytes.push(link_bytes.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -113,14 +113,14 @@ fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: 
   bytes.push(48);
 
   // 265..345: ゼロ埋め
-  while bytes.len() < 345 {
+  while bytes.byte_len() < 345 {
     bytes.push(0);
   }
 
   // 345..500: prefix (155 bytes)
   i = 0;
   while i < 155 {
-    if i < prefix_bytes.len() {
+    if i < prefix_bytes.byte_len() {
       bytes.push(prefix_bytes.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -129,7 +129,7 @@ fn create_tar_header_raw(name_bytes: &Bytes, size_octal: String, typeflag_byte: 
   }
 
   // 500..512: ゼロ埋め
-  while bytes.len() < 512 {
+  while bytes.byte_len() < 512 {
     bytes.push(0);
   }
 
@@ -148,7 +148,7 @@ fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int
   let name_b = name.as_bytes();
   let mut i = 0;
   while i < 100 {
-    if i < name_b.len() {
+    if i < name_b.byte_len() {
       bytes.push(name_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -187,7 +187,7 @@ fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int
   let size_b = size_octal.as_bytes();
   i = 0;
   while i < 12 {
-    if i < size_b.len() {
+    if i < size_b.byte_len() {
       bytes.push(size_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -217,7 +217,7 @@ fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int
   bytes.push(typeflag_byte);
 
   // 157..257: linkname (ゼロ埋め)
-  while bytes.len() < 257 {
+  while bytes.byte_len() < 257 {
     bytes.push(0);
   }
 
@@ -234,7 +234,7 @@ fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int
   bytes.push(0);  // '\0'
 
   // 265..345: ゼロ埋め
-  while bytes.len() < 345 {
+  while bytes.byte_len() < 345 {
     bytes.push(0);
   }
 
@@ -242,7 +242,7 @@ fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int
   let atime_b = atime_str.as_bytes();
   i = 0;
   while i < 12 {
-    if i < atime_b.len() {
+    if i < atime_b.byte_len() {
       bytes.push(atime_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -251,7 +251,7 @@ fn create_oldgnu_tar_header(name: String, size_octal: String, typeflag_byte: Int
   }
 
   // 357..512: ゼロ埋め
-  while bytes.len() < 512 {
+  while bytes.byte_len() < 512 {
     bytes.push(0);
   }
 
@@ -270,7 +270,7 @@ fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: In
   let name_b = name.as_bytes();
   let mut i = 0;
   while i < 100 {
-    if i < name_b.len() {
+    if i < name_b.byte_len() {
       bytes.push(name_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -309,7 +309,7 @@ fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: In
   let size_b = size_octal.as_bytes();
   i = 0;
   while i < 12 {
-    if i < size_b.len() {
+    if i < size_b.byte_len() {
       bytes.push(size_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -342,7 +342,7 @@ fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: In
   let link_b = linkname.as_bytes();
   i = 0;
   while i < 100 {
-    if i < link_b.len() {
+    if i < link_b.byte_len() {
       bytes.push(link_b.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -351,7 +351,7 @@ fn create_tar_header_fixture(name: String, size_octal: String, typeflag_byte: In
   }
 
   // 257..512: 残りをゼロ埋め
-  while bytes.len() < 512 {
+  while bytes.byte_len() < 512 {
     bytes.push(0);
   }
 
@@ -607,11 +607,11 @@ pub fn run_tar_fuzz_tests() -> Bool
   let mut pax_payload = Bytes.with_capacity(512);
   let pax_content = "24 path=../escape\n".as_bytes();
   let mut pi = 0;
-  while pi < pax_content.len() {
+  while pi < pax_content.byte_len() {
     pax_payload.push(pax_content.get(pi).unwrap_or(0));
     pi = pi + 1;
   }
-  while pax_payload.len() < 512 {
+  while pax_payload.byte_len() < 512 {
     pax_payload.push(0);
   }
   let safe_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
@@ -658,7 +658,7 @@ pub fn run_tar_fuzz_tests() -> Bool
   let mut bad_prefix_tar = Bytes.new();
   bad_prefix_tar.extend(&bad_prefix_h);
   let mut dummy_payload = Bytes.with_capacity(512);
-  while dummy_payload.len() < 512 {
+  while dummy_payload.byte_len() < 512 {
     dummy_payload.push(0);
   }
   bad_prefix_tar.extend(&dummy_payload);
@@ -999,7 +999,7 @@ pub fn run_tar_fuzz_tests() -> Bool
   malformed_octal.push(0);
   malformed_octal.extend(&"0000001000".as_bytes());
   malformed_octal.push(0);
-  match parse_octal(&malformed_octal, 0, malformed_octal.len()) {
+  match parse_octal(&malformed_octal, 0, malformed_octal.byte_len()) {
     Ok(_) => {
       return false;
     }
@@ -1014,7 +1014,7 @@ pub fn run_tar_fuzz_tests() -> Bool
   let mut normal_octal = Bytes.new();
   normal_octal.extend(&"0000001000".as_bytes());
   normal_octal.push(0);
-  match parse_octal(&normal_octal, 0, normal_octal.len()) {
+  match parse_octal(&normal_octal, 0, normal_octal.byte_len()) {
     Ok(val) => {
       if val != 512 {
         return false;
@@ -1032,7 +1032,7 @@ pub fn run_tar_fuzz_tests() -> Bool
     all_null_octal.push(0);
     ano_i = ano_i + 1;
   }
-  match parse_octal(&all_null_octal, 0, all_null_octal.len()) {
+  match parse_octal(&all_null_octal, 0, all_null_octal.byte_len()) {
     Ok(val) => {
       if val != 0 {
         return false;
@@ -1047,7 +1047,7 @@ pub fn run_tar_fuzz_tests() -> Bool
   let mut invalid_digit_octal = Bytes.new();
   invalid_digit_octal.extend(&"0000008".as_bytes());
   invalid_digit_octal.push(0);
-  match parse_octal(&invalid_digit_octal, 0, invalid_digit_octal.len()) {
+  match parse_octal(&invalid_digit_octal, 0, invalid_digit_octal.byte_len()) {
     Ok(_) => {
       return false;
     }
@@ -1063,7 +1063,7 @@ pub fn run_tar_fuzz_tests() -> Bool
   malformed_size_h.set(124, 0);
   let ms_digits = "0000001000".as_bytes();
   let mut msd_i = 0;
-  while msd_i < ms_digits.len() {
+  while msd_i < ms_digits.byte_len() {
     malformed_size_h.set(125 + msd_i, ms_digits.get(msd_i).unwrap_or(0));
     msd_i = msd_i + 1;
   }
@@ -1082,7 +1082,7 @@ pub fn run_tar_fuzz_tests() -> Bool
   // (5) 単体ヘッダ検査: 通常の 0000001000 + NUL のヘッダは size 512 として受理されること
   let mut normal_size_h = create_tar_header_fixture("safe", "00000000000 ", 48, "");
   let mut nsd_i = 0;
-  while nsd_i < ms_digits.len() {
+  while nsd_i < ms_digits.byte_len() {
     normal_size_h.set(124 + nsd_i, ms_digits.get(nsd_i).unwrap_or(0));
     nsd_i = nsd_i + 1;
   }

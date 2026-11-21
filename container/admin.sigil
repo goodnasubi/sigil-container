@@ -201,7 +201,7 @@ fn extract_bearer_token(auth_header: &String) -> Result<Bytes, String>
   effects none
 {
   let b = auth_header.as_bytes();
-  if b.len() < 7 {
+  if b.byte_len() < 7 {
     return Err("unauthorized".clone());
   }
 
@@ -219,8 +219,8 @@ fn extract_bearer_token(auth_header: &String) -> Result<Bytes, String>
     i = i + 1;
   }
 
-  let token_bytes = b.slice(7, b.len()).unwrap_or(Bytes.new());
-  if token_bytes.len() == 0 || token_bytes.len() > max_admin_token_size() {
+  let token_bytes = b.slice(7, b.byte_len()).unwrap_or(Bytes.new());
+  if token_bytes.byte_len() == 0 || token_bytes.byte_len() > max_admin_token_size() {
     return Err("unauthorized".clone());
   }
 
@@ -324,16 +324,16 @@ fn parse_action_and_workload(method: &String, path: &String) -> Result<(String, 
 
   // 接頭辞 /api/v1/workloads/ の検査
   let prefix = "/api/v1/workloads/";
-  if path.len() <= prefix.len() {
+  if path.byte_len() <= prefix.byte_len() {
     return Err("invalid path".clone());
   }
-  let path_prefix = path.as_bytes().slice(0, prefix.len()).unwrap_or(Bytes.new());
+  let path_prefix = path.as_bytes().slice(0, prefix.byte_len()).unwrap_or(Bytes.new());
   if path_prefix != prefix.as_bytes() {
     return Err("invalid path".clone());
   }
 
   // 残りの部分: {id} または {id}/start, {id}/stop, {id}/status, {id}/logs
-  let rest_bytes = path.as_bytes().slice(prefix.len(), path.len()).unwrap_or(Bytes.new());
+  let rest_bytes = path.as_bytes().slice(prefix.byte_len(), path.byte_len()).unwrap_or(Bytes.new());
   let mut rest_str = "".clone();
   match rest_bytes.to_string_utf8() {
     Ok(s) => {
@@ -347,10 +347,10 @@ fn parse_action_and_workload(method: &String, path: &String) -> Result<(String, 
   // スラッシュの位置を検索 (最初のスラッシュを採用して id を確定)
   let mut slash_pos = -1;
   let mut i = 0;
-  while i < rest_bytes.len() {
+  while i < rest_bytes.byte_len() {
     if rest_bytes.get(i).unwrap_or(0) == 47 {
       slash_pos = i;
-      i = rest_bytes.len();
+      i = rest_bytes.byte_len();
     } else {
       i = i + 1;
     }
@@ -391,7 +391,7 @@ fn parse_action_and_workload(method: &String, path: &String) -> Result<(String, 
     }
   }
 
-  let sub_bytes = rest_bytes.slice(slash_pos + 1, rest_bytes.len()).unwrap_or(Bytes.new());
+  let sub_bytes = rest_bytes.slice(slash_pos + 1, rest_bytes.byte_len()).unwrap_or(Bytes.new());
   let mut sub_str = "".clone();
   match sub_bytes.to_string_utf8() {
     Ok(s) => {
@@ -430,7 +430,7 @@ pub fn handle_admin_request(service: &mut AdminService, req: &AdminRequest) -> A
   }
 
   // 2. リクエストボディサイズ上限の検査 (64 KiB -> 413)
-  if req.body.len() > max_spec_size() {
+  if req.body.byte_len() > max_spec_size() {
     return make_limit_exceeded_response("リクエスト仕様サイズが上限 (64 KiB) を超過しています。".clone());
   }
 
@@ -531,7 +531,7 @@ pub fn handle_admin_request(service: &mut AdminService, req: &AdminRequest) -> A
       return make_not_found_response();
     }
     // ログ上限検査 (100 MiB -> 507)
-    if log_content.as_bytes().len() > max_log_size() {
+    if log_content.as_bytes().byte_len() > max_log_size() {
       return make_insufficient_storage_response("ログデータ量が上限 (100 MiB) を超過しています。".clone());
     }
     return new_admin_response(200, resp_headers, log_content);

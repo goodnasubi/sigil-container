@@ -84,18 +84,18 @@ fn encode_base64url(data: &Bytes) -> String
   let table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".as_bytes();
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < data.len() {
+  while i < data.byte_len() {
     let b0 = data.get(i).unwrap_or(0);
     let mut b1 = 0;
-    if i + 1 < data.len() {
+    if i + 1 < data.byte_len() {
       b1 = data.get(i + 1).unwrap_or(0);
     }
     let mut b2 = 0;
-    if i + 2 < data.len() {
+    if i + 2 < data.byte_len() {
       b2 = data.get(i + 2).unwrap_or(0);
     }
 
-    let rem = data.len() - i;
+    let rem = data.byte_len() - i;
     if rem >= 3 {
       out.push(table.get(b0 >> 2 & 63).unwrap_or(0));
       out.push(table.get((b0 & 3) << 4 | b1 >> 4 & 15).unwrap_or(0));
@@ -128,9 +128,9 @@ fn create_test_bearer_token(key: &Secret, audience: &String, subject: &String, i
   let mut payload_bytes = Bytes.new();
   push_u64_be(&mut payload_bytes, iat);
   push_u64_be(&mut payload_bytes, exp);
-  push_u16_be(&mut payload_bytes, audience.len());
+  push_u16_be(&mut payload_bytes, audience.byte_len());
   payload_bytes.extend(&audience.as_bytes());
-  push_u16_be(&mut payload_bytes, subject.len());
+  push_u16_be(&mut payload_bytes, subject.byte_len());
   payload_bytes.extend(&subject.as_bytes());
 
   let payload_b64 = encode_base64url(&payload_bytes);
