@@ -262,6 +262,17 @@ fn make_bad_request_response(msg: String) -> AdminResponse
   return new_admin_response(400, headers, msg);
 }
 
+fn make_conflict_response(msg: String) -> AdminResponse
+  intent "既存ワークロードとの競合を 409 で返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(409, headers, msg);
+}
+
 fn make_limit_exceeded_response(msg: String) -> AdminResponse
   intent "リクエスト仕様サイズ上限超過時の明示的 413 応答を生成する"
   requires none
@@ -547,12 +558,6 @@ pub fn handle_admin_request(service: &mut AdminService, req: &AdminRequest) -> A
       }
     }
 
-    // ワークロード数上限検査 (1,024)
-    if service.workloads.len() >= max_workload_count() {
-      service.active_requests = service.active_requests - 1;
-      return make_limit_exceeded_response("ワークロード数が上限 (1024) を超過しています。".clone());
-    }
-
     // 重複登録検査
     let mut exists = false;
     let mut i = 0;
@@ -569,7 +574,13 @@ pub fn handle_admin_request(service: &mut AdminService, req: &AdminRequest) -> A
     }
     if exists {
       service.active_requests = service.active_requests - 1;
-      return make_bad_request_response("同一識別子のワークロードが既に存在します。".clone());
+      return make_conflict_response("同一識別子のワークロードが既に存在します。".clone());
+    }
+
+    // ワークロード数上限検査 (1,024)
+    if service.workloads.len() >= max_workload_count() {
+      service.active_requests = service.active_requests - 1;
+      return make_limit_exceeded_response("ワークロード数が上限 (1024) を超過しています。".clone());
     }
 
     let new_wl = new_workload_record(body_str.clone(), "sha256:dummy".clone(), 1, 1);

@@ -4,6 +4,8 @@ module container.backup
 
 use container.error.ContainerError;
 use container.limits.max_backup_manifest_size;
+use container.limits.max_replicas;
+use container.limits.max_restart_count;
 use container.limits.max_workload_count;
 use container.reconcile_loop.ModelRuntime;
 use container.reconcile_loop.StateStore;
@@ -14,7 +16,12 @@ use container.reconcile_loop.reconcile_tick;
 use container.reconcile_state.decode_operation_record;
 use container.reconcile_state.decode_policy_record;
 use container.reconcile_state.decode_restart_state_record;
+use container.reconciler.instance_id_for;
+use container.reconciler.make_op_id;
+use container.spec.is_valid_sha256_digest;
+use container.spec.validate_network_identifier;
 use container.state.decode_workload_record;
+use db.limits.max_row_encoded_size;
 
 // ADR 0053 決定 6 (P5-5): バックアップと復元 (ADR 0045 / P4-1 準拠)
 // - 管理の状態を整合した時点で取り出し、復元する。
@@ -207,24 +214,184 @@ pub fn verify_backup(archive: &BackupArchive) -> Result<Bool, ContainerError>
   return Ok(true);
 }
 
+fn key_matches_id(key: &String, prefix_len: Int, id: &String) -> Bool
+  intent "キーの接頭辞に続く識別子が行内の空でない識別子と一致するか確認する"
+  requires none
+  ensures none
+  effects none
+{
+  if id.len() == 0 {
+    return false;
+  }
+  let key_bytes = key.as_bytes();
+  let suffix = key_bytes.slice(prefix_len, key_bytes.len()).unwrap_or(Bytes.new());
+  return match suffix.to_string_utf8() {
+    Ok(value) => value == id,
+    Err(_) => false,
+  };
+}
+
+fn valid_workload_id(id: &String) -> Bool
+  intent "宣言と同じ識別子形式を確認する"
+  requires none
+  ensures none
+  effects none
+{
+  return match validate_network_identifier(&id) {
+    Ok(_) => true,
+    Err(_) => false,
+  };
+}
+
+fn valid_instance_id(id: &String) -> Bool
+  intent "観測用の識別子または調整ループが生成するインスタンス識別子を受理する"
+  requires none
+  ensures none
+  effects none
+{
+  if valid_workload_id(&id) {
+    return true;
+  }
+  let bytes = id.as_bytes();
+  let mut split = bytes.len() - 1;
+  while split > 0 && bytes.get(split).unwrap_or(0) != 45 {
+    split = split - 1;
+  }
+  if split < 1 || split > 8 {
+    return false;
+  }
+  let prefix = bytes.slice(0, split).unwrap_or(Bytes.new());
+  let workload_id = match prefix.to_string_utf8() {
+    Ok(value) => value,
+    Err(_) => "",
+  };
+  if !valid_workload_id(&workload_id) {
+    return false;
+  }
+  let mut index = 0;
+  while index < max_replicas() {
+    if instance_id_for(&workload_id, index) == id {
+      return true;
+    }
+    index = index + 1;
+  }
+  return false;
+}
+
+fn valid_operation_id(id: &String, instance_id: &String, kind: &String) -> Bool
+  intent "操作 ID が行内のインスタンス・種別と許容世代から生成される値か確認する"
+  requires none
+  ensures none
+  effects none
+{
+  if !valid_instance_id(&instance_id) {
+    return false;
+  }
+  let mut epoch = 0;
+  while epoch <= max_restart_count() + 1 {
+    if make_op_id(&instance_id, &kind, epoch) == id {
+      return true;
+    }
+    epoch = epoch + 1;
+  }
+  return false;
+}
+
+fn validate_restore_entry(entry: &StoreEntry) -> Result<Bool, ContainerError>
+  intent "保存行を復号し、識別子と値の整合性を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if starts_with(&entry.key, &"workload:") {
+    match decode_workload_record(&entry.row) {
+      Ok(w) => {
+        if !key_matches_id(&entry.key, 9, &w.workload_id) || !valid_workload_id(&w.workload_id) {
+          return Err(ContainerError.Corrupt("ワークロード ID が不正またはキーと不一致です。"));
+        }
+        if w.desired_replicas > max_replicas() {
+          return Err(ContainerError.LimitExceeded("レプリカ数が上限を超過しています。"));
+        }
+        if w.desired_replicas < 0 || w.version < 0 || !is_valid_sha256_digest(&w.image_digest) {
+          return Err(ContainerError.Corrupt("ワークロード行に不正な値があります。"));
+        }
+        return Ok(true);
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  if starts_with(&entry.key, &"policy:") {
+    match decode_policy_record(&entry.row) {
+      Ok(p) => {
+        if !key_matches_id(&entry.key, 7, &p.workload_id) || !valid_workload_id(&p.workload_id) {
+          return Err(ContainerError.Corrupt("ポリシーのワークロード ID が不正またはキーと不一致です。"));
+        }
+        return Ok(true);
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  if starts_with(&entry.key, &"restart:") {
+    match decode_restart_state_record(&entry.row) {
+      Ok(r) => {
+        if !key_matches_id(&entry.key, 8, &r.instance_id) || !valid_instance_id(&r.instance_id) || r.next_restart_at_ms < 0 {
+          return Err(ContainerError.Corrupt("再起動行のインスタンス ID または再起動予定時刻が不正です。"));
+        }
+        return Ok(true);
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  if starts_with(&entry.key, &"op:") {
+    match decode_operation_record(&entry.row) {
+      Ok(o) => {
+        if !key_matches_id(&entry.key, 3, &o.op_id) || !valid_operation_id(&o.op_id, &o.instance_id, &o.kind) {
+          return Err(ContainerError.Corrupt("操作 ID が不正またはキー・行内の操作と不一致です。"));
+        }
+        return Ok(true);
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  return Err(ContainerError.Corrupt("未知または不正なキー形式のエントリが含まれています。"));
+}
+
 pub fn restore_backup(target_store: &mut StateStore, archive: &BackupArchive) -> Result<Int, ContainerError>
   intent "検証済みバックアップアーカイブから各エントリを復号・検証し、すべて健全な場合のみ原子的に復元する"
   requires none
   ensures none
   effects none
 {
-  // 1. 復元前に完全性を厳格検証 (失敗時はストアに一切触れない)
+  // チェックサム計算に先立って件数と行サイズを制限する。
+  let max_entries = max_workload_count() * 4;
+  if archive.entries.len() > max_entries {
+    return Err(ContainerError.LimitExceeded("バックアップエントリ件数が上限を超過しています。".clone()));
+  }
+  let mut row_idx = 0;
+  while row_idx < archive.entries.len() {
+    match archive.entries.get(row_idx) {
+      Some(entry) => {
+        if entry.row.len() > max_row_encoded_size() {
+          return Err(ContainerError.LimitExceeded("バックアップ行のサイズが上限を超過しています。"));
+        }
+      }
+      None => {}
+    }
+    row_idx = row_idx + 1;
+  }
   match verify_backup(&archive) {
     Ok(_) => {}
     Err(e) => {
       return Err(e);
     }
-  }
-
-  // 2. 件数上限検査 (1ワークロードあたり最大4エントリ想定)
-  let max_entries = max_workload_count() * 4;
-  if archive.entries.len() > max_entries {
-    return Err(ContainerError.LimitExceeded("バックアップエントリ件数が上限を超過しています。".clone()));
   }
 
   // 3. 重複キーの検査
@@ -255,68 +422,11 @@ pub fn restore_backup(target_store: &mut StateStore, archive: &BackupArchive) ->
   while k < archive.entries.len() {
     match archive.entries.get(k) {
       Some(entry) => {
-        if starts_with(&entry.key, &"workload:".clone()) {
-          let id_bytes = entry.key.as_bytes().slice(9, entry.key.len()).unwrap_or(Bytes.new());
-          if id_bytes.len() == 0 {
-            return Err(ContainerError.Corrupt("workload キーの識別子が空です。".clone()));
+        match validate_restore_entry(&entry) {
+          Ok(_) => {}
+          Err(e) => {
+            return Err(e);
           }
-          match decode_workload_record(&entry.row) {
-            Ok(w) => {
-              if w.workload_id.len() == 0 {
-                return Err(ContainerError.Corrupt("workload_id が空です。".clone()));
-              }
-            }
-            Err(err) => {
-              return Err(err);
-            }
-          }
-        } else if starts_with(&entry.key, &"policy:".clone()) {
-          let id_bytes = entry.key.as_bytes().slice(7, entry.key.len()).unwrap_or(Bytes.new());
-          if id_bytes.len() == 0 {
-            return Err(ContainerError.Corrupt("policy キーの識別子が空です。".clone()));
-          }
-          match decode_policy_record(&entry.row) {
-            Ok(p) => {
-              if p.workload_id.len() == 0 {
-                return Err(ContainerError.Corrupt("policy の workload_id が空です。".clone()));
-              }
-            }
-            Err(err) => {
-              return Err(err);
-            }
-          }
-        } else if starts_with(&entry.key, &"restart:".clone()) {
-          let id_bytes = entry.key.as_bytes().slice(8, entry.key.len()).unwrap_or(Bytes.new());
-          if id_bytes.len() == 0 {
-            return Err(ContainerError.Corrupt("restart キーの識別子が空です。".clone()));
-          }
-          match decode_restart_state_record(&entry.row) {
-            Ok(r) => {
-              if r.instance_id.len() == 0 {
-                return Err(ContainerError.Corrupt("restart の instance_id が空です。".clone()));
-              }
-            }
-            Err(err) => {
-              return Err(err);
-            }
-          }
-        } else if starts_with(&entry.key, &"op:".clone()) {
-          let id_bytes = entry.key.as_bytes().slice(3, entry.key.len()).unwrap_or(Bytes.new());
-          if id_bytes.len() == 0 {
-            return Err(ContainerError.Corrupt("op キーの識別子が空です。".clone()));
-          }
-          match decode_operation_record(&entry.row) {
-            Ok(o) => {
-              if o.op_id.len() == 0 {
-                return Err(ContainerError.Corrupt("op_id が空です。".clone()));
-              }
-            }
-            Err(err) => {
-              return Err(err);
-            }
-          }
-        } else {
-          return Err(ContainerError.Corrupt("未知または不正なキー形式のエントリが含まれています。".clone()));
         }
       }
       None => {}

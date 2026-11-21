@@ -2,6 +2,7 @@ module tests.test_admin_api
   targets server
   trust none
 
+use container.admin.AdminResponse;
 use container.admin.grant_permission;
 use container.admin.handle_admin_request;
 use container.admin.new_acl_rule;
@@ -149,6 +150,41 @@ fn create_test_bearer_token(key: &Secret, audience: &String, subject: &String, i
 // 1. ADR 0037 HMAC ベアラー認証否定試験 (トークン長超過を含む)
 // ---------------------------------------------------------------------------
 
+fn is_unauthorized_response(response: &AdminResponse) -> Bool
+  intent "固定 401 応答の本文と認証・キャッシュ用ヘッダを確認する"
+  requires none
+  ensures none
+  effects none
+{
+  if response.status_code != 401 || response.body != "unauthorized" {
+    return false;
+  }
+  let mut auth_count = 0;
+  let mut cache_count = 0;
+  let mut i = 0;
+  while i < response.headers.len() {
+    match response.headers.get(i) {
+      Some(header) => {
+        if header.name == "WWW-Authenticate" {
+          if header.value != "Bearer" {
+            return false;
+          }
+          auth_count = auth_count + 1;
+        }
+        if header.name == "Cache-Control" {
+          if header.value != "no-store" {
+            return false;
+          }
+          cache_count = cache_count + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return auth_count == 1 && cache_count == 1;
+}
+
 fn test_auth_negative_cases() -> Bool
   intent "未認証・不正トークン・期限切れ・未来発行・audience 不一致・偽造署名・トークン長超過がすべて固定 401 で拒否されることを検証する"
   requires none
@@ -164,14 +200,14 @@ fn test_auth_negative_cases() -> Bool
   // (1) 認証ヘッダなし
   let req_no_auth = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), "".clone(), Bytes.new(), now);
   let resp1 = handle_admin_request(&mut service, &req_no_auth);
-  if resp1.status_code != 401 || resp1.body != "unauthorized" {
+  if !is_unauthorized_response(&resp1) {
     return false;
   }
 
   // (2) 不正なスキーム ("Basic xxx")
   let req_basic = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), "Basic dXNlcjpwYXNz".clone(), Bytes.new(), now);
   let resp2 = handle_admin_request(&mut service, &req_basic);
-  if resp2.status_code != 401 || resp2.body != "unauthorized" {
+  if !is_unauthorized_response(&resp2) {
     return false;
   }
 
@@ -180,7 +216,7 @@ fn test_auth_negative_cases() -> Bool
   let auth_expired = concat_str(&"Bearer ".clone(), &expired_token);
   let req_expired = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_expired, Bytes.new(), now);
   let resp3 = handle_admin_request(&mut service, &req_expired);
-  if resp3.status_code != 401 || resp3.body != "unauthorized" {
+  if !is_unauthorized_response(&resp3) {
     return false;
   }
 
@@ -189,7 +225,7 @@ fn test_auth_negative_cases() -> Bool
   let auth_future = concat_str(&"Bearer ".clone(), &future_token);
   let req_future = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_future, Bytes.new(), now);
   let resp4 = handle_admin_request(&mut service, &req_future);
-  if resp4.status_code != 401 || resp4.body != "unauthorized" {
+  if !is_unauthorized_response(&resp4) {
     return false;
   }
 
@@ -198,7 +234,7 @@ fn test_auth_negative_cases() -> Bool
   let auth_wrong_aud = concat_str(&"Bearer ".clone(), &wrong_aud_token);
   let req_wrong_aud = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_wrong_aud, Bytes.new(), now);
   let resp5 = handle_admin_request(&mut service, &req_wrong_aud);
-  if resp5.status_code != 401 || resp5.body != "unauthorized" {
+  if !is_unauthorized_response(&resp5) {
     return false;
   }
 
@@ -214,7 +250,7 @@ fn test_auth_negative_cases() -> Bool
   let auth_forged = concat_str(&"Bearer ".clone(), &forged_token);
   let req_forged = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_forged, Bytes.new(), now);
   let resp6 = handle_admin_request(&mut service, &req_forged);
-  if resp6.status_code != 401 || resp6.body != "unauthorized" {
+  if !is_unauthorized_response(&resp6) {
     return false;
   }
 
@@ -233,7 +269,7 @@ fn test_auth_negative_cases() -> Bool
   let auth_huge = concat_str(&"Bearer ".clone(), &huge_token_str);
   let req_huge = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_huge, Bytes.new(), now);
   let resp7 = handle_admin_request(&mut service, &req_huge);
-  if resp7.status_code != 401 || resp7.body != "unauthorized" {
+  if !is_unauthorized_response(&resp7) {
     return false;
   }
 
@@ -389,9 +425,9 @@ fn test_admin_operations_crud() -> Bool
     return false;
   }
 
-  // (C) 同名ワークロードの重複作成拒否 (400)
+  // (C) 同名ワークロードの重複作成拒否 (409)
   let dup_create_resp = handle_admin_request(&mut service, &create_req);
-  if dup_create_resp.status_code != 400 {
+  if dup_create_resp.status_code != 409 || service.workloads.len() != 1 {
     return false;
   }
 

@@ -454,6 +454,57 @@ fn test_commit_identity_and_parent_checks() -> Bool
   return true;
 }
 
+fn test_egress_rule_order() -> Bool
+  intent "外向き規則の順序と内容を宣言差分で比較する"
+  requires none
+  ensures none
+  effects none
+{
+  let first = new_egress_rule("192.168.1.0/24", 443, "tcp");
+  let second = new_egress_rule("192.168.2.0/24", 443, "tcp");
+  let mut rules = List.new();
+  rules.push(first.clone());
+  rules.push(second.clone());
+  let mut swapped = List.new();
+  swapped.push(second.clone());
+  swapped.push(first.clone());
+  let mut changed = List.new();
+  changed.push(second);
+  changed.push(new_egress_rule("192.168.1.0/24", 8443, "tcp"));
+
+  let mut base_spec = dummy_spec(&d1_digest());
+  base_spec.network_enabled = true;
+  base_spec.egress_rules = rules.clone();
+  let mut swapped_spec = base_spec.clone();
+  swapped_spec.egress_rules = swapped.clone();
+  let mut changed_spec = base_spec.clone();
+  changed_spec.egress_rules = changed.clone();
+
+  let mut before = List.new();
+  before.push(new_workload_declaration("wl-1", d1_digest(), 1, base_spec, new_network_spec(true, List.new(), rules, List.new()), disabled_health_check()));
+  if compute_declaration_diff(&before, &before).modified.len() != 0 {
+    return false;
+  }
+
+  let mut reordered = List.new();
+  reordered.push(new_workload_declaration("wl-1", d1_digest(), 1, swapped_spec, new_network_spec(true, List.new(), swapped, List.new()), disabled_health_check()));
+  let mut edited = List.new();
+  edited.push(new_workload_declaration("wl-1", d1_digest(), 1, changed_spec, new_network_spec(true, List.new(), changed, List.new()), disabled_health_check()));
+
+  let reorder_diff = compute_declaration_diff(&before, &reordered);
+  let content_diff = compute_declaration_diff(&reordered, &edited);
+  if reorder_diff.modified.len() != 1 || content_diff.modified.len() != 1 {
+    return false;
+  }
+  return match reorder_diff.modified.get(0) {
+    Some(order) => match content_diff.modified.get(0) {
+      Some(content) => order.spec_changed && order.network_changed && content.spec_changed && content.network_changed,
+      None => false,
+    },
+    None => false,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // エントリポイント
 // ---------------------------------------------------------------------------
@@ -465,6 +516,9 @@ pub fn run_declaration_versioning_tests() -> Bool
   effects none
 {
   if !test_diff_computation() {
+    return false;
+  }
+  if !test_egress_rule_order() {
     return false;
   }
   if !test_validation_rejects_unsafe_spec() {

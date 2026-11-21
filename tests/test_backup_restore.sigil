@@ -10,15 +10,21 @@ use container.backup.new_backup_manifest;
 use container.backup.restore_backup;
 use container.backup.verify_backup;
 use container.error.ContainerError;
+use container.limits.max_replicas;
 use container.reconcile_loop.new_model_runtime;
 use container.reconcile_loop.new_state_store;
 use container.reconcile_loop.new_store_entry;
 use container.reconcile_loop.put_workload;
 use container.reconcile_state.disabled_health_check;
+use container.reconcile_state.encode_operation_record;
 use container.reconcile_state.encode_policy_record;
+use container.reconcile_state.encode_restart_state_record;
+use container.reconcile_state.new_operation_record;
 use container.reconcile_state.new_policy_record;
+use container.reconcile_state.new_restart_state_record;
 use container.state.encode_workload_record;
 use container.state.new_workload_record;
+use db.limits.max_row_encoded_size;
 
 // ---------------------------------------------------------------------------
 // 1. 整合バックアップの作成とチェックサム完全性テスト
@@ -198,7 +204,7 @@ fn test_atomic_restore() -> Bool
 {
   // 1. ターゲットストアに既存の正常データを用意
   let mut target_store = new_state_store();
-  let existing_wl = new_workload_record("existing-app".clone(), "sha256:exist".clone(), 1, 1);
+  let existing_wl = new_workload_record("existing-app".clone(), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".clone(), 1, 1);
   let mut existing_bytes = Bytes.new();
   match encode_workload_record(&existing_wl) {
     Ok(b) => {
@@ -241,7 +247,7 @@ fn test_atomic_restore() -> Bool
 
   // 3. 正常なアーカイブを復元
   let mut source_store = new_state_store();
-  let new_wl = new_workload_record("new-app".clone(), "sha256:new123".clone(), 2, 1);
+  let new_wl = new_workload_record("new-app".clone(), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".clone(), 2, 1);
   let mut new_bytes = Bytes.new();
   match encode_workload_record(&new_wl) {
     Ok(b) => {
@@ -297,12 +303,12 @@ fn test_convergence_after_restore() -> Bool
   ensures none
   effects none
 {
-  // 1. バックアップ対象の状態ストア (workload: app-worker, replicas: 1, policy: always)
+  // 1. バックアップ対象の状態ストア (workload: worker, replicas: 1, policy: always)
   let mut origin_store = new_state_store();
 
   let valid_digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".clone();
-  let wl = new_workload_record("app-worker".clone(), valid_digest, 1, 1);
-  let pol = new_policy_record("app-worker".clone(), "always".clone(), 3, 1000, disabled_health_check());
+  let wl = new_workload_record("worker".clone(), valid_digest, 1, 1);
+  let pol = new_policy_record("worker".clone(), "always".clone(), 3, 1000, disabled_health_check());
 
   match put_workload(&mut origin_store, &wl, &pol) {
     Ok(_) => {}
@@ -346,7 +352,7 @@ fn test_convergence_after_restore() -> Bool
       }
       match runtime.instances.get(0) {
         Some(inst) => {
-          if inst.workload_id != "app-worker" || inst.status != "running" {
+          if inst.workload_id != "worker" || inst.status != "running" {
             return false;
           }
         }
@@ -376,6 +382,130 @@ fn test_convergence_after_restore() -> Bool
   return true;
 }
 
+fn rejects_restore_row(key: String, encoded: Result<Bytes, ContainerError>, expect_limit: Bool) -> Bool
+  intent "正しいチェックサムを持つ不正行の拒否と復元先の不変性を確認する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = Bytes.new();
+  match encoded {
+    Ok(b) => {
+      row = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let mut entries = List.new();
+  entries.push(new_store_entry(key, row));
+  let checksum = compute_archive_checksum(&entries);
+  let archive = new_backup_archive(new_backup_manifest("invalid", 0, 1, 1, checksum), entries);
+
+  let mut target = new_state_store();
+  target.entries.push(new_store_entry("workload:existing", "existing row".as_bytes()));
+  let before = compute_archive_checksum(&target.entries);
+  let rejected = match restore_backup(&mut target, &archive) {
+    Err(ContainerError.Corrupt(_)) => !expect_limit,
+    Err(ContainerError.LimitExceeded(_)) => expect_limit,
+    _ => false,
+  };
+  return rejected && compute_archive_checksum(&target.entries) == before;
+}
+
+fn test_restore_row_validation() -> Bool
+  intent "4 種類のキーと行内 ID の照合、および行の値とサイズ上限を確認する"
+  requires none
+  ensures none
+  effects none
+{
+  let digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  let valid = new_workload_record("app-1234", digest.clone(), max_replicas(), 1);
+  let policy = new_policy_record("app-1234", "no", 0, 0, disabled_health_check());
+  let restart = new_restart_state_record("app-1234-63", 1, 1000, 1, "Backoff", "");
+  let op = new_operation_record("app-1234-63:create:1", "app-1234-63", "create", "Pending", 0, "");
+  if !rejects_restore_row("workload:other", encode_workload_record(&valid), false) || !rejects_restore_row("policy:other", encode_policy_record(&policy), false) || !rejects_restore_row("restart:other", encode_restart_state_record(&restart), false) || !rejects_restore_row("op:other:create:1", encode_operation_record(&op), false) {
+    return false;
+  }
+
+  let bad_id = new_workload_record("Bad", digest.clone(), 1, 1);
+  let bad_digest = new_workload_record("app", "sha256:invalid", 1, 1);
+  let negative = new_workload_record("app", digest.clone(), -1, 1);
+  let excessive = new_workload_record("app", digest.clone(), max_replicas() + 1, 1);
+  if !rejects_restore_row("workload:Bad", encode_workload_record(&bad_id), false) || !rejects_restore_row("workload:app", encode_workload_record(&bad_digest), false) || !rejects_restore_row("workload:app", encode_workload_record(&negative), false) || !rejects_restore_row("workload:app", encode_workload_record(&excessive), true) {
+    return false;
+  }
+
+  let bad_restart = new_restart_state_record("app-1234-63", 1, -1, 1, "Backoff", "");
+  let bad_op = new_operation_record("app-1234-63:create:1", "app-1234-62", "create", "Pending", 0, "");
+  if !rejects_restore_row("restart:app-1234-63", encode_restart_state_record(&bad_restart), false) || !rejects_restore_row("op:app-1234-63:create:1", encode_operation_record(&bad_op), false) {
+    return false;
+  }
+
+  let mut oversized = Bytes.new();
+  let mut i = 0;
+  while i <= max_row_encoded_size() {
+    oversized.push(0);
+    i = i + 1;
+  }
+  if !rejects_restore_row("workload:app", Ok(oversized), true) {
+    return false;
+  }
+
+  let mut source = new_state_store();
+  let workload_row = encode_workload_record(&valid);
+  let policy_row = encode_policy_record(&policy);
+  let restart_row = encode_restart_state_record(&restart);
+  let operation_row = encode_operation_record(&op);
+  match workload_row {
+    Ok(row) => {
+      source.entries.push(new_store_entry("workload:app-1234", row));
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match policy_row {
+    Ok(row) => {
+      source.entries.push(new_store_entry("policy:app-1234", row));
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match restart_row {
+    Ok(row) => {
+      source.entries.push(new_store_entry("restart:app-1234-63", row));
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  match operation_row {
+    Ok(row) => {
+      source.entries.push(new_store_entry("op:app-1234-63:create:1", row));
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut archive = new_backup_archive(new_backup_manifest("", 0, 0, 0, ""), List.new());
+  match create_backup(&source, "valid", 0) {
+    Ok(a) => {
+      archive = a;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let mut restored = new_state_store();
+  return match restore_backup(&mut restored, &archive) {
+    Ok(count) => count == 4 && compute_archive_checksum(&restored.entries) == archive.manifest.checksum_hex,
+    Err(_) => false,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // エントリポイント
 // ---------------------------------------------------------------------------
@@ -390,6 +520,9 @@ pub fn run_backup_restore_tests() -> Bool
     return false;
   }
   if !test_corrupt_backup_rejected() {
+    return false;
+  }
+  if !test_restore_row_validation() {
     return false;
   }
   if !test_atomic_restore() {
