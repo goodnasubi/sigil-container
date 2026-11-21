@@ -132,6 +132,8 @@ pub fn compute_archive_checksum(entries: &List<StoreEntry>) -> String
   ensures none
   effects none
 {
+  // チェックサム方式は区切り文字方式から前置長さ方式へ変更済み (PR #14 コミット 1c91d5ce。マージ済みの main に区切り文字方式が入ったことはない)。
+  // 旧方式で作られたアーカイブは本関数の再計算と一致しないため、verify_backup でチェックサム不一致 (Corrupt) として拒否される。
   let mut combined = Bytes.new();
   let mut i = 0;
   while i < entries.len() {
@@ -177,9 +179,11 @@ pub fn create_backup(store: &StateStore, backup_id: String, now_ms: Int) -> Resu
   // 確定点でのチェックサムを計算 (長さ前置)
   let checksum = compute_archive_checksum(&entries_copy);
 
+  // format_version = 1 (アーカイブ形式の版であり、復元という操作の回数ではないため復元時に版は上げない。
+  // create_backup は常に format_version = 1 のマニフェストを書き、復元後に create_backup すると再び format_version = 1 となり、
+  // 内容が同じなら同じチェックサムになる。将来、形式に互換を壊す変更を入れる際は ADR 0045 どおり版を上げる)
   let manifest = new_backup_manifest(backup_id, now_ms, 1, entries_copy.len(), checksum);
 
-  // format_version = 1
   return Ok(new_backup_archive(manifest, entries_copy));
 }
 
@@ -189,7 +193,7 @@ pub fn verify_backup(archive: &BackupArchive) -> Result<Bool, ContainerError>
   ensures none
   effects none
 {
-  // 1. バージョン検証 (未知のバージョンは拒否)
+  // 1. バージョン検証 (format_version != 1 は未対応または未知のバックアップ形式バージョンとして Corrupt で拒否)
   if archive.manifest.format_version != 1 {
     return Err(ContainerError.Corrupt("未対応または未知のバックアップ形式バージョンです。".clone()));
   }

@@ -683,6 +683,10 @@ pub fn apply_declaration_commit(repo: &mut DeclarationRepository, commit: Declar
   effects none
 {
   // 1. 履歴保持上限チェック
+  // - 256 件の上限はインメモリ単一ノードモデルにおける境界上限値である。
+  // - 256 件到達後は apply_declaration_commit が LimitExceeded で失敗し続けることを仕様とし、削除・圧縮の手段は設計しない。
+  // - ADR 0045「データを失わせる自動修復より拒否を選ぶ」に照らし、履歴（監査・差分の根拠）を運用者の明示なしに失わせる自動刈り込みは採用しない。
+  // - 運用では新しいリポジトリを作り直す。履歴圧縮・刈り込みは永続リポジトリ連携の段で設計する未対応事項とする。
   if repo.commits.len() >= max_declaration_commits() {
     return Err(ContainerError.LimitExceeded("リポジトリのコミット履歴数が上限 (256) に達しています。".clone()));
   }
