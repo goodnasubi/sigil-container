@@ -1,0 +1,652 @@
+module container.admin
+  targets server
+  trust none
+
+use container.limits.max_admin_token_size;
+use container.limits.max_concurrent_operations;
+use container.limits.max_log_size;
+use container.limits.max_spec_size;
+use container.limits.max_workload_count;
+use container.spec.validate_network_identifier;
+use container.state.InstanceRecord;
+use container.state.WorkloadRecord;
+use container.state.new_workload_record;
+
+// ADR 0053 決定 6 / ADR 0037 (P5-5): 管理 HTTP API と認可・検証
+// 本モジュールは、管理操作の HTTP API に対する「認証・認可・ルーティング・要求検証の骨格 (Skeleton)」を提供する。
+// - 管理操作 (作成 create・起動 start・停止 stop・削除 delete・状態の取得 status・ログ logs) の HTTP API ルーティング
+// - ADR 0037 の HMAC ベアラー認証 (Authorization: Bearer sigil1.<payload>.<tag>) による主体検証
+// - 秘密 (認証鍵) は環境変数でなくファイル (メモリ上の Secret) で渡す
+// - 操作ごとの権限 (認可) 検査
+// - 権限の変更は次の要求から直ちに有効にする
+// - 読めない対象の存在は明かさない (権限なし時は 404 Not Found で存在を秘匿)
+// - 上限 (仕様サイズ 64KiB, ログ量 100MiB, 同時操作数 16, ワークロード数 1,024) は読み込み前に効かせる
+// - 秘密は仕様・状態・ログ・エラーに値を出さない
+// ※ 実体（調整ループ reconcile_loop、ModelRuntime、DeclarationRepository）との統合は後続の結合段階で実施。
+
+// ---------------------------------------------------------------------------
+// 認可・ACL モデル
+// ---------------------------------------------------------------------------
+
+pub struct AclRule {
+  subject: String,
+  action: String,  // "create", "start", "stop", "delete", "status", "logs", "*"
+  workload_id: String,  // 特定の workload_id または "*"
+}
+
+pub struct AclStore {
+  rules: List<AclRule>,
+}
+
+pub fn new_acl_rule(subject: String, action: String, workload_id: String) -> AclRule
+  intent "AclRule を構築する。subject == '*' は認証済みのすべての主体に規則を適用する"
+  requires none
+  ensures none
+  effects none
+{
+  return AclRule { subject: subject, action: action, workload_id: workload_id };
+}
+
+pub fn new_acl_store() -> AclStore
+  intent "空の AclStore を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return AclStore { rules: List.new() };
+}
+
+pub fn grant_permission(store: &mut AclStore, rule: AclRule)
+  intent "権限規則を追加する (次の要求から直ちに有効化)"
+  requires none
+  ensures none
+  effects none
+{
+  store.rules.push(rule);
+}
+
+pub fn revoke_permission(store: &mut AclStore, subject: &String, action: &String, workload_id: &String)
+  intent "一致する権限規則を削除する。指定された規則のみを削除し、広範なワイルドカード規則 (*, *) は別途取り消さない限り維持される"
+  requires none
+  ensures none
+  effects none
+{
+  let mut new_rules = List.new();
+  let mut i = 0;
+  while i < store.rules.len() {
+    match store.rules.get(i) {
+      Some(r) => {
+        let match_sub = r.subject == subject;
+        let match_act = r.action == action || action == "*";
+        let match_wl = r.workload_id == workload_id || workload_id == "*";
+        if !(match_sub && match_act && match_wl) {
+          new_rules.push(r.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  store.rules = new_rules;
+}
+
+pub fn is_authorized(store: &AclStore, subject: &String, action: &String, workload_id: &String) -> Bool
+  intent "指定された主体が対象リソースに対して操作権限を有しているかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < store.rules.len() {
+    match store.rules.get(i) {
+      Some(r) => {
+        if r.subject == subject || r.subject == "*" {
+          let act_ok = r.action == action || r.action == "*";
+          let res_ok = r.workload_id == workload_id || r.workload_id == "*";
+          if act_ok && res_ok {
+            return true;
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP API 型定義
+// ---------------------------------------------------------------------------
+
+pub struct AdminHeader {
+  name: String,
+  value: String,
+}
+
+pub struct AdminRequest {
+  method: String,
+  path: String,
+  auth_header: String,  // 例: "Bearer sigil1.<payload>.<tag>"
+  body: Bytes,
+  timestamp_sec: Int,
+}
+
+pub struct AdminResponse {
+  status_code: Int,
+  headers: List<AdminHeader>,
+  body: String,
+}
+
+pub struct LogEntry {
+  workload_id: String,
+  instance_id: String,
+  content: String,
+}
+
+pub struct AdminService {
+  signing_key: Secret,
+  audience: String,
+  acl: AclStore,
+  active_requests: Int,
+  workloads: List<WorkloadRecord>,
+  instances: List<InstanceRecord>,
+  logs: List<LogEntry>,
+}
+
+pub fn new_admin_header(name: String, value: String) -> AdminHeader
+  intent "AdminHeader を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return AdminHeader { name: name, value: value };
+}
+
+pub fn new_admin_request(method: String, path: String, auth_header: String, body: Bytes, timestamp_sec: Int) -> AdminRequest
+  intent "AdminRequest を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return AdminRequest { method: method, path: path, auth_header: auth_header, body: body, timestamp_sec: timestamp_sec };
+}
+
+pub fn new_admin_response(status_code: Int, headers: List<AdminHeader>, body: String) -> AdminResponse
+  intent "AdminResponse を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return AdminResponse { status_code: status_code, headers: headers, body: body };
+}
+
+pub fn new_admin_service(signing_key: Secret, audience: String, acl: AclStore) -> AdminService
+  intent "AdminService 骨格を構築する (秘密鍵はメモリ上の Secret で所有)"
+  requires none
+  ensures none
+  effects none
+{
+  return AdminService { signing_key: signing_key, audience: audience, acl: acl, active_requests: 0, workloads: List.new(), instances: List.new(), logs: List.new() };
+}
+
+// ---------------------------------------------------------------------------
+// 認証・リクエストハンドラ
+// ---------------------------------------------------------------------------
+
+fn extract_bearer_token(auth_header: &String) -> Result<Bytes, String>
+  intent "Authorization ヘッダから Bearer スキームとトークンバイト列を抽出する"
+  requires none
+  ensures none
+  effects none
+{
+  let b = auth_header.as_bytes();
+  if b.len() < 7 {
+    return Err("unauthorized".clone());
+  }
+
+  // 大小不問の 'bearer ' (7 バイト) 検査
+  let mut i = 0;
+  let expected = "bearer ".as_bytes();
+  while i < 7 {
+    let mut c = b.get(i).unwrap_or(0);
+    if c >= 65 && c <= 90 {
+      c = c + 32;
+    }
+    if c != expected.get(i).unwrap_or(255) {
+      return Err("unauthorized".clone());
+    }
+    i = i + 1;
+  }
+
+  let token_bytes = b.slice(7, b.len()).unwrap_or(Bytes.new());
+  if token_bytes.len() == 0 || token_bytes.len() > max_admin_token_size() {
+    return Err("unauthorized".clone());
+  }
+
+  return Ok(token_bytes);
+}
+
+fn make_unauthorized_response() -> AdminResponse
+  intent "認証失敗時に ADR 0037 準拠の固定 401 応答を生成する (秘密を出さない)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("WWW-Authenticate".clone(), "Bearer".clone()));
+  headers.push(new_admin_header("Cache-Control".clone(), "no-store".clone()));
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(401, headers, "unauthorized".clone());
+}
+
+fn make_not_found_response() -> AdminResponse
+  intent "存在秘匿またはリソース非存在時の固定 404 応答を生成する (読めない対象の存在を明かさない)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(404, headers, "not found".clone());
+}
+
+fn make_bad_request_response(msg: String) -> AdminResponse
+  intent "不正な要求形式時の明示的 400 応答を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(400, headers, msg);
+}
+
+fn make_limit_exceeded_response(msg: String) -> AdminResponse
+  intent "リクエスト仕様サイズ上限超過時の明示的 413 応答を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(413, headers, msg);
+}
+
+fn make_rate_limited_response(msg: String) -> AdminResponse
+  intent "同時操作数上限超過時の明示的 429 応答を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(429, headers, msg);
+}
+
+fn make_insufficient_storage_response(msg: String) -> AdminResponse
+  intent "ログバッファ上限超過時の明示的 507 応答を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut headers = List.new();
+  headers.push(new_admin_header("Content-Type".clone(), "text/plain; charset=utf-8".clone()));
+  return new_admin_response(507, headers, msg);
+}
+
+fn parse_action_and_workload(method: &String, path: &String) -> Result<(String, String), String>
+  intent "HTTP メソッドとパスから操作アクションとリソース識別子を抽出する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. POST /api/v1/workloads => ("create", "*")
+  if method == "POST" && path == "/api/v1/workloads" {
+    return Ok(("create".clone(), "*".clone()));
+  }
+
+  // 2. GET /api/v1/workloads => ("status", "*")
+  if method == "GET" && path == "/api/v1/workloads" {
+    return Ok(("status".clone(), "*".clone()));
+  }
+
+  // 接頭辞 /api/v1/workloads/ の検査
+  let prefix = "/api/v1/workloads/";
+  if path.len() <= prefix.len() {
+    return Err("invalid path".clone());
+  }
+  let path_prefix = path.as_bytes().slice(0, prefix.len()).unwrap_or(Bytes.new());
+  if path_prefix != prefix.as_bytes() {
+    return Err("invalid path".clone());
+  }
+
+  // 残りの部分: {id} または {id}/start, {id}/stop, {id}/status, {id}/logs
+  let rest_bytes = path.as_bytes().slice(prefix.len(), path.len()).unwrap_or(Bytes.new());
+  let mut rest_str = "".clone();
+  match rest_bytes.to_string_utf8() {
+    Ok(s) => {
+      rest_str = s;
+    }
+    Err(_) => {
+      return Err("invalid utf8".clone());
+    }
+  }
+
+  // スラッシュの位置を検索 (最初のスラッシュを採用して id を確定)
+  let mut slash_pos = -1;
+  let mut i = 0;
+  while i < rest_bytes.len() {
+    if rest_bytes.get(i).unwrap_or(0) == 47 {
+      slash_pos = i;
+      i = rest_bytes.len();
+    } else {
+      i = i + 1;
+    }
+  }
+
+  if slash_pos == -1 {
+    // スラッシュなし: DELETE /api/v1/workloads/{id} または GET /api/v1/workloads/{id}
+    match validate_network_identifier(&rest_str) {
+      Ok(_) => {}
+      Err(_) => {
+        return Err("invalid workload id".clone());
+      }
+    }
+    if method == "DELETE" {
+      return Ok(("delete".clone(), rest_str));
+    }
+    if method == "GET" {
+      return Ok(("status".clone(), rest_str));
+    }
+    return Err("method not allowed".clone());
+  }
+
+  let id_bytes = rest_bytes.slice(0, slash_pos).unwrap_or(Bytes.new());
+  let mut id_str = "".clone();
+  match id_bytes.to_string_utf8() {
+    Ok(s) => {
+      id_str = s;
+    }
+    Err(_) => {
+      return Err("invalid utf8".clone());
+    }
+  }
+
+  match validate_network_identifier(&id_str) {
+    Ok(_) => {}
+    Err(_) => {
+      return Err("invalid workload id".clone());
+    }
+  }
+
+  let sub_bytes = rest_bytes.slice(slash_pos + 1, rest_bytes.len()).unwrap_or(Bytes.new());
+  let mut sub_str = "".clone();
+  match sub_bytes.to_string_utf8() {
+    Ok(s) => {
+      sub_str = s;
+    }
+    Err(_) => {
+      return Err("invalid utf8".clone());
+    }
+  }
+
+  if method == "POST" && sub_str == "start" {
+    return Ok(("start".clone(), id_str));
+  }
+  if method == "POST" && sub_str == "stop" {
+    return Ok(("stop".clone(), id_str));
+  }
+  if method == "GET" && sub_str == "status" {
+    return Ok(("status".clone(), id_str));
+  }
+  if method == "GET" && sub_str == "logs" {
+    return Ok(("logs".clone(), id_str));
+  }
+
+  return Err("unsupported route".clone());
+}
+
+pub fn handle_admin_request(service: &mut AdminService, req: &AdminRequest) -> AdminResponse
+  intent "管理 HTTP 要求を受信し、認証・認可・上限検査・存在秘匿を行って処理する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 同時操作数上限の検査 (読み込む前に効かせる -> 429)
+  if service.active_requests >= max_concurrent_operations() {
+    return make_rate_limited_response("同時操作数が上限を超過しています (429)。".clone());
+  }
+
+  // 2. リクエストボディサイズ上限の検査 (64 KiB -> 413)
+  if req.body.len() > max_spec_size() {
+    return make_limit_exceeded_response("リクエスト仕様サイズが上限 (64 KiB) を超過しています。".clone());
+  }
+
+  // 3. ADR 0037 HMAC ベアラー認証
+  let token_bytes_res = extract_bearer_token(&req.auth_header);
+  let mut token_bytes = Bytes.new();
+  match token_bytes_res {
+    Ok(tb) => {
+      token_bytes = tb;
+    }
+    Err(_) => {
+      return make_unauthorized_response();
+    }
+  }
+
+  let verify_res = web.verify_bearer(&service.signing_key, &service.audience, &token_bytes, req.timestamp_sec);
+  let mut subject = "".clone();
+  match verify_res {
+    Ok(identity) => {
+      subject = identity.subject();
+    }
+    Err(_) => {
+      return make_unauthorized_response();
+    }
+  }
+
+  // 4. アクションと対象リソースのルーティング解析
+  let route_res = parse_action_and_workload(&req.method, &req.path);
+  let mut action = "".clone();
+  let mut target_workload = "".clone();
+  match route_res {
+    Ok((act, wl)) => {
+      action = act;
+      target_workload = wl;
+    }
+    Err(_) => {
+      return make_not_found_response();
+    }
+  }
+
+  // 5. 認可 (権限) 検査と存在秘匿
+  // 読めない対象の存在は明かさない: 権限がない場合は 403 ではなく 404 Not Found を返す！
+  if !is_authorized(&service.acl, &subject, &action, &target_workload) {
+    return make_not_found_response();
+  }
+
+  // 6. 各管理操作の実行
+  service.active_requests = service.active_requests + 1;
+
+  let mut resp_headers = List.new();
+  resp_headers.push(new_admin_header("Content-Type".clone(), "application/json".clone()));
+
+  if action == "status" {
+    if target_workload == "*" {
+      service.active_requests = service.active_requests - 1;
+      return new_admin_response(200, resp_headers, "{\"workloads_count\": 0}".clone());
+    }
+    // 特定ワークロードの検索
+    let mut found = false;
+    let mut i = 0;
+    while i < service.workloads.len() {
+      match service.workloads.get(i) {
+        Some(wl) => {
+          if wl.workload_id == target_workload {
+            found = true;
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    service.active_requests = service.active_requests - 1;
+    if !found {
+      return make_not_found_response();
+    }
+    return new_admin_response(200, resp_headers, "{\"status\": \"Ready\"}".clone());
+  }
+
+  if action == "logs" {
+    // ログ取得: 存在確認
+    let mut found = false;
+    let mut log_content = "".clone();
+    let mut i = 0;
+    while i < service.logs.len() {
+      match service.logs.get(i) {
+        Some(l) => {
+          if l.workload_id == target_workload {
+            found = true;
+            log_content = l.content.clone();
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    service.active_requests = service.active_requests - 1;
+    if !found {
+      return make_not_found_response();
+    }
+    // ログ上限検査 (100 MiB -> 507)
+    if log_content.as_bytes().len() > max_log_size() {
+      return make_insufficient_storage_response("ログデータ量が上限 (100 MiB) を超過しています。".clone());
+    }
+    return new_admin_response(200, resp_headers, log_content);
+  }
+
+  if action == "create" {
+    let mut body_str = "".clone();
+    match req.body.to_string_utf8() {
+      Ok(s) => {
+        body_str = s;
+      }
+      Err(_) => {
+        service.active_requests = service.active_requests - 1;
+        return make_bad_request_response("ボディが不正な UTF-8 です。".clone());
+      }
+    }
+
+    // 識別子形式の厳格検証 (空文字、*、a/b 等の不正な識別子を 400 で拒否)
+    match validate_network_identifier(&body_str) {
+      Ok(_) => {}
+      Err(_) => {
+        service.active_requests = service.active_requests - 1;
+        return make_bad_request_response("不正なワークロード識別子形式です。".clone());
+      }
+    }
+
+    // ワークロード数上限検査 (1,024)
+    if service.workloads.len() >= max_workload_count() {
+      service.active_requests = service.active_requests - 1;
+      return make_limit_exceeded_response("ワークロード数が上限 (1024) を超過しています。".clone());
+    }
+
+    // 重複登録検査
+    let mut exists = false;
+    let mut i = 0;
+    while i < service.workloads.len() {
+      match service.workloads.get(i) {
+        Some(w) => {
+          if w.workload_id == body_str {
+            exists = true;
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    if exists {
+      service.active_requests = service.active_requests - 1;
+      return make_bad_request_response("同一識別子のワークロードが既に存在します。".clone());
+    }
+
+    let new_wl = new_workload_record(body_str.clone(), "sha256:dummy".clone(), 1, 1);
+    service.workloads.push(new_wl);
+    service.active_requests = service.active_requests - 1;
+    let mut created_headers = List.new();
+    created_headers.push(new_admin_header("Content-Type".clone(), "application/json".clone()));
+    return new_admin_response(201, created_headers, "{\"created\": true}".clone());
+  }
+
+  if action == "start" {
+    let mut found = false;
+    let mut i = 0;
+    while i < service.workloads.len() {
+      match service.workloads.get(i) {
+        Some(wl) => {
+          if wl.workload_id == target_workload {
+            found = true;
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    service.active_requests = service.active_requests - 1;
+    if !found {
+      return make_not_found_response();
+    }
+    return new_admin_response(200, resp_headers, "{\"started\": true}".clone());
+  }
+
+  if action == "stop" {
+    let mut found = false;
+    let mut i = 0;
+    while i < service.workloads.len() {
+      match service.workloads.get(i) {
+        Some(wl) => {
+          if wl.workload_id == target_workload {
+            found = true;
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    service.active_requests = service.active_requests - 1;
+    if !found {
+      return make_not_found_response();
+    }
+    return new_admin_response(200, resp_headers, "{\"stopped\": true}".clone());
+  }
+
+  if action == "delete" {
+    let mut found = false;
+    let mut new_wls = List.new();
+    let mut i = 0;
+    while i < service.workloads.len() {
+      match service.workloads.get(i) {
+        Some(wl) => {
+          if wl.workload_id == target_workload {
+            found = true;
+          } else {
+            new_wls.push(wl.clone());
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    service.active_requests = service.active_requests - 1;
+    if !found {
+      return make_not_found_response();
+    }
+    service.workloads = new_wls;
+    return new_admin_response(200, resp_headers, "{\"deleted\": true}".clone());
+  }
+
+  service.active_requests = service.active_requests - 1;
+  return make_not_found_response();
+}

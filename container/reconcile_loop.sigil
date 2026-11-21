@@ -42,6 +42,15 @@ pub struct StoreEntry {
   row: Bytes,
 }
 
+pub fn new_store_entry(key: String, row: Bytes) -> StoreEntry
+  intent "StoreEntry を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return StoreEntry { key: key, row: row };
+}
+
 pub struct StateStore {
   entries: List<StoreEntry>,
   fail_commits: Bool,  // 障害注入: 書き込みを失敗させる

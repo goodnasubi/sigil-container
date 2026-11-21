@@ -1,0 +1,351 @@
+module container.backup
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_backup_manifest_size;
+use container.limits.max_workload_count;
+use container.reconcile_loop.ModelRuntime;
+use container.reconcile_loop.StateStore;
+use container.reconcile_loop.StoreEntry;
+use container.reconcile_loop.TickReport;
+use container.reconcile_loop.new_store_entry;
+use container.reconcile_loop.reconcile_tick;
+use container.reconcile_state.decode_operation_record;
+use container.reconcile_state.decode_policy_record;
+use container.reconcile_state.decode_restart_state_record;
+use container.state.decode_workload_record;
+
+// ADR 0053 決定 6 (P5-5): バックアップと復元 (ADR 0045 / P4-1 準拠)
+// - 管理の状態を整合した時点で取り出し、復元する。
+// - 決定論的 SHA-256 チェックサムによる偶発的破損検出・完全性検査 (改ざん排除には共有秘密による認証タグが必要)。
+// - 復元前に各エントリのキー形式、重複キー、件数上限、行の復号妥当性を厳格検証する (原子的復元)。
+// - 復元した状態から調整ループが望ましい状態へ収束すること。
+// - バックアップを元データと同じ秘密として扱い、試験は使い捨てのデータだけを使う。
+
+pub struct BackupManifest {
+  backup_id: String,
+  created_at_ms: Int,
+  format_version: Int,
+  entry_count: Int,
+  checksum_hex: String,
+}
+
+pub struct BackupArchive {
+  manifest: BackupManifest,
+  entries: List<StoreEntry>,
+}
+
+pub fn new_backup_manifest(backup_id: String, created_at_ms: Int, format_version: Int, entry_count: Int, checksum_hex: String) -> BackupManifest
+  intent "BackupManifest を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return BackupManifest { backup_id: backup_id, created_at_ms: created_at_ms, format_version: format_version, entry_count: entry_count, checksum_hex: checksum_hex };
+}
+
+pub fn new_backup_archive(manifest: BackupManifest, entries: List<StoreEntry>) -> BackupArchive
+  intent "BackupArchive を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return BackupArchive { manifest: manifest, entries: entries };
+}
+
+fn hex_char(val: Int) -> Int
+  intent "4 ビット数値を小文字 hex ASCII コードに変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if val < 10 {
+    return 48 + val;
+  }
+  return 97 + (val - 10);
+}
+
+fn bytes_to_hex(b: &Bytes) -> String
+  intent "バイト列を小文字 hex 文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let byte_val = b.get(i).unwrap_or(0);
+    out.push(hex_char(byte_val >> 4 & 15));
+    out.push(hex_char(byte_val & 15));
+    i = i + 1;
+  }
+  return match out.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "".clone(),
+  };
+}
+
+fn push_u32_be(buf: &mut Bytes, val: Int)
+  intent "符号なし 32 ビット整数を Big-Endian で追加する"
+  requires none
+  ensures none
+  effects none
+{
+  buf.push(val >> 24 & 255);
+  buf.push(val >> 16 & 255);
+  buf.push(val >> 8 & 255);
+  buf.push(val & 255);
+}
+
+fn starts_with(s: &String, prefix: &String) -> Bool
+  intent "文字列が指定接頭辞で始まるか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let sb = s.as_bytes();
+  let pb = prefix.as_bytes();
+  if sb.len() < pb.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < pb.len() {
+    if sb.get(i).unwrap_or(0) != pb.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn compute_archive_checksum(entries: &List<StoreEntry>) -> String
+  intent "全エントリの内容 (キー長・キー・行長・行バイト列の前置長さ連結) から決定論的な SHA-256 チェックサムを計算する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut combined = Bytes.new();
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      Some(entry) => {
+        let key_bytes = entry.key.as_bytes();
+        push_u32_be(&mut combined, key_bytes.len());
+        combined.extend(&key_bytes);
+        push_u32_be(&mut combined, entry.row.len());
+        combined.extend(&entry.row);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let digest = sha256(&combined);
+  return bytes_to_hex(&digest);
+}
+
+pub fn create_backup(store: &StateStore, backup_id: String, now_ms: Int) -> Result<BackupArchive, ContainerError>
+  intent "整合した時点の状態ストアからバックアップアーカイブを作成する"
+  requires none
+  ensures none
+  effects none
+{
+  if backup_id.len() == 0 {
+    return Err(ContainerError.SpecValidation("backup_id は空にできません。".clone()));
+  }
+
+  // 整合した時点のエントリ一覧を抽出
+  let mut entries_copy = List.new();
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(e) => {
+        entries_copy.push(new_store_entry(e.key.clone(), e.row.clone()));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // 確定点でのチェックサムを計算 (長さ前置)
+  let checksum = compute_archive_checksum(&entries_copy);
+
+  let manifest = new_backup_manifest(backup_id, now_ms, 1, entries_copy.len(), checksum);
+
+  // format_version = 1
+  return Ok(new_backup_archive(manifest, entries_copy));
+}
+
+pub fn verify_backup(archive: &BackupArchive) -> Result<Bool, ContainerError>
+  intent "バックアップアーカイブの完全性 (バージョン、マニフェストサイズ上限、件数、SHA-256 チェックサム) を厳格検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. バージョン検証 (未知のバージョンは拒否)
+  if archive.manifest.format_version != 1 {
+    return Err(ContainerError.Corrupt("未対応または未知のバックアップ形式バージョンです。".clone()));
+  }
+
+  // 2. マニフェストサイズ上限検査 (64 KiB)
+  let manifest_size = archive.manifest.backup_id.len() + archive.manifest.checksum_hex.len() + 32;
+  if manifest_size > max_backup_manifest_size() {
+    return Err(ContainerError.LimitExceeded("バックアップマニフェストのサイズが上限 (64 KiB) を超過しています。".clone()));
+  }
+
+  // 3. エントリ件数の整合性検証
+  if archive.manifest.entry_count != archive.entries.len() {
+    return Err(ContainerError.Corrupt("バックアップマニフェストのエントリ件数と実データ件数が一致しません。".clone()));
+  }
+
+  // 4. SHA-256 チェックサムの再計算と完全一致の検証 (破損検出)
+  let calculated = compute_archive_checksum(&archive.entries);
+  if calculated != archive.manifest.checksum_hex {
+    return Err(ContainerError.Corrupt("バックアップの SHA-256 チェックサム不一致が検出されました (データ破損または改ざん)。".clone()));
+  }
+
+  return Ok(true);
+}
+
+pub fn restore_backup(target_store: &mut StateStore, archive: &BackupArchive) -> Result<Int, ContainerError>
+  intent "検証済みバックアップアーカイブから各エントリを復号・検証し、すべて健全な場合のみ原子的に復元する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 復元前に完全性を厳格検証 (失敗時はストアに一切触れない)
+  match verify_backup(&archive) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 2. 件数上限検査 (1ワークロードあたり最大4エントリ想定)
+  let max_entries = max_workload_count() * 4;
+  if archive.entries.len() > max_entries {
+    return Err(ContainerError.LimitExceeded("バックアップエントリ件数が上限を超過しています。".clone()));
+  }
+
+  // 3. 重複キーの検査
+  let mut i = 0;
+  while i < archive.entries.len() {
+    match archive.entries.get(i) {
+      Some(ei) => {
+        let mut j = i + 1;
+        while j < archive.entries.len() {
+          match archive.entries.get(j) {
+            Some(ej) => {
+              if ei.key == ej.key {
+                return Err(ContainerError.Corrupt("バックアップ内に重複キーが存在します。".clone()));
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // 4. 各エントリのキー形式および行データの復号検証
+  let mut k = 0;
+  while k < archive.entries.len() {
+    match archive.entries.get(k) {
+      Some(entry) => {
+        if starts_with(&entry.key, &"workload:".clone()) {
+          let id_bytes = entry.key.as_bytes().slice(9, entry.key.len()).unwrap_or(Bytes.new());
+          if id_bytes.len() == 0 {
+            return Err(ContainerError.Corrupt("workload キーの識別子が空です。".clone()));
+          }
+          match decode_workload_record(&entry.row) {
+            Ok(w) => {
+              if w.workload_id.len() == 0 {
+                return Err(ContainerError.Corrupt("workload_id が空です。".clone()));
+              }
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+        } else if starts_with(&entry.key, &"policy:".clone()) {
+          let id_bytes = entry.key.as_bytes().slice(7, entry.key.len()).unwrap_or(Bytes.new());
+          if id_bytes.len() == 0 {
+            return Err(ContainerError.Corrupt("policy キーの識別子が空です。".clone()));
+          }
+          match decode_policy_record(&entry.row) {
+            Ok(p) => {
+              if p.workload_id.len() == 0 {
+                return Err(ContainerError.Corrupt("policy の workload_id が空です。".clone()));
+              }
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+        } else if starts_with(&entry.key, &"restart:".clone()) {
+          let id_bytes = entry.key.as_bytes().slice(8, entry.key.len()).unwrap_or(Bytes.new());
+          if id_bytes.len() == 0 {
+            return Err(ContainerError.Corrupt("restart キーの識別子が空です。".clone()));
+          }
+          match decode_restart_state_record(&entry.row) {
+            Ok(r) => {
+              if r.instance_id.len() == 0 {
+                return Err(ContainerError.Corrupt("restart の instance_id が空です。".clone()));
+              }
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+        } else if starts_with(&entry.key, &"op:".clone()) {
+          let id_bytes = entry.key.as_bytes().slice(3, entry.key.len()).unwrap_or(Bytes.new());
+          if id_bytes.len() == 0 {
+            return Err(ContainerError.Corrupt("op キーの識別子が空です。".clone()));
+          }
+          match decode_operation_record(&entry.row) {
+            Ok(o) => {
+              if o.op_id.len() == 0 {
+                return Err(ContainerError.Corrupt("op_id が空です。".clone()));
+              }
+            }
+            Err(err) => {
+              return Err(err);
+            }
+          }
+        } else {
+          return Err(ContainerError.Corrupt("未知または不正なキー形式のエントリが含まれています。".clone()));
+        }
+      }
+      None => {}
+    }
+    k = k + 1;
+  }
+
+  // 5. 原子的復元: 全検証が通過した場合のみ既存エントリを消去し、バックアップの内容で完全置換
+  target_store.entries = List.new();
+  let mut m = 0;
+  while m < archive.entries.len() {
+    match archive.entries.get(m) {
+      Some(e) => {
+        target_store.entries.push(new_store_entry(e.key.clone(), e.row.clone()));
+      }
+      None => {}
+    }
+    m = m + 1;
+  }
+
+  return Ok(target_store.entries.len());
+}
+
+pub fn converge_after_restore(store: &mut StateStore, runtime: &mut ModelRuntime, now_ms: Int) -> Result<TickReport, ContainerError>
+  intent "復元後の状態ストアをもとに調整ループを実行し、望ましい状態へと収束させる"
+  requires none
+  ensures none
+  effects none
+{
+  // 復元された状態ストアと実行環境をもとに調整ループ 1 回分を実行
+  return reconcile_tick(&mut store, &mut runtime, now_ms);
+}

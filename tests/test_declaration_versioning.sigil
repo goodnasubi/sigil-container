@@ -1,0 +1,480 @@
+module tests.test_declaration_versioning
+  targets server
+  trust none
+
+use container.declaration.apply_declaration_commit;
+use container.declaration.compute_declaration_diff;
+use container.declaration.find_declaration;
+use container.declaration.get_head_declarations;
+use container.declaration.new_declaration_commit;
+use container.declaration.new_declaration_repository;
+use container.declaration.new_workload_declaration;
+use container.declaration.validate_declaration_commit;
+use container.error.ContainerError;
+use container.network.new_network_spec;
+use container.reconcile_state.disabled_health_check;
+use container.reconcile_state.new_health_check_spec;
+use container.spec.ContainerSpec;
+use container.spec.RestartPolicy;
+use container.spec.default_secure_isolation;
+use container.spec.new_container_spec;
+use container.spec.new_egress_rule;
+use container.spec.new_port_mapping;
+use container.spec.new_resources;
+
+// テスト用コンテナ仕様生成ヘルパー
+fn d1_digest() -> String
+  intent "d1 の sha256 digest"
+  requires none
+  ensures none
+  effects none
+{
+  return "sha256:1111111111111111111111111111111111111111111111111111111111111111".clone();
+}
+
+fn d2_digest() -> String
+  intent "d2 の sha256 digest"
+  requires none
+  ensures none
+  effects none
+{
+  return "sha256:2222222222222222222222222222222222222222222222222222222222222222".clone();
+}
+
+fn d3_digest() -> String
+  intent "d3 の sha256 digest"
+  requires none
+  ensures none
+  effects none
+{
+  return "sha256:3333333333333333333333333333333333333333333333333333333333333333".clone();
+}
+
+fn unsafe_digest() -> String
+  intent "unsafe の sha256 digest"
+  requires none
+  ensures none
+  effects none
+{
+  return "sha256:6666666666666666666666666666666666666666666666666666666666666666".clone();
+}
+
+fn over_digest() -> String
+  intent "over の sha256 digest"
+  requires none
+  ensures none
+  effects none
+{
+  return "sha256:7777777777777777777777777777777777777777777777777777777777777777".clone();
+}
+
+fn dummy_spec(digest: &String) -> ContainerSpec
+  intent "テスト用の安全な既定コンテナ仕様を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let iso = default_secure_isolation();
+  let res = new_resources(268435456, 50000, 128, 536870912, 5242880);
+  return new_container_spec(digest.clone(), List.new(), List.new(), "/app".clone(), iso, res, false, List.new(), List.new(), List.new(), RestartPolicy.Always);
+}
+
+fn dummy_unsafe_spec(digest: &String) -> ContainerSpec
+  intent "特権を要求する危険な仕様を生成する (検証で拒否されるべき)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut iso = default_secure_isolation();
+  iso.privileged = true;  // 特権コンテナは既定拒否
+  let res = new_resources(268435456, 50000, 128, 536870912, 5242880);
+  return new_container_spec(digest.clone(), List.new(), List.new(), "/app".clone(), iso, res, false, List.new(), List.new(), List.new(), RestartPolicy.Always);
+}
+
+// ---------------------------------------------------------------------------
+// 1. 宣言の差分計算テスト (全フィールド対応・資源/ポート/ネットワーク単独変更検出)
+// ---------------------------------------------------------------------------
+
+fn test_diff_computation() -> Bool
+  intent "宣言の追加・削除・変更の差分が全フィールドにわたって正確に計算されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let net_spec = new_network_spec(false, List.new(), List.new(), List.new());
+  let health = disabled_health_check();
+
+  let d1 = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_spec.clone(), health.clone());
+  let d2 = new_workload_declaration("wl-2".clone(), d2_digest(), 1, dummy_spec(&d2_digest()), net_spec.clone(), health.clone());
+
+  let mut old_list = List.new();
+  old_list.push(d1);
+  old_list.push(d2);
+
+  // new_list: wl-1 のレプリカを 2 -> 3 に変更、wl-2 を削除、wl-3 を追加
+  let d1_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 3, dummy_spec(&d1_digest()), net_spec.clone(), health.clone());
+  let d3 = new_workload_declaration("wl-3".clone(), d3_digest(), 1, dummy_spec(&d3_digest()), net_spec.clone(), health.clone());
+
+  let mut new_list = List.new();
+  new_list.push(d1_mod);
+  new_list.push(d3);
+
+  let diff = compute_declaration_diff(&old_list, &new_list);
+
+  // 1 件追加 (wl-3)
+  if diff.added.len() != 1 {
+    return false;
+  }
+  match diff.added.get(0) {
+    Some(a) => {
+      if a.workload_id != "wl-3" {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 1 件削除 (wl-2)
+  if diff.removed.len() != 1 {
+    return false;
+  }
+  match diff.removed.get(0) {
+    Some(r) => {
+      if r != "wl-2" {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 1 件変更 (wl-1: replicas 2 -> 3)
+  if diff.modified.len() != 1 {
+    return false;
+  }
+  match diff.modified.get(0) {
+    Some(ch) => {
+      if ch.workload_id != "wl-1" || !ch.replicas_changed || ch.old_replicas != 2 || ch.new_replicas != 3 {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (A) 資源上限 (resources) だけを変更した差分検出テスト
+  let mut res_changed_spec = dummy_spec(&d1_digest());
+  res_changed_spec.resources.memory_max_bytes = 536870912;  // 256MiB -> 512MiB
+  let d_res_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, res_changed_spec, net_spec.clone(), health.clone());
+
+  let mut list_res = List.new();
+  list_res.push(d_res_mod);
+
+  let mut base_list = List.new();
+  base_list.push(new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_spec.clone(), health.clone()));
+
+  let diff_res = compute_declaration_diff(&base_list, &list_res);
+  if diff_res.modified.len() != 1 {
+    return false;
+  }
+  match diff_res.modified.get(0) {
+    Some(ch) => {
+      if !ch.spec_changed || ch.replicas_changed || ch.digest_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (B) ポート (ports) だけを変更した差分検出テスト
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 80, "tcp".clone(), "127.0.0.1".clone()));
+  let net_with_port = new_network_spec(true, ports, List.new(), List.new());
+  let d_port_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_with_port, health.clone());
+
+  let mut list_port = List.new();
+  list_port.push(d_port_mod);
+
+  let diff_port = compute_declaration_diff(&base_list, &list_port);
+  if diff_port.modified.len() != 1 {
+    return false;
+  }
+  match diff_port.modified.get(0) {
+    Some(ch) => {
+      if !ch.network_changed || ch.spec_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (C) ネットワーク外向き規則 (egress_rules) だけを変更した差分検出テスト
+  let mut egress = List.new();
+  egress.push(new_egress_rule("192.168.1.0/24".clone(), 443, "tcp".clone()));
+  let net_with_egress = new_network_spec(true, List.new(), egress, List.new());
+  let d_egress_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_with_egress, health.clone());
+
+  let mut list_egress = List.new();
+  list_egress.push(d_egress_mod);
+
+  let diff_egress = compute_declaration_diff(&base_list, &list_egress);
+  if diff_egress.modified.len() != 1 {
+    return false;
+  }
+  match diff_egress.modified.get(0) {
+    Some(ch) => {
+      if !ch.network_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (D) ヘルスチェック (health_spec) だけを変更した差分検出テスト
+  let active_health = new_health_check_spec(true, 5000, 2000, 3, 10000);
+  let d_health_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_spec.clone(), active_health);
+
+  let mut list_health = List.new();
+  list_health.push(d_health_mod);
+
+  let diff_health = compute_declaration_diff(&base_list, &list_health);
+  if diff_health.modified.len() != 1 {
+    return false;
+  }
+  match diff_health.modified.get(0) {
+    Some(ch) => {
+      if !ch.health_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 2. 適用前検証 (不正仕様の拒否)
+// ---------------------------------------------------------------------------
+
+fn test_validation_rejects_unsafe_spec() -> Bool
+  intent "特権や上限超過を含む宣言コミットが適用前に確実に拒否されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let net_spec = new_network_spec(false, List.new(), List.new(), List.new());
+  let health = disabled_health_check();
+
+  // 危険な仕様 (特権 cap)
+  let unsafe_decl = new_workload_declaration("wl-unsafe".clone(), unsafe_digest(), 1, dummy_unsafe_spec(&unsafe_digest()), net_spec.clone(), health.clone());
+
+  let mut decls = List.new();
+  decls.push(unsafe_decl);
+
+  let commit = new_declaration_commit("commit-1".clone(), "".clone(), 1000, "alice".clone(), "add unsafe".clone(), decls);
+
+  match validate_declaration_commit(&commit) {
+    Ok(_) => {
+      return false;  // 危険な仕様は拒否されなければならない
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // レプリカ数上限超過 (65 > 64)
+  let over_replicas_decl = new_workload_declaration("wl-over".clone(), over_digest(), 65, dummy_spec(&over_digest()), net_spec.clone(), health.clone());
+  let mut decls_over = List.new();
+  decls_over.push(over_replicas_decl);
+
+  let commit_over = new_declaration_commit("commit-2".clone(), "".clone(), 1000, "alice".clone(), "add over".clone(), decls_over);
+  match validate_declaration_commit(&commit_over) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.LimitExceeded(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3. 原子的適用の検証 (一部だけ適用されないこと)
+// ---------------------------------------------------------------------------
+
+fn test_atomic_apply() -> Bool
+  intent "検証失敗時にリポジトリが一切更新されず、成功時のみ HEAD が更新されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut repo = new_declaration_repository();
+  let net_spec = new_network_spec(false, List.new(), List.new(), List.new());
+  let health = disabled_health_check();
+
+  // 1. 正常コミットの適用
+  let valid_decl = new_workload_declaration("wl-valid".clone(), d1_digest(), 1, dummy_spec(&d1_digest()), net_spec.clone(), health.clone());
+  let mut decls1 = List.new();
+  decls1.push(valid_decl);
+
+  let c1 = new_declaration_commit("commit-c1".clone(), "".clone(), 1000, "alice".clone(), "init".clone(), decls1);
+
+  let apply1_res = apply_declaration_commit(&mut repo, c1);
+  match apply1_res {
+    Ok(diff) => {
+      if diff.added.len() != 1 || repo.head_commit_id != "commit-c1" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 正常な宣言と不正な宣言を混在させたコミットの適用試行 (全体拒否・原子性)
+  let valid_decl2 = new_workload_declaration("wl-valid2".clone(), d2_digest(), 1, dummy_spec(&d2_digest()), net_spec.clone(), health.clone());
+  let invalid_decl = new_workload_declaration("wl-invalid".clone(), unsafe_digest(), 1, dummy_unsafe_spec(&unsafe_digest()), net_spec.clone(), health.clone());
+
+  let mut mixed_decls = List.new();
+  mixed_decls.push(valid_decl2);
+  mixed_decls.push(invalid_decl);
+
+  let c2_invalid = new_declaration_commit("commit-c2".clone(), "commit-c1".clone(), 2000, "bob".clone(), "mixed".clone(), mixed_decls);
+
+  let apply2_res = apply_declaration_commit(&mut repo, c2_invalid);
+  match apply2_res {
+    Ok(_) => {
+      return false;  // 失敗しなければならない
+    }
+    Err(_) => {
+      // リポジトリの状態が commit-c1 のままであることを検証 (原子性)
+      if repo.head_commit_id != "commit-c1" || repo.commits.len() != 1 {
+        return false;
+      }
+      let head_decls = get_head_declarations(&repo);
+      if head_decls.len() != 1 {
+        return false;
+      }
+      match head_decls.get(0) {
+        Some(hd) => {
+          if hd.workload_id != "wl-valid" {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+      // wl-valid2 が部分適用されていないことを確認
+      match find_declaration(&repo, &"wl-valid2".clone()) {
+        Some(_) => {
+          return false;
+        }
+        None => {}
+      }
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. 重複 commit_id 拒否および初回コミット親検査テスト
+// ---------------------------------------------------------------------------
+
+fn test_commit_identity_and_parent_checks() -> Bool
+  intent "同一 commit_id の重複拒否および初回コミット parent_commit_id 必須空検査を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut repo = new_declaration_repository();
+  let net_spec = new_network_spec(false, List.new(), List.new(), List.new());
+  let health = disabled_health_check();
+
+  let decl = new_workload_declaration("wl-1".clone(), d1_digest(), 1, dummy_spec(&d1_digest()), net_spec.clone(), health.clone());
+  let mut decls = List.new();
+  decls.push(decl);
+
+  // 1. 初回コミットで parent_commit_id が空でない場合は拒否されること
+  let bad_init = new_declaration_commit("init-1".clone(), "non-empty-parent".clone(), 1000, "alice".clone(), "msg".clone(), decls.clone());
+  match apply_declaration_commit(&mut repo, bad_init) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.StateError(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 正常な初回コミットを適用
+  let good_init = new_declaration_commit("init-1".clone(), "".clone(), 1000, "alice".clone(), "msg".clone(), decls.clone());
+  match apply_declaration_commit(&mut repo, good_init) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 同一 commit_id ("init-1") の重複コミット適用試行が拒否されること
+  let dup_commit = new_declaration_commit("init-1".clone(), "init-1".clone(), 2000, "bob".clone(), "dup".clone(), decls.clone());
+  match apply_declaration_commit(&mut repo, dup_commit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.StateError(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. リポジトリのコミット件数が 1 件のままであること
+  if repo.commits.len() != 1 || repo.head_commit_id != "init-1" {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// エントリポイント
+// ---------------------------------------------------------------------------
+
+pub fn run_declaration_versioning_tests() -> Bool
+  intent "宣言の版管理テストをすべて実行する"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_diff_computation() {
+    return false;
+  }
+  if !test_validation_rejects_unsafe_spec() {
+    return false;
+  }
+  if !test_atomic_apply() {
+    return false;
+  }
+  if !test_commit_identity_and_parent_checks() {
+    return false;
+  }
+  return true;
+}
