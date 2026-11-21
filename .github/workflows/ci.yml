@@ -27,12 +27,14 @@ jobs:
   # フェイルセーフ: 出力 code は最初に true にしておき、「コードの変更が無い」と確定したときだけ false に上書きする。
   # 検出のどこかが失敗しても、このジョブ自体が失敗しても、後段は実行側に倒れる。
   # main への push では検出しない（test ジョブ側で常に全量を実行する）。
+  # PR では第5節の起動経路の変更も検出し、test ジョブの実行条件に使う。
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       code: ${{ steps.detect.outputs.code }}
+      runtime_e2e: ${{ steps.detect.outputs.runtime_e2e }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -47,6 +49,9 @@ jobs:
           changed="$(git diff --name-only --no-renames "$BASE_SHA" HEAD)"
           echo "変更されたファイル:"
           echo "$changed"
+          if printf '%s\n' "$changed" | grep -Eq '^(tests/test_runtime_e2e\.sh|test\.sh|\.github/workflows/ci\.yml)$'; then
+            echo "runtime_e2e=true" >> "$GITHUB_OUTPUT"
+          fi
           # コード扱いするパス。ci.yml の変更では ci.yml の全ジョブを実行する。
           if printf '%s\n' "$changed" | grep -Eq '^(container/|db/|tests/)|^test\.sh$|^test_runner\.sigil$|^\.github/workflows/ci\.yml$'; then
             echo "コードの変更あり: テストを実行する"
@@ -132,10 +137,10 @@ jobs:
           fi
           echo "gate passed (SIR evaluator tests, result = 0)"
 
-  # main への push の全量（sigil-db の test と同じ名前・役割）。test.sh の全節
-  # （fmt・check・SIR 評価器・ネイティブビルドと実行）を実行する。
+  # main への push と、実 OCI ランタイム試験の起動経路を変更する PR で全節を実行する。
   test:
-    if: ${{ github.event_name == 'push' }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.result != 'success' || needs.changes.outputs.runtime_e2e == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -156,10 +161,10 @@ jobs:
           rustc --version
           echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      - name: ネイティブ出力の前提
+      - name: ネイティブ出力と OCI ランタイムの前提
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev crun
 
       # ビルドのキャッシュ。gate ジョブと同じキーで、main の全量ジョブが保存したものを復元する。
       - name: キャッシュの復元
@@ -188,6 +193,8 @@ jobs:
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
           SIGIL_REF: ${{ env.SIGIL_REF }}
+          # 第5節のみ sudo で実行し、必要な権限が無い場合は CI を失敗させる。
+          SIGIL_RUNTIME_E2E_SUDO: "1"
 
       # main への push のときだけ保存する。同じキーが既にあれば保存されない
       # （Cargo.lock かツールチェーンか SIGIL_REF が変わると新しいキーになる）。

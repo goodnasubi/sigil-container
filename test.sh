@@ -48,7 +48,9 @@ if [ "$NATIVE_OUTPUT" != "0" ]; then
 fi
 echo "Native binary tests passed (result = 0)"
 
-if [ -x "./tests/test_runtime_e2e.sh" ] && (command -v crun >/dev/null 2>&1 || command -v runc >/dev/null 2>&1); then
+if [ "${SIGIL_RUNTIME_E2E_SUDO:-0}" = "1" ]; then
+  sudo -n ./tests/test_runtime_e2e.sh --require
+elif [ -x "./tests/test_runtime_e2e.sh" ] && (command -v crun >/dev/null 2>&1 || command -v runc >/dev/null 2>&1); then
   echo "=== 5. Running real OCI runtime integration and negative tests ==="
   ./tests/test_runtime_e2e.sh
 else
