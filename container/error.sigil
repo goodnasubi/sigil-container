@@ -12,6 +12,9 @@ pub enum ContainerError {
   LimitExceeded(String),
   Corrupt(String),
   StateError(String),
+  AuthError(String),
+  PermissionDenied(String),
+  NotFound(String),
 }
 
 pub fn error_kind_name(err: &ContainerError) -> String
@@ -26,6 +29,9 @@ pub fn error_kind_name(err: &ContainerError) -> String
     ContainerError.LimitExceeded(_) => "LimitExceeded",
     ContainerError.Corrupt(_) => "Corrupt",
     ContainerError.StateError(_) => "StateError",
+    ContainerError.AuthError(_) => "AuthError",
+    ContainerError.PermissionDenied(_) => "PermissionDenied",
+    ContainerError.NotFound(_) => "NotFound",
   };
 }
 
@@ -41,6 +47,9 @@ pub fn error_message(err: &ContainerError) -> String
     ContainerError.LimitExceeded(msg) => msg.clone(),
     ContainerError.Corrupt(msg) => msg.clone(),
     ContainerError.StateError(msg) => msg.clone(),
+    ContainerError.AuthError(msg) => msg.clone(),
+    ContainerError.PermissionDenied(msg) => msg.clone(),
+    ContainerError.NotFound(msg) => msg.clone(),
   };
 }
 

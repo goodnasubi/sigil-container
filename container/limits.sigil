@@ -289,3 +289,57 @@ pub fn max_operation_attempts() -> Int
 {
   return 5;
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0053 決定 6 / ADR 0037 (P5-5): 管理 API・版管理・バックアップの上限値定数
+// ---------------------------------------------------------------------------
+
+// 管理 API トークンの最大バイトサイズ (ADR 0037 決定 1): 1,024 byte
+pub fn max_admin_token_size() -> Int
+  intent "管理 API ベアラートークンの最大長 (1,024 byte) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+// 管理 API トークンペイロードの最大バイトサイズ (ADR 0037 決定 1): 404 byte
+pub fn max_admin_payload_size() -> Int
+  intent "管理 API トークンペイロードの最大長 (404 byte) を返す"
+  requires none
+  ensures result == 404
+  effects none
+{
+  return 404;
+}
+
+// 管理 API の同時処理数上限 (ADR 0053 脅威と対策: 資源の行): 16
+pub fn max_concurrent_operations() -> Int
+  intent "管理 API の同時操作数上限 (16) を返す"
+  requires none
+  ensures result == 16
+  effects none
+{
+  return 16;
+}
+
+// 宣言版管理のリポジトリコミット履歴上限数: 256
+pub fn max_declaration_commits() -> Int
+  intent "宣言リポジトリのコミット保持上限数 (256) を返す"
+  requires none
+  ensures result == 256
+  effects none
+{
+  return 256;
+}
+
+// バックアップマニフェストの最大バイトサイズ: 64 KiB (65,536 byte)
+pub fn max_backup_manifest_size() -> Int
+  intent "バックアップマニフェストの最大サイズ (65,536 byte) を返す"
+  requires none
+  ensures result == 65536
+  effects none
+{
+  return 65536;
+}

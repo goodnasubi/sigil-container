@@ -1,0 +1,344 @@
+module container.declaration
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.limits.max_declaration_commits;
+use container.limits.max_replicas;
+use container.limits.max_workload_count;
+use container.network.NetworkSpec;
+use container.network.validate_network_spec;
+use container.reconcile_state.HealthCheckSpec;
+use container.spec.ContainerSpec;
+use container.spec.validate_network_identifier;
+use container.spec.validate_spec;
+
+// ADR 0053 決定 6 (P5-5): 宣言の版管理との連携
+// - 望ましい状態の宣言を P4-3・P4-4 のリポジトリで版管理し、差分を見られるようにする。
+// - 宣言の変更は差分として確認でき、適用前に検証されること。
+// - 検証の失敗はエラー型で返し、一部だけ適用しない (原子的検証・適用)。
+
+pub struct WorkloadDeclaration {
+  workload_id: String,
+  image_digest: String,
+  desired_replicas: Int,
+  spec: ContainerSpec,
+  network_spec: NetworkSpec,
+  health_spec: HealthCheckSpec,
+}
+
+pub struct DeclarationChange {
+  workload_id: String,
+  digest_changed: Bool,
+  old_digest: String,
+  new_digest: String,
+  replicas_changed: Bool,
+  old_replicas: Int,
+  new_replicas: Int,
+  spec_changed: Bool,
+}
+
+pub struct DeclarationDiff {
+  added: List<WorkloadDeclaration>,
+  removed: List<String>,
+  modified: List<DeclarationChange>,
+}
+
+pub struct DeclarationCommit {
+  commit_id: String,
+  parent_commit_id: String,
+  timestamp_ms: Int,
+  author: String,
+  message: String,
+  declarations: List<WorkloadDeclaration>,
+}
+
+pub struct DeclarationRepository {
+  commits: List<DeclarationCommit>,
+  head_commit_id: String,
+}
+
+pub fn new_workload_declaration(workload_id: String, image_digest: String, desired_replicas: Int, spec: ContainerSpec, network_spec: NetworkSpec, health_spec: HealthCheckSpec) -> WorkloadDeclaration
+  intent "WorkloadDeclaration を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return WorkloadDeclaration { workload_id: workload_id, image_digest: image_digest, desired_replicas: desired_replicas, spec: spec, network_spec: network_spec, health_spec: health_spec };
+}
+
+pub fn new_declaration_diff(added: List<WorkloadDeclaration>, removed: List<String>, modified: List<DeclarationChange>) -> DeclarationDiff
+  intent "DeclarationDiff を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return DeclarationDiff { added: added, removed: removed, modified: modified };
+}
+
+pub fn new_declaration_commit(commit_id: String, parent_commit_id: String, timestamp_ms: Int, author: String, message: String, declarations: List<WorkloadDeclaration>) -> DeclarationCommit
+  intent "DeclarationCommit を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return DeclarationCommit { commit_id: commit_id, parent_commit_id: parent_commit_id, timestamp_ms: timestamp_ms, author: author, message: message, declarations: declarations };
+}
+
+pub fn new_declaration_repository() -> DeclarationRepository
+  intent "空の宣言リポジトリを初期化する"
+  requires none
+  ensures none
+  effects none
+{
+  return DeclarationRepository { commits: List.new(), head_commit_id: "" };
+}
+
+fn find_declaration_in_list(decls: &List<WorkloadDeclaration>, workload_id: &String) -> Option<WorkloadDeclaration>
+  intent "リストから指定 workload_id の宣言を検索する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < decls.len() {
+    match decls.get(i) {
+      Some(d) => {
+        if d.workload_id == workload_id {
+          return Some(d.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+pub fn compute_declaration_diff(old_list: &List<WorkloadDeclaration>, new_list: &List<WorkloadDeclaration>) -> DeclarationDiff
+  intent "2 つの宣言一覧の間の差分 (追加・削除・変更) を計算する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut added = List.new();
+  let mut removed = List.new();
+  let mut modified = List.new();
+
+  // 新リストを走査: 追加または変更を検出
+  let mut i = 0;
+  while i < new_list.len() {
+    match new_list.get(i) {
+      Some(new_decl) => {
+        match find_declaration_in_list(&old_list, &new_decl.workload_id) {
+          None => {
+            added.push(new_decl.clone());
+          }
+          Some(old_decl) => {
+            let digest_diff = old_decl.image_digest != new_decl.image_digest;
+            let replicas_diff = old_decl.desired_replicas != new_decl.desired_replicas;
+            let spec_diff = old_decl.spec.image_digest != new_decl.spec.image_digest || old_decl.spec.working_dir != new_decl.spec.working_dir;
+
+            if digest_diff || replicas_diff || spec_diff {
+              modified.push(DeclarationChange { workload_id: new_decl.workload_id.clone(), digest_changed: digest_diff, old_digest: old_decl.image_digest.clone(), new_digest: new_decl.image_digest.clone(), replicas_changed: replicas_diff, old_replicas: old_decl.desired_replicas, new_replicas: new_decl.desired_replicas, spec_changed: spec_diff });
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // 旧リストを走査: 削除を検出
+  let mut j = 0;
+  while j < old_list.len() {
+    match old_list.get(j) {
+      Some(old_decl) => {
+        match find_declaration_in_list(&new_list, &old_decl.workload_id) {
+          None => {
+            removed.push(old_decl.workload_id.clone());
+          }
+          Some(_) => {}
+        }
+      }
+      None => {}
+    }
+    j = j + 1;
+  }
+
+  return new_declaration_diff(added, removed, modified);
+}
+
+pub fn validate_workload_declaration(decl: &WorkloadDeclaration) -> Result<Bool, ContainerError>
+  intent "単一のワークロード宣言がすべてのセキュリティ・仕様・資源制限規則を満たすか検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 識別子形式の検証
+  match validate_network_identifier(&decl.workload_id) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 2. レプリカ数上限
+  if decl.desired_replicas < 0 {
+    return Err(ContainerError.SpecValidation("desired_replicas は 0 以上である必要があります。"));
+  }
+  if decl.desired_replicas > max_replicas() {
+    return Err(ContainerError.LimitExceeded("desired_replicas が上限 (64) を超過しています。"));
+  }
+
+  // 3. コンテナ仕様の検証 (既定拒否・セキュリティ境界・資源上限必須)
+  match validate_spec(&decl.spec) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // ワークロードIDと仕様digestの整合確認
+  if decl.image_digest != decl.spec.image_digest {
+    return Err(ContainerError.SpecValidation("workload の image_digest と container spec の image_digest が一致しません。"));
+  }
+
+  // 4. ネットワーク仕様の検証 (既定拒否・内部アドレス限定・特権ポート拒否)
+  match validate_network_spec(&decl.network_spec) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  return Ok(true);
+}
+
+pub fn validate_declaration_commit(commit: &DeclarationCommit) -> Result<Bool, ContainerError>
+  intent "コミット内のすべての宣言が妥当であるかを適用前に厳格検証する (原子的検証)"
+  requires none
+  ensures none
+  effects none
+{
+  if commit.commit_id.len() == 0 {
+    return Err(ContainerError.SpecValidation("commit_id は空にできません。"));
+  }
+
+  if commit.declarations.len() > max_workload_count() {
+    return Err(ContainerError.LimitExceeded("コミット内のワークロード宣言数が上限 (1024) を超過しています。"));
+  }
+
+  // 重複 workload_id の検査
+  let mut i = 0;
+  while i < commit.declarations.len() {
+    match commit.declarations.get(i) {
+      Some(decl_i) => {
+        let mut j = i + 1;
+        while j < commit.declarations.len() {
+          match commit.declarations.get(j) {
+            Some(decl_j) => {
+              if decl_i.workload_id == decl_j.workload_id {
+                return Err(ContainerError.SpecValidation("同一コミット内で重複する workload_id が宣言されています。"));
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // 各宣言の厳格検証 (1件でも失敗すれば直ちに Err を返し、全体を不適用とする)
+  let mut k = 0;
+  while k < commit.declarations.len() {
+    match commit.declarations.get(k) {
+      Some(decl) => {
+        match validate_workload_declaration(&decl) {
+          Ok(_) => {}
+          Err(e) => {
+            return Err(e);
+          }
+        }
+      }
+      None => {}
+    }
+    k = k + 1;
+  }
+
+  return Ok(true);
+}
+
+pub fn get_head_declarations(repo: &DeclarationRepository) -> List<WorkloadDeclaration>
+  intent "リポジトリの HEAD における最新の宣言一覧を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  if repo.head_commit_id.len() == 0 || repo.commits.len() == 0 {
+    return List.new();
+  }
+  let mut i = 0;
+  while i < repo.commits.len() {
+    match repo.commits.get(i) {
+      Some(c) => {
+        if c.commit_id == repo.head_commit_id {
+          return c.declarations.clone();
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return List.new();
+}
+
+pub fn find_declaration(repo: &DeclarationRepository, workload_id: &String) -> Option<WorkloadDeclaration>
+  intent "HEAD において指定された workload_id の宣言を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  let current_decls = get_head_declarations(&repo);
+  return find_declaration_in_list(&current_decls, &workload_id);
+}
+
+pub fn apply_declaration_commit(repo: &mut DeclarationRepository, commit: DeclarationCommit) -> Result<DeclarationDiff, ContainerError>
+  intent "新しい宣言コミットを適用前に検証し、成功した場合のみ原子的に HEAD を更新して差分を返す"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 履歴保持上限チェック
+  if repo.commits.len() >= max_declaration_commits() {
+    return Err(ContainerError.LimitExceeded("リポジトリのコミット履歴数が上限 (256) に達しています。"));
+  }
+
+  // 2. 適用前の厳格検証: 不正があれば即時拒否し、リポジトリの状態は一切変更しない
+  match validate_declaration_commit(&commit) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 3. 親コミット整合性チェック (初期コミット以外)
+  if repo.head_commit_id.len() > 0 && commit.parent_commit_id != repo.head_commit_id {
+    return Err(ContainerError.StateError("parent_commit_id が現在の HEAD と一致しません (分岐または競合)。"));
+  }
+
+  // 4. 現在の HEAD との差分を計算
+  let current_decls = get_head_declarations(&repo);
+  let diff = compute_declaration_diff(&current_decls, &commit.declarations);
+
+  // 5. 原子的更新: コミットを履歴に追加し HEAD を前進
+  let new_head = commit.commit_id.clone();
+  repo.commits.push(commit);
+  repo.head_commit_id = new_head;
+
+  return Ok(diff);
+}

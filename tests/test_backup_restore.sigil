@@ -1,0 +1,313 @@
+module tests.test_backup_restore
+  targets server
+  trust none
+
+use container.backup.converge_after_restore;
+use container.backup.create_backup;
+use container.backup.new_backup_archive;
+use container.backup.new_backup_manifest;
+use container.backup.restore_backup;
+use container.backup.verify_backup;
+use container.error.ContainerError;
+use container.reconcile_loop.new_model_runtime;
+use container.reconcile_loop.new_state_store;
+use container.reconcile_loop.new_store_entry;
+use container.reconcile_loop.put_workload;
+use container.reconcile_state.disabled_health_check;
+use container.reconcile_state.encode_policy_record;
+use container.reconcile_state.new_policy_record;
+use container.state.encode_workload_record;
+use container.state.new_workload_record;
+
+// ---------------------------------------------------------------------------
+// 1. 整合バックアップの作成とチェックサム完全性テスト
+// ---------------------------------------------------------------------------
+
+fn test_backup_creation_and_integrity() -> Bool
+  intent "バックアップ作成と SHA-256 チェックサムの整合性検証を確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+
+  let wl = new_workload_record("app-1".clone(), "sha256:aaaa".clone(), 1, 1);
+  let wl_bytes_res = encode_workload_record(&wl);
+  let mut wl_bytes = Bytes.new();
+  match wl_bytes_res {
+    Ok(b) => {
+      wl_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let pol = new_policy_record("app-1".clone(), "always".clone(), 3, 1000, disabled_health_check());
+  let pol_bytes_res = encode_policy_record(&pol);
+  let mut pol_bytes = Bytes.new();
+  match pol_bytes_res {
+    Ok(b) => {
+      pol_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  store.entries.push(new_store_entry("workload:app-1".clone(), wl_bytes));
+  store.entries.push(new_store_entry("policy:app-1".clone(), pol_bytes));
+
+  let backup_res = create_backup(&store, "backup-20261121-01".clone(), 1700000000);
+  match backup_res {
+    Ok(archive) => {
+      if archive.manifest.entry_count != 2 || archive.manifest.format_version != 1 {
+        return false;
+      }
+      match verify_backup(&archive) {
+        Ok(valid) => {
+          if !valid {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 2. 改ざん・破損バックアップの拒否テスト
+// ---------------------------------------------------------------------------
+
+fn test_corrupt_backup_rejected() -> Bool
+  intent "チェックサム不一致・エントリ破損・未知バージョンが確実に拒否されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let mut dummy_row = Bytes.new();
+  dummy_row.push(1);
+  dummy_row.push(2);
+  dummy_row.push(3);
+  store.entries.push(new_store_entry("key1".clone(), dummy_row));
+
+  let mut archive = new_backup_archive(new_backup_manifest("".clone(), 0, 0, 0, "".clone()), List.new());
+  match create_backup(&store, "backup-02".clone(), 1700000000) {
+    Ok(a) => {
+      archive = a;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 1. データの改ざん (エントリのバイト列を変更)
+  let mut tampered_row = Bytes.new();
+  tampered_row.push(9);
+  tampered_row.push(9);
+  let mut tampered_entries = List.new();
+  tampered_entries.push(new_store_entry("key1".clone(), tampered_row));
+  archive.entries = tampered_entries;
+
+  match verify_backup(&archive) {
+    Ok(_) => {
+      return false;  // 改ざんされたバックアップは拒否されなければならない
+    }
+    Err(ContainerError.Corrupt(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 未知のバージョン (format_version = 2)
+  archive.manifest.format_version = 2;
+  match verify_backup(&archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.Corrupt(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3. 原子的復元テスト
+// ---------------------------------------------------------------------------
+
+fn test_atomic_restore() -> Bool
+  intent "復元失敗時はターゲットが維持され、成功時は完全に復元されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut source_store = new_state_store();
+  let mut src_row = Bytes.new();
+  src_row.push(42);
+  source_store.entries.push(new_store_entry("src_key".clone(), src_row));
+
+  let mut archive = new_backup_archive(new_backup_manifest("".clone(), 0, 0, 0, "".clone()), List.new());
+  match create_backup(&source_store, "backup-03".clone(), 1700000000) {
+    Ok(a) => {
+      archive = a;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut target_store = new_state_store();
+  let mut initial_row = Bytes.new();
+  initial_row.push(99);
+  target_store.entries.push(new_store_entry("init_key".clone(), initial_row));
+
+  // 正常復元
+  match restore_backup(&mut target_store, &archive) {
+    Ok(count) => {
+      if count != 1 || target_store.entries.len() != 1 {
+        return false;
+      }
+      match target_store.entries.get(0) {
+        Some(e) => {
+          if e.key != "src_key" || e.row.get(0).unwrap_or(0) != 42 {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. 復元後の調整ループによる望ましい状態への収束テスト
+// ---------------------------------------------------------------------------
+
+fn test_convergence_after_restore() -> Bool
+  intent "バックアップから復元した状態から、調整ループが望ましい状態へ収束することを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. バックアップ対象の状態ストア (workload: app-worker, replicas: 1, policy: always)
+  let mut origin_store = new_state_store();
+
+  let valid_digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".clone();
+  let wl = new_workload_record("app-worker".clone(), valid_digest, 1, 1);
+  let pol = new_policy_record("app-worker".clone(), "always".clone(), 3, 1000, disabled_health_check());
+
+  match put_workload(&mut origin_store, &wl, &pol) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut backup = new_backup_archive(new_backup_manifest("".clone(), 0, 0, 0, "".clone()), List.new());
+  match create_backup(&origin_store, "snap-worker".clone(), 1700000000) {
+    Ok(a) => {
+      backup = a;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 新しい空のストアへ復元
+  let mut restored_store = new_state_store();
+  match restore_backup(&mut restored_store, &backup) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 実行環境 (最初はインスタンス 0 件)
+  let mut runtime = new_model_runtime();
+
+  // 4. 復元後の状態から調整ループを実行 (tick 1: create + start = 2 ops)
+  let report_res = converge_after_restore(&mut restored_store, &mut runtime, 1700000000);
+  match report_res {
+    Ok(report) => {
+      // 望ましい状態 (レプリカ 1) に合わせて create と start (計 2 回) が実行されたことを確認
+      if report.failed > 0 || report.executed != 2 {
+        return false;
+      }
+      if runtime.instances.len() != 1 {
+        return false;
+      }
+      match runtime.instances.get(0) {
+        Some(inst) => {
+          if inst.workload_id != "app-worker" || inst.status != "running" {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 5. 調整ループ tick 2: すでに望ましい状態 (running) に収束しているため追加操作なし (冪等性)
+  let report2_res = converge_after_restore(&mut restored_store, &mut runtime, 1700001000);
+  match report2_res {
+    Ok(report2) => {
+      if report2.executed != 0 || report2.failed != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// エントリポイント
+// ---------------------------------------------------------------------------
+
+pub fn run_backup_restore_tests() -> Bool
+  intent "バックアップと復元に関するテストをすべて実行する"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_backup_creation_and_integrity() {
+    return false;
+  }
+  if !test_corrupt_backup_rejected() {
+    return false;
+  }
+  if !test_atomic_restore() {
+    return false;
+  }
+  if !test_convergence_after_restore() {
+    return false;
+  }
+  return true;
+}

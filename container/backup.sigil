@@ -1,0 +1,201 @@
+module container.backup
+  targets server
+  trust none
+
+use container.error.ContainerError;
+use container.reconcile_loop.ModelRuntime;
+use container.reconcile_loop.StateStore;
+use container.reconcile_loop.StoreEntry;
+use container.reconcile_loop.TickReport;
+use container.reconcile_loop.new_store_entry;
+use container.reconcile_loop.reconcile_tick;
+
+// ADR 0053 決定 6 (P5-5): バックアップと復元 (ADR 0045 / P4-1 準拠)
+// - 管理の状態を整合した時点で取り出し、復元する。
+// - チェックサム (SHA-256) による整合性検証、破損・改ざんの拒否。
+// - 復元した状態から調整ループが望ましい状態へ収束すること。
+// - バックアップを元データと同じ秘密として扱い、試験は使い捨てのデータだけを使う。
+
+pub struct BackupManifest {
+  backup_id: String,
+  created_at_ms: Int,
+  format_version: Int,
+  entry_count: Int,
+  checksum_hex: String,
+}
+
+pub struct BackupArchive {
+  manifest: BackupManifest,
+  entries: List<StoreEntry>,
+}
+
+pub fn new_backup_manifest(backup_id: String, created_at_ms: Int, format_version: Int, entry_count: Int, checksum_hex: String) -> BackupManifest
+  intent "BackupManifest を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return BackupManifest { backup_id: backup_id, created_at_ms: created_at_ms, format_version: format_version, entry_count: entry_count, checksum_hex: checksum_hex };
+}
+
+pub fn new_backup_archive(manifest: BackupManifest, entries: List<StoreEntry>) -> BackupArchive
+  intent "BackupArchive を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return BackupArchive { manifest: manifest, entries: entries };
+}
+
+fn hex_char(val: Int) -> Int
+  intent "4 ビット数値を小文字 hex ASCII コードに変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if val < 10 {
+    return 48 + val;
+  }
+  return 97 + (val - 10);
+}
+
+fn bytes_to_hex(b: &Bytes) -> String
+  intent "バイト列を小文字 hex 文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let byte_val = b.get(i).unwrap_or(0);
+    out.push(hex_char(byte_val >> 4 & 15));
+    out.push(hex_char(byte_val & 15));
+    i = i + 1;
+  }
+  return match out.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "",
+  };
+}
+
+pub fn compute_archive_checksum(entries: &List<StoreEntry>) -> String
+  intent "全エントリの内容 (キーとバイト列) から決定論的な SHA-256 チェックサムを計算する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut combined = Bytes.new();
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      Some(entry) => {
+        combined.extend(&entry.key.as_bytes());
+        combined.push(58);  // ':' 区切り
+        combined.extend(&entry.row);
+        combined.push(10);  // '\n' 区切り
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let digest = sha256(&combined);
+  return bytes_to_hex(&digest);
+}
+
+pub fn create_backup(store: &StateStore, backup_id: String, now_ms: Int) -> Result<BackupArchive, ContainerError>
+  intent "整合した時点の状態ストアからバックアップアーカイブを作成する"
+  requires none
+  ensures none
+  effects none
+{
+  if backup_id.len() == 0 {
+    return Err(ContainerError.SpecValidation("backup_id は空にできません。"));
+  }
+
+  // 整合した時点のエントリ一覧を抽出
+  let mut entries_copy = List.new();
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(e) => {
+        entries_copy.push(new_store_entry(e.key.clone(), e.row.clone()));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // 確定点でのチェックサムを計算
+  let checksum = compute_archive_checksum(&entries_copy);
+
+  let manifest = new_backup_manifest(backup_id, now_ms, 1, entries_copy.len(), checksum);
+
+  // format_version = 1
+  return Ok(new_backup_archive(manifest, entries_copy));
+}
+
+pub fn verify_backup(archive: &BackupArchive) -> Result<Bool, ContainerError>
+  intent "バックアップアーカイブの完全性 (バージョン、件数、SHA-256 チェックサム) を厳格検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. バージョン検証 (未知のバージョンは拒否)
+  if archive.manifest.format_version != 1 {
+    return Err(ContainerError.Corrupt("未対応または未知のバックアップ形式バージョンです。"));
+  }
+
+  // 2. エントリ件数の整合性検証
+  if archive.manifest.entry_count != archive.entries.len() {
+    return Err(ContainerError.Corrupt("バックアップマニフェストのエントリ件数と実データ件数が一致しません。"));
+  }
+
+  // 3. SHA-256 チェックサムの再計算と完全一致の検証 (改ざん・破損の排除)
+  let calculated = compute_archive_checksum(&archive.entries);
+  if calculated != archive.manifest.checksum_hex {
+    return Err(ContainerError.Corrupt("バックアップの SHA-256 チェックサム不一致が検出されました (データ破損または改ざん)。"));
+  }
+
+  return Ok(true);
+}
+
+pub fn restore_backup(target_store: &mut StateStore, archive: &BackupArchive) -> Result<Int, ContainerError>
+  intent "検証済みバックアップアーカイブから状態ストアを原子的に復元する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 復元前に完全性を厳格検証 (失敗時はストアに一切触れない)
+  match verify_backup(&archive) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 2. 原子的復元: 既存エントリをすべて消去し、バックアップの内容で完全置換
+  target_store.entries = List.new();
+  let mut i = 0;
+  while i < archive.entries.len() {
+    match archive.entries.get(i) {
+      Some(e) => {
+        target_store.entries.push(new_store_entry(e.key.clone(), e.row.clone()));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  return Ok(target_store.entries.len());
+}
+
+pub fn converge_after_restore(store: &mut StateStore, runtime: &mut ModelRuntime, now_ms: Int) -> Result<TickReport, ContainerError>
+  intent "復元後の状態ストアをもとに調整ループを実行し、望ましい状態へと収束させる"
+  requires none
+  ensures none
+  effects none
+{
+  // 復元された状態ストアと実行環境をもとに調整ループ 1 回分を実行
+  return reconcile_tick(&mut store, &mut runtime, now_ms);
+}
