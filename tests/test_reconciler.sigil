@@ -4,6 +4,7 @@ module tests.test_reconciler
 
 use container.error.error_kind_name;
 use container.limits.max_operation_attempts;
+use container.limits.max_replicas;
 use container.reconcile_loop.ModelRuntime;
 use container.reconcile_loop.StateStore;
 use container.reconcile_loop.count_model_status;
@@ -15,6 +16,7 @@ use container.reconcile_loop.model_instance_count;
 use container.reconcile_loop.model_instance_status;
 use container.reconcile_loop.new_model_runtime;
 use container.reconcile_loop.new_state_store;
+use container.reconcile_loop.new_store_entry;
 use container.reconcile_loop.put_workload;
 use container.reconcile_loop.reconcile_tick;
 use container.reconcile_state.decode_operation_record;
@@ -36,6 +38,9 @@ use container.reconciler.instance_id_for;
 use container.reconciler.int_to_str;
 use container.reconciler.next_health_failures;
 use container.reconciler.should_reconcile;
+use container.state.WorkloadRecord;
+use container.state.decode_workload_record;
+use container.state.encode_workload_record;
 use container.state.new_workload_record;
 
 fn digest() -> String
@@ -798,8 +803,24 @@ fn test_limits_and_validation() -> Int
   // レプリカ数の上限は調整の前に検査される (超過は黙って切り捨てない)
   let mut store = new_state_store();
   let mut rt = new_model_runtime();
-  if !declare(&mut store, &"big", 65, &"no", 0, 0, false) {
-    return 15;
+  // 保存済みの上限超過行を用意し、調整ループ側の検査を確認する。
+  let w = new_workload_record("big", digest(), max_replicas() + 1, 1);
+  let p = new_policy_record("big", "no", 0, 0, disabled_health_check());
+  match encode_workload_record(&w) {
+    Ok(row) => {
+      store.entries.push(new_store_entry("workload:big", row));
+    }
+    Err(_) => {
+      return 15;
+    }
+  }
+  match encode_policy_record(&p) {
+    Ok(row) => {
+      store.entries.push(new_store_entry("policy:big", row));
+    }
+    Err(_) => {
+      return 15;
+    }
   }
   match reconcile_tick(&mut store, &mut rt, 1000) {
     Ok(_) => {
@@ -912,6 +933,93 @@ fn test_record_round_trip() -> Int
   return 0;
 }
 
+fn rejects_workload(w: &WorkloadRecord, expected_error: &String) -> Bool
+  intent "不正なワークロードが期待するエラーで拒否され、行が残らないことを確認する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_state_store();
+  let p = new_policy_record(w.workload_id.clone(), "no", 0, 0, disabled_health_check());
+  return match put_workload(&mut store, &w, &p) {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == expected_error && store.entries.len() == 0,
+  };
+}
+
+pub fn test_put_workload() -> Int
+  intent "書き込み時の入力検証と、成功・失敗時に保存されたワークロードを確認する"
+  requires none
+  ensures none
+  effects none
+{
+  if !rejects_workload(&new_workload_record("Bad", digest(), 1, 1), &"SpecValidation") {
+    return 1;
+  }
+  if !rejects_workload(&new_workload_record("worker", "sha256:invalid", 1, 1), &"SpecValidation") {
+    return 2;
+  }
+  if !rejects_workload(&new_workload_record("worker", digest(), 0 - 1, 1), &"SpecValidation") {
+    return 3;
+  }
+  if !rejects_workload(&new_workload_record("worker", digest(), 1, 0 - 1), &"SpecValidation") {
+    return 4;
+  }
+  if !rejects_workload(&new_workload_record("worker", digest(), max_replicas() + 1, 1), &"LimitExceeded") {
+    return 5;
+  }
+
+  let mut store = new_state_store();
+  let original = new_workload_record("worker", digest(), max_replicas(), 1);
+  let updated = new_workload_record("worker", digest(), 0, 2);
+  let p = new_policy_record("worker", "no", 0, 0, disabled_health_check());
+  match put_workload(&mut store, &original, &p) {
+    Ok(true) => {}
+    _ => {
+      return 6;
+    }
+  }
+  store.fail_commits = true;
+  match put_workload(&mut store, &updated, &p) {
+    Err(e) => {
+      if error_kind_name(&e) != "StateError" {
+        return 7;
+      }
+    }
+    Ok(_) => {
+      return 8;
+    }
+  }
+  if store.entries.len() != 2 {
+    return 9;
+  }
+  // コミットに失敗した更新は読めず、成功した書き込みの値が残る。
+  match store.entries.get(0) {
+    Some(entry) => {
+      if entry.key != "workload:worker" {
+        return 10;
+      }
+      match decode_workload_record(&entry.row) {
+        Ok(saved) => {
+          if saved.workload_id != original.workload_id || saved.image_digest != original.image_digest || saved.desired_replicas != original.desired_replicas || saved.version != original.version {
+            return 11;
+          }
+          if saved.desired_replicas == updated.desired_replicas || saved.version == updated.version {
+            return 12;
+          }
+        }
+        Err(_) => {
+          return 13;
+        }
+      }
+    }
+    None => {
+      return 14;
+    }
+  }
+  return 0;
+}
+
 pub fn run_reconciler_tests() -> Int
   intent "調整ループの試験をすべて実行し、0 で全合格、不合格なら 100 * 試験番号 + 失敗番号を返す"
   requires none
@@ -961,6 +1069,10 @@ pub fn run_reconciler_tests() -> Int
   code = test_record_round_trip();
   if code != 0 {
     return 1100 + code;
+  }
+  code = test_put_workload();
+  if code != 0 {
+    return 1200 + code;
   }
   return 0;
 }

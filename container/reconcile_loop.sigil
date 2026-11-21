@@ -5,6 +5,7 @@ module container.reconcile_loop
 use container.error.ContainerError;
 use container.error.error_message;
 use container.limits.max_operation_attempts;
+use container.limits.max_replicas;
 use container.reconcile_state.OperationRecord;
 use container.reconcile_state.PolicyRecord;
 use container.reconcile_state.RestartStateRecord;
@@ -22,6 +23,8 @@ use container.reconciler.empty_tick_plan;
 use container.reconciler.new_declaration;
 use container.reconciler.new_observed;
 use container.reconciler.plan_tick;
+use container.spec.is_valid_sha256_digest;
+use container.spec.validate_network_identifier;
 use container.state.WorkloadRecord;
 use container.state.decode_workload_record;
 use container.state.encode_workload_record;
@@ -203,15 +206,31 @@ pub fn store_commit(store: &mut StateStore, puts: &List<StoreEntry>, deletes: &L
 }
 
 pub fn put_workload(store: &mut StateStore, w: &WorkloadRecord, policy: &PolicyRecord) -> Result<Bool, ContainerError>
-  intent "望ましい状態 (ワークロードと宣言ポリシー) を 1 トランザクションで保存する"
+  intent "ワークロードを検証し、宣言ポリシーとともに保存してワークロードを読み戻す"
   requires none
   ensures none
   effects none
 {
+  match validate_network_identifier(&w.workload_id) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  if !is_valid_sha256_digest(&w.image_digest) {
+    return Err(ContainerError.SpecValidation("イメージ digest の形式が不正です。"));
+  }
+  if w.desired_replicas < 0 || w.version < 0 {
+    return Err(ContainerError.SpecValidation("レプリカ数とワークロードの版は 0 以上である必要があります。"));
+  }
+  if w.desired_replicas > max_replicas() {
+    return Err(ContainerError.LimitExceeded("レプリカ数が上限を超過しています。"));
+  }
+  let key = concat2(&"workload:", &w.workload_id);
   let mut puts = List.new();
   match crate_encode_workload(&w) {
     Ok(b) => {
-      puts.push(StoreEntry { key: concat2(&"workload:", &w.workload_id), row: b });
+      puts.push(StoreEntry { key: key.clone(), row: b });
     }
     Err(e) => {
       return Err(e);
@@ -225,7 +244,38 @@ pub fn put_workload(store: &mut StateStore, w: &WorkloadRecord, policy: &PolicyR
       return Err(e);
     }
   }
-  return store_commit(&mut store, &puts, &List.new());
+  match store_commit(&mut store, &puts, &List.new()) {
+    Ok(true) => {}
+    Ok(false) => {
+      return Err(ContainerError.StateError("ワークロードの保存に失敗しました。"));
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  let mut i = 0;
+  while i < store.entries.len() {
+    match store.entries.get(i) {
+      Some(entry) => {
+        if entry.key == key {
+          match decode_workload_record(&entry.row) {
+            Ok(saved) => {
+              if saved.workload_id == w.workload_id && saved.image_digest == w.image_digest && saved.desired_replicas == w.desired_replicas && saved.version == w.version {
+                return Ok(true);
+              }
+              return Err(ContainerError.StateError("保存したワークロードが書き込み内容と一致しません。"));
+            }
+            Err(e) => {
+              return Err(e);
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(ContainerError.StateError("保存したワークロードを読み戻せませんでした。"));
 }
 
 fn crate_encode_workload(w: &WorkloadRecord) -> Result<Bytes, ContainerError>
