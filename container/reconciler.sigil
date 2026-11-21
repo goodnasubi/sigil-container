@@ -331,7 +331,7 @@ fn workload_of(observed: &List<Observed>, id: &String) -> String
     return out;
   }
   let bytes = id.as_bytes();
-  let mut end = bytes.len();
+  let mut end = bytes.byte_len();
   while end > 0 && bytes.get(end - 1).unwrap_or(0) != 45 {
     end = end - 1;
   }

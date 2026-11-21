@@ -18,8 +18,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
-  # P5-1（PR #2）のコードはこの版のローカルビルドで test.sh 全量の通過を確認済み。
-  SIGIL_REF: 97e22263d5fe2fbf390e4a38c66e4c38388b904a
+  # ADR 0055 第2段以降の版（Issue #26）。
+  SIGIL_REF: a2298a3c0eebda28c7350a0442383823719a3a41
 
 jobs:
   # 変更検出（sigil 本体 Issue #562 項目1、sigil-db と同じ役割）。

@@ -591,7 +591,7 @@ pub fn validate_declaration_commit(commit: &DeclarationCommit) -> Result<Bool, C
   ensures none
   effects none
 {
-  if commit.commit_id.len() == 0 {
+  if commit.commit_id.byte_len() == 0 {
     return Err(ContainerError.SpecValidation("commit_id は空にできません。".clone()));
   }
 
@@ -648,7 +648,7 @@ pub fn get_head_declarations(repo: &DeclarationRepository) -> List<WorkloadDecla
   ensures none
   effects none
 {
-  if repo.head_commit_id.len() == 0 || repo.commits.len() == 0 {
+  if repo.head_commit_id.byte_len() == 0 || repo.commits.len() == 0 {
     return List.new();
   }
   let mut i = 0;
@@ -706,9 +706,9 @@ pub fn apply_declaration_commit(repo: &mut DeclarationRepository, commit: Declar
   }
 
   // 3. 親コミット整合性チェック
-  if repo.head_commit_id.len() == 0 {
+  if repo.head_commit_id.byte_len() == 0 {
     // 初回コミットは parent_commit_id が空でなければならない
-    if commit.parent_commit_id.len() != 0 {
+    if commit.parent_commit_id.byte_len() != 0 {
       return Err(ContainerError.StateError("初回コミットの parent_commit_id は空文字列である必要があります。".clone()));
     }
   } else {

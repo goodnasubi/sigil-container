@@ -126,11 +126,11 @@ fn starts_with(s: &String, prefix: &String) -> Bool
 {
   let sb = s.as_bytes();
   let pb = prefix.as_bytes();
-  if sb.len() < pb.len() {
+  if sb.byte_len() < pb.byte_len() {
     return false;
   }
   let mut i = 0;
-  while i < pb.len() {
+  while i < pb.byte_len() {
     if sb.get(i).unwrap_or(0) != pb.get(i).unwrap_or(0) {
       return false;
     }

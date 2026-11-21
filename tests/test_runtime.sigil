@@ -211,7 +211,7 @@ pub fn run_runtime_tests() -> Bool
       return false;
     }
   }
-  if log_buf.current_bytes != normal_chunk.len() {
+  if log_buf.current_bytes != normal_chunk.byte_len() {
     return false;
   }
 
@@ -294,7 +294,7 @@ pub fn run_runtime_tests() -> Bool
 
   // 7. 隔離境界告知文の検証
   let notice = runtime_isolation_notice();
-  if notice.len() == 0 {
+  if notice.byte_len() == 0 {
     return false;
   }
 
@@ -309,7 +309,7 @@ pub fn run_runtime_tests() -> Bool
       return false;
     }
   }
-  if rt_key.len() == 0 {
+  if rt_key.byte_len() == 0 {
     return false;
   }
 

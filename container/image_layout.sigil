@@ -107,12 +107,12 @@ pub fn validate_path(path: &String) -> Result<Bool, ContainerError>
   effects none
 {
   let bytes = path.as_bytes();
-  if bytes.len() == 0 {
+  if bytes.byte_len() == 0 {
     return Err(ContainerError.LayerValidation("パスが空です。"));
   }
 
   // 1. パス長上限
-  if bytes.len() > max_path_length() {
+  if bytes.byte_len() > max_path_length() {
     return Err(ContainerError.LimitExceeded("パス長が上限 (256 byte) を超過しています。"));
   }
 
@@ -126,9 +126,9 @@ pub fn validate_path(path: &String) -> Result<Bool, ContainerError>
   let mut i = 0;
   let mut segment_start = 0;
 
-  while i <= bytes.len() {
+  while i <= bytes.byte_len() {
     let mut is_delim = false;
-    if i == bytes.len() {
+    if i == bytes.byte_len() {
       is_delim = true;
     } else {
       if bytes.get(i).unwrap_or(0) == 47 {
@@ -172,7 +172,7 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
   ensures none
   effects none
 {
-  if header.len() != 512 {
+  if header.byte_len() != 512 {
     return Err(ContainerError.Corrupt("Tar ヘッダのサイズが 512 バイトではありません。"));
   }
 
@@ -263,7 +263,7 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
     }
   }
   let mut full_path = name_part.clone();
-  if prefix_part.len() > 0 {
+  if prefix_part.byte_len() > 0 {
     let mut p_buf = Bytes.new();
     p_buf.extend(&prefix_part.as_bytes());
     p_buf.push(47);  // '/'
@@ -291,7 +291,7 @@ pub fn inspect_tar_header(header: &Bytes) -> Result<TarEntry, ContainerError>
   // これにより、非ゼロサイズを持つレガシーディレクトリエントリが通常ファイルとして扱われ、
   // 後続の悪意あるヘッダがペイロードとしてスキップされる迂回を防ぐ。
   let path_bytes = full_path.as_bytes();
-  if (typeflag == 0 || typeflag == 48) && path_bytes.len() > 0 && path_bytes.get(path_bytes.len() - 1).unwrap_or(0) == 47 {
+  if (typeflag == 0 || typeflag == 48) && path_bytes.byte_len() > 0 && path_bytes.get(path_bytes.byte_len() - 1).unwrap_or(0) == 47 {
     typeflag = 53;
   }
 
@@ -350,13 +350,13 @@ pub fn validate_tar_archive(tar_bytes: &Bytes) -> Result<Int, ContainerError>
   ensures none
   effects none
 {
-  if tar_bytes.len() < 512 {
+  if tar_bytes.byte_len() < 512 {
     return Err(ContainerError.Corrupt("アーカイブが不正です: 1 ヘッダ (512 バイト) 未満の入力です。"));
   }
-  if tar_bytes.len() % 512 != 0 {
+  if tar_bytes.byte_len() % 512 != 0 {
     return Err(ContainerError.Corrupt("アーカイブのサイズが 512 バイト境界に揃っていません (不完全な末尾ヘッダまたは断片)。"));
   }
-  if tar_bytes.len() > max_layer_size() {
+  if tar_bytes.byte_len() > max_layer_size() {
     return Err(ContainerError.LimitExceeded("層のサイズが最大容量 (1 GiB) を超過しています。"));
   }
 
@@ -365,7 +365,7 @@ pub fn validate_tar_archive(tar_bytes: &Bytes) -> Result<Int, ContainerError>
   let mut total_unpacked_size = 0;
   let mut reached_end = false;
 
-  while offset + 512 <= tar_bytes.len() && !reached_end {
+  while offset + 512 <= tar_bytes.byte_len() && !reached_end {
     let header_slice = tar_bytes.slice(offset, offset + 512).unwrap_or(Bytes.new());
     let mut entry = TarEntry { path: "", size: 0, typeflag: 0, linkname: "" };
     match inspect_tar_header(&header_slice) {
@@ -396,7 +396,7 @@ pub fn validate_tar_archive(tar_bytes: &Bytes) -> Result<Int, ContainerError>
       let content_blocks = (entry.size + 511) / 512;
       let payload_size = content_blocks * 512;
       let next_offset = offset + 512 + payload_size;
-      if next_offset > tar_bytes.len() {
+      if next_offset > tar_bytes.byte_len() {
         return Err(ContainerError.Corrupt("アーカイブが途中で切り詰められています: ペイロードがアーカイブ境界を超過しています。"));
       }
       offset = next_offset;
@@ -406,13 +406,13 @@ pub fn validate_tar_archive(tar_bytes: &Bytes) -> Result<Int, ContainerError>
   // 終端マーカー以降の検査: 残りブロックがある場合はすべて 0 でなければならない
   if reached_end {
     let mut rem_i = offset;
-    while rem_i < tar_bytes.len() {
+    while rem_i < tar_bytes.byte_len() {
       if tar_bytes.get(rem_i).unwrap_or(0) != 0 {
         return Err(ContainerError.Corrupt("終端マーカーの後に不正なデータが存在します。"));
       }
       rem_i = rem_i + 1;
     }
-  } else if offset < tar_bytes.len() {
+  } else if offset < tar_bytes.byte_len() {
     return Err(ContainerError.Corrupt("アーカイブに不完全な末尾ヘッダが存在します。"));
   }
 

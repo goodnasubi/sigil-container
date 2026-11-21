@@ -751,7 +751,7 @@ fn test_state_persistence() -> Bool
   let key_res = encode_endpoint_key(&rec.instance_id);
   match key_res {
     Ok(k) => {
-      if k.len() == 0 {
+      if k.byte_len() == 0 {
         return false;
       }
     }

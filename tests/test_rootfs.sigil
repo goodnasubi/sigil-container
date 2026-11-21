@@ -24,7 +24,7 @@ fn create_tar_header_raw_for_test(name: &String, size: Int, mode_str: &String, t
   let name_bytes = name.as_bytes();
   let mut i = 0;
   while i < 100 {
-    if i < name_bytes.len() {
+    if i < name_bytes.byte_len() {
       bytes.push(name_bytes.get(i).unwrap_or(0));
     } else {
       bytes.push(0);
@@ -197,11 +197,11 @@ fn bytes_equal(a: &Bytes, b: &Bytes) -> Bool
   ensures none
   effects none
 {
-  if a.len() != b.len() {
+  if a.byte_len() != b.byte_len() {
     return false;
   }
   let mut i = 0;
-  while i < a.len() {
+  while i < a.byte_len() {
     if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
       return false;
     }
@@ -337,7 +337,7 @@ fn mode_parses_to_for_test(name: &String, elf: &Bytes, dest: &String, mode_str: 
   let mut tar = Bytes.new();
   tar.extend(&hdr);
   tar.extend(&elf);
-  let mut i = elf.len();
+  let mut i = elf.byte_len();
   while i < 512 {
     tar.push(0);
     i = i + 1;
@@ -405,7 +405,7 @@ pub fn run_rootfs_tests() -> Bool
   // 結合テスト: manifest の entry.payload が元のペイロードと一致し payload 長が size と等しいことを検証
   match manifest.entries.get(0) {
     Some(e) => {
-      if e.payload.len() != e.size || e.size != 120 {
+      if e.payload.byte_len() != e.size || e.size != 120 {
         return false;
       }
       if !bytes_equal(&e.payload, &valid_elf) {
@@ -635,7 +635,7 @@ pub fn run_rootfs_tests() -> Bool
       return false;
     }
   }
-  if key_bytes.len() == 0 {
+  if key_bytes.byte_len() == 0 {
     return false;
   }
 
@@ -856,7 +856,7 @@ pub fn run_rootfs_tests() -> Bool
   let mut bad_uid_tar = Bytes.new();
   bad_uid_tar.extend(&bad_uid_hdr);
   bad_uid_tar.extend(&valid_elf);
-  i = valid_elf.len();
+  i = valid_elf.byte_len();
   while i < 512 {
     bad_uid_tar.push(0);
     i = i + 1;
@@ -878,7 +878,7 @@ pub fn run_rootfs_tests() -> Bool
   let mut bad_gid_tar = Bytes.new();
   bad_gid_tar.extend(&bad_gid_hdr);
   bad_gid_tar.extend(&valid_elf);
-  i = valid_elf.len();
+  i = valid_elf.byte_len();
   while i < 512 {
     bad_gid_tar.push(0);
     i = i + 1;
@@ -900,7 +900,7 @@ pub fn run_rootfs_tests() -> Bool
   let mut zero_id_tar = Bytes.new();
   zero_id_tar.extend(&zero_id_hdr);
   zero_id_tar.extend(&valid_elf);
-  i = valid_elf.len();
+  i = valid_elf.byte_len();
   while i < 512 {
     zero_id_tar.push(0);
     i = i + 1;
@@ -929,7 +929,7 @@ pub fn run_rootfs_tests() -> Bool
   let mut nonzero_id_tar = Bytes.new();
   nonzero_id_tar.extend(&nonzero_id_hdr);
   nonzero_id_tar.extend(&valid_elf);
-  i = valid_elf.len();
+  i = valid_elf.byte_len();
   while i < 512 {
     nonzero_id_tar.push(0);
     i = i + 1;
@@ -959,7 +959,7 @@ pub fn run_rootfs_tests() -> Bool
   let mut bad_mode_tar = Bytes.new();
   bad_mode_tar.extend(&bad_mode_hdr);
   bad_mode_tar.extend(&valid_elf);
-  i = valid_elf.len();
+  i = valid_elf.byte_len();
   while i < 512 {
     bad_mode_tar.push(0);
     i = i + 1;

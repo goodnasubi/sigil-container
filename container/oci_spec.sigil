@@ -64,7 +64,7 @@ pub fn append_raw_escaped(buf: &mut Bytes, s: &String)
 {
   let bytes = s.as_bytes();
   let mut i = 0;
-  while i < bytes.len() {
+  while i < bytes.byte_len() {
     let b = bytes.get(i).unwrap_or(0);
     if b == 34 {
       buf.push(92);  // '\'

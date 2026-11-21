@@ -20,18 +20,18 @@ fn bytes_contains(haystack: &Bytes, needle: &Bytes) -> Bool
   ensures none
   effects none
 {
-  if needle.len() == 0 {
+  if needle.byte_len() == 0 {
     return true;
   }
-  if haystack.len() < needle.len() {
+  if haystack.byte_len() < needle.byte_len() {
     return false;
   }
-  let max_start = haystack.len() - needle.len();
+  let max_start = haystack.byte_len() - needle.byte_len();
   let mut i = 0;
   while i <= max_start {
     let mut matched = true;
     let mut j = 0;
-    while j < needle.len() && matched {
+    while j < needle.byte_len() && matched {
       let b_h = haystack.get(i + j).unwrap_or(0);
       let b_n = needle.get(j).unwrap_or(0);
       if b_h != b_n {
@@ -112,7 +112,7 @@ pub fn run_bundle_tests() -> Bool
   }
 
   // 必須キーの含有確認
-  if json1.len() == 0 {
+  if json1.byte_len() == 0 {
     return false;
   }
 
@@ -242,7 +242,7 @@ pub fn run_bundle_tests() -> Bool
   let mut over_limit_spec = create_sample_spec();
   let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";  // 64 bytes
   let mut large_buf = Bytes.new();
-  while large_buf.len() < 66000 {
+  while large_buf.byte_len() < 66000 {
     large_buf.extend(&chunk.as_bytes());
   }
   let large_str = match large_buf.to_string_utf8() {
