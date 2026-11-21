@@ -2,7 +2,6 @@ module tests.test_admin_api
   targets server
   trust none
 
-use container.admin.create_test_bearer_token;
 use container.admin.grant_permission;
 use container.admin.handle_admin_request;
 use container.admin.new_acl_rule;
@@ -10,11 +9,15 @@ use container.admin.new_acl_store;
 use container.admin.new_admin_request;
 use container.admin.new_admin_service;
 use container.admin.revoke_permission;
+use container.limits.max_admin_token_size;
 use container.limits.max_concurrent_operations;
 use container.limits.max_spec_size;
 use container.state.new_workload_record;
 
-// テスト用の使い捨て 32 バイト鍵 (製品鍵や環境変数ではない)
+// ---------------------------------------------------------------------------
+// テスト用の使い捨て 32 バイト鍵およびトークン生成ヘルパー (本番コードから分離)
+// ---------------------------------------------------------------------------
+
 fn test_signing_key() -> Secret
   intent "試験用の固定使い捨て鍵を返す (32 バイト)"
   requires none
@@ -41,16 +44,113 @@ fn concat_str(s1: &String, s2: &String) -> String
   buf.extend(&s2.as_bytes());
   return match buf.to_string_utf8() {
     Ok(s) => s,
-    Err(_) => "",
+    Err(_) => "".clone(),
   };
 }
 
+fn push_u64_be(buf: &mut Bytes, val: Int)
+  intent "符号なし 64 ビット整数を Big-Endian で追加する"
+  requires none
+  ensures none
+  effects none
+{
+  buf.push(val >> 56 & 255);
+  buf.push(val >> 48 & 255);
+  buf.push(val >> 40 & 255);
+  buf.push(val >> 32 & 255);
+  buf.push(val >> 24 & 255);
+  buf.push(val >> 16 & 255);
+  buf.push(val >> 8 & 255);
+  buf.push(val & 255);
+}
+
+fn push_u16_be(buf: &mut Bytes, val: Int)
+  intent "符号なし 16 ビット整数を Big-Endian で追加する"
+  requires none
+  ensures none
+  effects none
+{
+  buf.push(val >> 8 & 255);
+  buf.push(val & 255);
+}
+
+fn encode_base64url(data: &Bytes) -> String
+  intent "バイト列を RFC 4648 base64url (パディングなし正規形) に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < data.len() {
+    let b0 = data.get(i).unwrap_or(0);
+    let mut b1 = 0;
+    if i + 1 < data.len() {
+      b1 = data.get(i + 1).unwrap_or(0);
+    }
+    let mut b2 = 0;
+    if i + 2 < data.len() {
+      b2 = data.get(i + 2).unwrap_or(0);
+    }
+
+    let rem = data.len() - i;
+    if rem >= 3 {
+      out.push(table.get(b0 >> 2 & 63).unwrap_or(0));
+      out.push(table.get((b0 & 3) << 4 | b1 >> 4 & 15).unwrap_or(0));
+      out.push(table.get((b1 & 15) << 2 | b2 >> 6 & 3).unwrap_or(0));
+      out.push(table.get(b2 & 63).unwrap_or(0));
+      i = i + 3;
+    } else if rem == 2 {
+      out.push(table.get(b0 >> 2 & 63).unwrap_or(0));
+      out.push(table.get((b0 & 3) << 4 | b1 >> 4 & 15).unwrap_or(0));
+      out.push(table.get((b1 & 15) << 2).unwrap_or(0));
+      i = i + 2;
+    } else {
+      out.push(table.get(b0 >> 2 & 63).unwrap_or(0));
+      out.push(table.get((b0 & 3) << 4).unwrap_or(0));
+      i = i + 1;
+    }
+  }
+  return match out.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "".clone(),
+  };
+}
+
+fn create_test_bearer_token(key: &Secret, audience: &String, subject: &String, iat: Int, exp: Int) -> String
+  intent "ADR 0037 形式に完全準拠した試験用署名付きトークンを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload_bytes = Bytes.new();
+  push_u64_be(&mut payload_bytes, iat);
+  push_u64_be(&mut payload_bytes, exp);
+  push_u16_be(&mut payload_bytes, audience.len());
+  payload_bytes.extend(&audience.as_bytes());
+  push_u16_be(&mut payload_bytes, subject.len());
+  payload_bytes.extend(&subject.as_bytes());
+
+  let payload_b64 = encode_base64url(&payload_bytes);
+  let prefix = "sigil1.".clone();
+  let signed_str = concat_str(&prefix, &payload_b64);
+
+  let tag_secret = hmac_sha256(&key, &signed_str.as_bytes());
+  let tag_bytes = tag_secret.expose();
+  let tag_b64 = encode_base64url(&tag_bytes);
+
+  let dot = ".".clone();
+  let token = concat_str(&signed_str, &concat_str(&dot, &tag_b64));
+  return token;
+}
+
 // ---------------------------------------------------------------------------
-// 1. ADR 0037 HMAC ベアラー認証否定試験
+// 1. ADR 0037 HMAC ベアラー認証否定試験 (トークン長超過を含む)
 // ---------------------------------------------------------------------------
 
 fn test_auth_negative_cases() -> Bool
-  intent "未認証・不正トークン・期限切れ・audience 不一致がすべて固定 401 で拒否されることを検証する"
+  intent "未認証・不正トークン・期限切れ・未来発行・audience 不一致・偽造署名・トークン長超過がすべて固定 401 で拒否されることを検証する"
   requires none
   ensures none
   effects none
@@ -118,6 +218,25 @@ fn test_auth_negative_cases() -> Bool
     return false;
   }
 
+  // (7) トークン長上限超過 (1,024 byte 超過)
+  let mut huge_token_bytes = Bytes.new();
+  let mut k = 0;
+  let max_len = max_admin_token_size();
+  while k < max_len + 50 {
+    huge_token_bytes.push(97);  // 'a'
+    k = k + 1;
+  }
+  let huge_token_str = match huge_token_bytes.to_string_utf8() {
+    Ok(s) => s,
+    Err(_) => "".clone(),
+  };
+  let auth_huge = concat_str(&"Bearer ".clone(), &huge_token_str);
+  let req_huge = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_huge, Bytes.new(), now);
+  let resp7 = handle_admin_request(&mut service, &req_huge);
+  if resp7.status_code != 401 || resp7.body != "unauthorized" {
+    return false;
+  }
+
   return true;
 }
 
@@ -137,18 +256,18 @@ fn test_authz_negative_and_existence_hiding() -> Bool
 
   let mut service = new_admin_service(key, aud.clone(), new_acl_store());
 
-  // サービスに秘密のワークロード "secret-db" を登録しておく
-  service.workloads.push(new_workload_record("secret-db".clone(), "sha256:secret123".clone(), 1, 1));
+  // サービスに秘密のワークロード "sec-db" を登録しておく
+  service.workloads.push(new_workload_record("sec-db".clone(), "sha256:secret123".clone(), 1, 1));
 
   // 攻撃者/一般ユーザー "user:bob" の有効なトークンを作成
   let token_bob = create_test_bearer_token(&test_signing_key(), &aud, &"user:bob".clone(), now, now + 3600);
   let auth_bob = concat_str(&"Bearer ".clone(), &token_bob);
 
-  // bob は "other-app" の status 権限しか持っていない
-  grant_permission(&mut service.acl, new_acl_rule("user:bob".clone(), "status".clone(), "other-app".clone()));
+  // bob は "other" の status 権限しか持っていない
+  grant_permission(&mut service.acl, new_acl_rule("user:bob".clone(), "status".clone(), "other".clone()));
 
-  // bob が "secret-db" の status を取得しようとする
-  let req_sniff = new_admin_request("GET".clone(), "/api/v1/workloads/secret-db/status".clone(), auth_bob.clone(), Bytes.new(), now);
+  // bob が "sec-db" の status を取得しようとする
+  let req_sniff = new_admin_request("GET".clone(), "/api/v1/workloads/sec-db/status".clone(), auth_bob.clone(), Bytes.new(), now);
   let resp_sniff = handle_admin_request(&mut service, &req_sniff);
 
   // 重要: 403 Forbidden ではなく 404 Not Found で存在を秘匿する！
@@ -156,15 +275,15 @@ fn test_authz_negative_and_existence_hiding() -> Bool
     return false;
   }
 
-  // bob が "secret-db" を停止 (stop) しようとする
-  let req_stop = new_admin_request("POST".clone(), "/api/v1/workloads/secret-db/stop".clone(), auth_bob.clone(), Bytes.new(), now);
+  // bob が "sec-db" を停止 (stop) しようとする
+  let req_stop = new_admin_request("POST".clone(), "/api/v1/workloads/sec-db/stop".clone(), auth_bob.clone(), Bytes.new(), now);
   let resp_stop = handle_admin_request(&mut service, &req_stop);
   if resp_stop.status_code != 404 || resp_stop.body != "not found" {
     return false;
   }
 
-  // bob が "secret-db" を削除 (delete) しようとする
-  let req_del = new_admin_request("DELETE".clone(), "/api/v1/workloads/secret-db".clone(), auth_bob.clone(), Bytes.new(), now);
+  // bob が "sec-db" を削除 (delete) しようとする
+  let req_del = new_admin_request("DELETE".clone(), "/api/v1/workloads/sec-db".clone(), auth_bob.clone(), Bytes.new(), now);
   let resp_del = handle_admin_request(&mut service, &req_del);
   if resp_del.status_code != 404 || resp_del.body != "not found" {
     return false;
@@ -188,12 +307,12 @@ fn test_permission_change_takes_effect_immediately() -> Bool
   let now = 1700000000;
 
   let mut service = new_admin_service(key, aud.clone(), new_acl_store());
-  service.workloads.push(new_workload_record("web-frontend".clone(), "sha256:web123".clone(), 1, 1));
+  service.workloads.push(new_workload_record("web-fe".clone(), "sha256:web123".clone(), 1, 1));
 
   let token_charlie = create_test_bearer_token(&test_signing_key(), &aud, &"user:charlie".clone(), now, now + 3600);
   let auth_charlie = concat_str(&"Bearer ".clone(), &token_charlie);
 
-  let req = new_admin_request("GET".clone(), "/api/v1/workloads/web-frontend/status".clone(), auth_charlie.clone(), Bytes.new(), now);
+  let req = new_admin_request("GET".clone(), "/api/v1/workloads/web-fe/status".clone(), auth_charlie.clone(), Bytes.new(), now);
 
   // 1. 最初は権限なし -> 404 Not Found
   let resp1 = handle_admin_request(&mut service, &req);
@@ -202,7 +321,7 @@ fn test_permission_change_takes_effect_immediately() -> Bool
   }
 
   // 2. 権限を付与 (grant)
-  grant_permission(&mut service.acl, new_acl_rule("user:charlie".clone(), "status".clone(), "web-frontend".clone()));
+  grant_permission(&mut service.acl, new_acl_rule("user:charlie".clone(), "status".clone(), "web-fe".clone()));
 
   // 3. 直後の同一要求で 200 OK が返ることを確認
   let resp2 = handle_admin_request(&mut service, &req);
@@ -211,7 +330,7 @@ fn test_permission_change_takes_effect_immediately() -> Bool
   }
 
   // 4. 権限を剥奪 (revoke)
-  revoke_permission(&mut service.acl, &"user:charlie".clone(), &"status".clone(), &"web-frontend".clone());
+  revoke_permission(&mut service.acl, &"user:charlie".clone(), &"status".clone(), &"web-fe".clone());
 
   // 5. 直後の同一要求で再び 404 Not Found になることを確認
   let resp3 = handle_admin_request(&mut service, &req);
@@ -223,11 +342,11 @@ fn test_permission_change_takes_effect_immediately() -> Bool
 }
 
 // ---------------------------------------------------------------------------
-// 4. 管理操作の正常系テスト (作成・起動・停止・削除・状態・ログ)
+// 4. 管理操作の正常系および不正識別子・重複拒否テスト
 // ---------------------------------------------------------------------------
 
 fn test_admin_operations_crud() -> Bool
-  intent "管理操作 (create, start, stop, delete, status, logs) の完全な一連の流れを検証する"
+  intent "管理操作 (create, start, stop, delete, status, logs) の完全な一連の流れと不正値・重複拒否を検証する"
   requires none
   ensures none
   effects none
@@ -244,36 +363,68 @@ fn test_admin_operations_crud() -> Bool
   let token_admin = create_test_bearer_token(&test_signing_key(), &aud, &"admin".clone(), now, now + 3600);
   let auth_admin = concat_str(&"Bearer ".clone(), &token_admin);
 
-  // 1. 作成 (create): POST /api/v1/workloads
-  let create_req = new_admin_request("POST".clone(), "/api/v1/workloads".clone(), auth_admin.clone(), "my-service".clone().as_bytes(), now);
+  // (A) 不正な識別子形式 (空文字、*、a/b 等) での作成拒否 (400)
+  let bad_create1 = new_admin_request("POST".clone(), "/api/v1/workloads".clone(), auth_admin.clone(), "".clone().as_bytes(), now);
+  let bad_resp1 = handle_admin_request(&mut service, &bad_create1);
+  if bad_resp1.status_code != 400 {
+    return false;
+  }
+
+  let bad_create2 = new_admin_request("POST".clone(), "/api/v1/workloads".clone(), auth_admin.clone(), "*".clone().as_bytes(), now);
+  let bad_resp2 = handle_admin_request(&mut service, &bad_create2);
+  if bad_resp2.status_code != 400 {
+    return false;
+  }
+
+  let bad_create3 = new_admin_request("POST".clone(), "/api/v1/workloads".clone(), auth_admin.clone(), "a/b".clone().as_bytes(), now);
+  let bad_resp3 = handle_admin_request(&mut service, &bad_create3);
+  if bad_resp3.status_code != 400 {
+    return false;
+  }
+
+  // (B) 正常な作成 (create): POST /api/v1/workloads (workload_id は 1〜8 文字の英小文字・数字・ハイフン)
+  let create_req = new_admin_request("POST".clone(), "/api/v1/workloads".clone(), auth_admin.clone(), "my-app".clone().as_bytes(), now);
   let create_resp = handle_admin_request(&mut service, &create_req);
   if create_resp.status_code != 201 {
     return false;
   }
 
-  // 2. 状態取得 (status): GET /api/v1/workloads/my-service/status
-  let status_req = new_admin_request("GET".clone(), "/api/v1/workloads/my-service/status".clone(), auth_admin.clone(), Bytes.new(), now);
+  // (C) 同名ワークロードの重複作成拒否 (400)
+  let dup_create_resp = handle_admin_request(&mut service, &create_req);
+  if dup_create_resp.status_code != 400 {
+    return false;
+  }
+
+  // (D) 不正な多重スラッシュ経路 (/api/v1/workloads/a/b/start) の拒否 (404)
+  let multi_slash_req = new_admin_request("POST".clone(), "/api/v1/workloads/my-app/extra/start".clone(), auth_admin.clone(), Bytes.new(), now);
+  let multi_slash_resp = handle_admin_request(&mut service, &multi_slash_req);
+  if multi_slash_resp.status_code != 404 {
+    return false;
+  }
+
+  // 2. 状態取得 (status): GET /api/v1/workloads/my-app/status
+  let status_req = new_admin_request("GET".clone(), "/api/v1/workloads/my-app/status".clone(), auth_admin.clone(), Bytes.new(), now);
   let status_resp = handle_admin_request(&mut service, &status_req);
   if status_resp.status_code != 200 {
     return false;
   }
 
-  // 3. 起動 (start): POST /api/v1/workloads/my-service/start
-  let start_req = new_admin_request("POST".clone(), "/api/v1/workloads/my-service/start".clone(), auth_admin.clone(), Bytes.new(), now);
+  // 3. 起動 (start): POST /api/v1/workloads/my-app/start
+  let start_req = new_admin_request("POST".clone(), "/api/v1/workloads/my-app/start".clone(), auth_admin.clone(), Bytes.new(), now);
   let start_resp = handle_admin_request(&mut service, &start_req);
   if start_resp.status_code != 200 {
     return false;
   }
 
-  // 4. 停止 (stop): POST /api/v1/workloads/my-service/stop
-  let stop_req = new_admin_request("POST".clone(), "/api/v1/workloads/my-service/stop".clone(), auth_admin.clone(), Bytes.new(), now);
+  // 4. 停止 (stop): POST /api/v1/workloads/my-app/stop
+  let stop_req = new_admin_request("POST".clone(), "/api/v1/workloads/my-app/stop".clone(), auth_admin.clone(), Bytes.new(), now);
   let stop_resp = handle_admin_request(&mut service, &stop_req);
   if stop_resp.status_code != 200 {
     return false;
   }
 
-  // 5. 削除 (delete): DELETE /api/v1/workloads/my-service
-  let del_req = new_admin_request("DELETE".clone(), "/api/v1/workloads/my-service".clone(), auth_admin.clone(), Bytes.new(), now);
+  // 5. 削除 (delete): DELETE /api/v1/workloads/my-app
+  let del_req = new_admin_request("DELETE".clone(), "/api/v1/workloads/my-app".clone(), auth_admin.clone(), Bytes.new(), now);
   let del_resp = handle_admin_request(&mut service, &del_req);
   if del_resp.status_code != 200 {
     return false;
@@ -293,7 +444,7 @@ fn test_admin_operations_crud() -> Bool
 // ---------------------------------------------------------------------------
 
 fn test_limits_and_secret_redaction() -> Bool
-  intent "仕様サイズ上限超過や同時操作上限超過が拒否され、秘密が応答に出ないことを検証する"
+  intent "仕様サイズ上限超過 (413) や同時操作上限超過 (429) が拒否され、秘密が応答に出ないことを検証する"
   requires none
   ensures none
   effects none
@@ -308,7 +459,7 @@ fn test_limits_and_secret_redaction() -> Bool
   let token_admin = create_test_bearer_token(&test_signing_key(), &aud, &"admin".clone(), now, now + 3600);
   let auth_admin = concat_str(&"Bearer ".clone(), &token_admin);
 
-  // 1. 仕様サイズ超過 (64 KiB 超過)
+  // 1. 仕様サイズ超過 (64 KiB 超過 -> 413)
   let mut huge_body = Bytes.new();
   let limit = max_spec_size();
   let mut i = 0;
@@ -322,11 +473,11 @@ fn test_limits_and_secret_redaction() -> Bool
     return false;
   }
 
-  // 2. 同時操作数超過 (active_requests >= 16)
+  // 2. 同時操作数超過 (active_requests >= 16 -> 429)
   service.active_requests = max_concurrent_operations();
   let normal_req = new_admin_request("GET".clone(), "/api/v1/workloads".clone(), auth_admin.clone(), Bytes.new(), now);
   let over_resp = handle_admin_request(&mut service, &normal_req);
-  if over_resp.status_code != 413 {
+  if over_resp.status_code != 429 {
     return false;
   }
   service.active_requests = 0;

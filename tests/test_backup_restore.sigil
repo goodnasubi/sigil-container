@@ -2,6 +2,7 @@ module tests.test_backup_restore
   targets server
   trust none
 
+use container.backup.compute_archive_checksum;
 use container.backup.converge_after_restore;
 use container.backup.create_backup;
 use container.backup.new_backup_archive;
@@ -84,21 +85,27 @@ fn test_backup_creation_and_integrity() -> Bool
 }
 
 // ---------------------------------------------------------------------------
-// 2. 改ざん・破損バックアップの拒否テスト
+// 2. 改ざん・破損・不正エントリバックアップの拒否テスト
 // ---------------------------------------------------------------------------
 
 fn test_corrupt_backup_rejected() -> Bool
-  intent "チェックサム不一致・エントリ破損・未知バージョンが確実に拒否されることを検証する"
+  intent "チェックサム不一致・エントリ破損・未知バージョン・重複キー・不正形式が確実に拒否されることを検証する"
   requires none
   ensures none
   effects none
 {
   let mut store = new_state_store();
-  let mut dummy_row = Bytes.new();
-  dummy_row.push(1);
-  dummy_row.push(2);
-  dummy_row.push(3);
-  store.entries.push(new_store_entry("key1".clone(), dummy_row));
+  let wl = new_workload_record("app-2".clone(), "sha256:bbbb".clone(), 1, 1);
+  let mut wl_bytes = Bytes.new();
+  match encode_workload_record(&wl) {
+    Ok(b) => {
+      wl_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  store.entries.push(new_store_entry("workload:app-2".clone(), wl_bytes.clone()));
 
   let mut archive = new_backup_archive(new_backup_manifest("".clone(), 0, 0, 0, "".clone()), List.new());
   match create_backup(&store, "backup-02".clone(), 1700000000) {
@@ -110,12 +117,12 @@ fn test_corrupt_backup_rejected() -> Bool
     }
   }
 
-  // 1. データの改ざん (エントリのバイト列を変更)
+  // 1. データの改ざん (エントリのバイト列を変更しチェックサム不一致)
   let mut tampered_row = Bytes.new();
   tampered_row.push(9);
   tampered_row.push(9);
   let mut tampered_entries = List.new();
-  tampered_entries.push(new_store_entry("key1".clone(), tampered_row));
+  tampered_entries.push(new_store_entry("workload:app-2".clone(), tampered_row));
   archive.entries = tampered_entries;
 
   match verify_backup(&archive) {
@@ -140,48 +147,130 @@ fn test_corrupt_backup_rejected() -> Bool
     }
   }
 
+  // 3. 不正なキー形式 (未知接頭辞) のエントリを含むアーカイブの復元拒否
+  let mut corrupt_entries = List.new();
+  corrupt_entries.push(new_store_entry("invalid_prefix:item".clone(), wl_bytes.clone()));
+  let corrupt_csum = compute_archive_checksum(&corrupt_entries);
+  let corrupt_manifest = new_backup_manifest("bad-key".clone(), 1700000000, 1, 1, corrupt_csum);
+  let corrupt_archive = new_backup_archive(corrupt_manifest, corrupt_entries);
+
+  let mut dummy_target = new_state_store();
+  match restore_backup(&mut dummy_target, &corrupt_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.Corrupt(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 重複キーを含むアーカイブの復元拒否
+  let mut dup_entries = List.new();
+  dup_entries.push(new_store_entry("workload:app-2".clone(), wl_bytes.clone()));
+  dup_entries.push(new_store_entry("workload:app-2".clone(), wl_bytes.clone()));
+  let dup_csum = compute_archive_checksum(&dup_entries);
+  let dup_manifest = new_backup_manifest("dup-key".clone(), 1700000000, 1, 2, dup_csum);
+  let dup_archive = new_backup_archive(dup_manifest, dup_entries);
+
+  match restore_backup(&mut dummy_target, &dup_archive) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.Corrupt(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// 3. 原子的復元テスト
+// 3. 原子的復元テスト (失敗時にターゲットが維持され、成功時に置換されること)
 // ---------------------------------------------------------------------------
 
 fn test_atomic_restore() -> Bool
-  intent "復元失敗時はターゲットが維持され、成功時は完全に復元されることを検証する"
+  intent "復元失敗時はターゲットが完全に維持され、成功時のみ完全に復元されることを検証する"
   requires none
   ensures none
   effects none
 {
-  let mut source_store = new_state_store();
-  let mut src_row = Bytes.new();
-  src_row.push(42);
-  source_store.entries.push(new_store_entry("src_key".clone(), src_row));
+  // 1. ターゲットストアに既存の正常データを用意
+  let mut target_store = new_state_store();
+  let existing_wl = new_workload_record("existing-app".clone(), "sha256:exist".clone(), 1, 1);
+  let mut existing_bytes = Bytes.new();
+  match encode_workload_record(&existing_wl) {
+    Ok(b) => {
+      existing_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  target_store.entries.push(new_store_entry("workload:existing-app".clone(), existing_bytes));
 
-  let mut archive = new_backup_archive(new_backup_manifest("".clone(), 0, 0, 0, "".clone()), List.new());
-  match create_backup(&source_store, "backup-03".clone(), 1700000000) {
+  // 2. 壊れたアーカイブ (チェックサム不整合)
+  let bad_manifest = new_backup_manifest("bad".clone(), 1700000000, 1, 1, "0000000000000000000000000000000000000000000000000000000000000000".clone());
+  let mut bad_entries = List.new();
+  bad_entries.push(new_store_entry("workload:bad".clone(), Bytes.new()));
+  let bad_archive = new_backup_archive(bad_manifest, bad_entries);
+
+  // 復元失敗を試行
+  match restore_backup(&mut target_store, &bad_archive) {
+    Ok(_) => {
+      return false;  // 失敗しなければならない
+    }
+    Err(_) => {
+      // ターゲットストアの内容が一切変更されていないことを検証 (原子性)
+      if target_store.entries.len() != 1 {
+        return false;
+      }
+      match target_store.entries.get(0) {
+        Some(e) => {
+          if e.key != "workload:existing-app" {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 3. 正常なアーカイブを復元
+  let mut source_store = new_state_store();
+  let new_wl = new_workload_record("new-app".clone(), "sha256:new123".clone(), 2, 1);
+  let mut new_bytes = Bytes.new();
+  match encode_workload_record(&new_wl) {
+    Ok(b) => {
+      new_bytes = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  source_store.entries.push(new_store_entry("workload:new-app".clone(), new_bytes));
+
+  let mut good_archive = new_backup_archive(new_backup_manifest("".clone(), 0, 0, 0, "".clone()), List.new());
+  match create_backup(&source_store, "backup-good".clone(), 1700000000) {
     Ok(a) => {
-      archive = a;
+      good_archive = a;
     }
     Err(_) => {
       return false;
     }
   }
 
-  let mut target_store = new_state_store();
-  let mut initial_row = Bytes.new();
-  initial_row.push(99);
-  target_store.entries.push(new_store_entry("init_key".clone(), initial_row));
-
-  // 正常復元
-  match restore_backup(&mut target_store, &archive) {
+  match restore_backup(&mut target_store, &good_archive) {
     Ok(count) => {
       if count != 1 || target_store.entries.len() != 1 {
         return false;
       }
       match target_store.entries.get(0) {
         Some(e) => {
-          if e.key != "src_key" || e.row.get(0).unwrap_or(0) != 42 {
+          if e.key != "workload:new-app" {
             return false;
           }
         }

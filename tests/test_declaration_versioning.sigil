@@ -13,10 +13,13 @@ use container.declaration.validate_declaration_commit;
 use container.error.ContainerError;
 use container.network.new_network_spec;
 use container.reconcile_state.disabled_health_check;
+use container.reconcile_state.new_health_check_spec;
 use container.spec.ContainerSpec;
 use container.spec.RestartPolicy;
 use container.spec.default_secure_isolation;
 use container.spec.new_container_spec;
+use container.spec.new_egress_rule;
+use container.spec.new_port_mapping;
 use container.spec.new_resources;
 
 // テスト用コンテナ仕様生成ヘルパー
@@ -89,11 +92,11 @@ fn dummy_unsafe_spec(digest: &String) -> ContainerSpec
 }
 
 // ---------------------------------------------------------------------------
-// 1. 宣言の差分計算テスト
+// 1. 宣言の差分計算テスト (全フィールド対応・資源/ポート/ネットワーク単独変更検出)
 // ---------------------------------------------------------------------------
 
 fn test_diff_computation() -> Bool
-  intent "宣言の追加・削除・変更の差分が正確に計算されることを検証する"
+  intent "宣言の追加・削除・変更の差分が全フィールドにわたって正確に計算されることを検証する"
   requires none
   ensures none
   effects none
@@ -155,6 +158,102 @@ fn test_diff_computation() -> Bool
   match diff.modified.get(0) {
     Some(ch) => {
       if ch.workload_id != "wl-1" || !ch.replicas_changed || ch.old_replicas != 2 || ch.new_replicas != 3 {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (A) 資源上限 (resources) だけを変更した差分検出テスト
+  let mut res_changed_spec = dummy_spec(&d1_digest());
+  res_changed_spec.resources.memory_max_bytes = 536870912;  // 256MiB -> 512MiB
+  let d_res_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, res_changed_spec, net_spec.clone(), health.clone());
+
+  let mut list_res = List.new();
+  list_res.push(d_res_mod);
+
+  let mut base_list = List.new();
+  base_list.push(new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_spec.clone(), health.clone()));
+
+  let diff_res = compute_declaration_diff(&base_list, &list_res);
+  if diff_res.modified.len() != 1 {
+    return false;
+  }
+  match diff_res.modified.get(0) {
+    Some(ch) => {
+      if !ch.spec_changed || ch.replicas_changed || ch.digest_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (B) ポート (ports) だけを変更した差分検出テスト
+  let mut ports = List.new();
+  ports.push(new_port_mapping(8080, 80, "tcp".clone(), "127.0.0.1".clone()));
+  let net_with_port = new_network_spec(true, ports, List.new(), List.new());
+  let d_port_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_with_port, health.clone());
+
+  let mut list_port = List.new();
+  list_port.push(d_port_mod);
+
+  let diff_port = compute_declaration_diff(&base_list, &list_port);
+  if diff_port.modified.len() != 1 {
+    return false;
+  }
+  match diff_port.modified.get(0) {
+    Some(ch) => {
+      if !ch.network_changed || ch.spec_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (C) ネットワーク外向き規則 (egress_rules) だけを変更した差分検出テスト
+  let mut egress = List.new();
+  egress.push(new_egress_rule("192.168.1.0/24".clone(), 443, "tcp".clone()));
+  let net_with_egress = new_network_spec(true, List.new(), egress, List.new());
+  let d_egress_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_with_egress, health.clone());
+
+  let mut list_egress = List.new();
+  list_egress.push(d_egress_mod);
+
+  let diff_egress = compute_declaration_diff(&base_list, &list_egress);
+  if diff_egress.modified.len() != 1 {
+    return false;
+  }
+  match diff_egress.modified.get(0) {
+    Some(ch) => {
+      if !ch.network_changed {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // (D) ヘルスチェック (health_spec) だけを変更した差分検出テスト
+  let active_health = new_health_check_spec(true, 5000, 2000, 3, 10000);
+  let d_health_mod = new_workload_declaration("wl-1".clone(), d1_digest(), 2, dummy_spec(&d1_digest()), net_spec.clone(), active_health);
+
+  let mut list_health = List.new();
+  list_health.push(d_health_mod);
+
+  let diff_health = compute_declaration_diff(&base_list, &list_health);
+  if diff_health.modified.len() != 1 {
+    return false;
+  }
+  match diff_health.modified.get(0) {
+    Some(ch) => {
+      if !ch.health_changed {
         return false;
       }
     }
@@ -297,6 +396,65 @@ fn test_atomic_apply() -> Bool
 }
 
 // ---------------------------------------------------------------------------
+// 4. 重複 commit_id 拒否および初回コミット親検査テスト
+// ---------------------------------------------------------------------------
+
+fn test_commit_identity_and_parent_checks() -> Bool
+  intent "同一 commit_id の重複拒否および初回コミット parent_commit_id 必須空検査を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut repo = new_declaration_repository();
+  let net_spec = new_network_spec(false, List.new(), List.new(), List.new());
+  let health = disabled_health_check();
+
+  let decl = new_workload_declaration("wl-1".clone(), d1_digest(), 1, dummy_spec(&d1_digest()), net_spec.clone(), health.clone());
+  let mut decls = List.new();
+  decls.push(decl);
+
+  // 1. 初回コミットで parent_commit_id が空でない場合は拒否されること
+  let bad_init = new_declaration_commit("init-1".clone(), "non-empty-parent".clone(), 1000, "alice".clone(), "msg".clone(), decls.clone());
+  match apply_declaration_commit(&mut repo, bad_init) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.StateError(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 正常な初回コミットを適用
+  let good_init = new_declaration_commit("init-1".clone(), "".clone(), 1000, "alice".clone(), "msg".clone(), decls.clone());
+  match apply_declaration_commit(&mut repo, good_init) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 同一 commit_id ("init-1") の重複コミット適用試行が拒否されること
+  let dup_commit = new_declaration_commit("init-1".clone(), "init-1".clone(), 2000, "bob".clone(), "dup".clone(), decls.clone());
+  match apply_declaration_commit(&mut repo, dup_commit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.StateError(_)) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. リポジトリのコミット件数が 1 件のままであること
+  if repo.commits.len() != 1 || repo.head_commit_id != "init-1" {
+    return false;
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // エントリポイント
 // ---------------------------------------------------------------------------
 
@@ -313,6 +471,9 @@ pub fn run_declaration_versioning_tests() -> Bool
     return false;
   }
   if !test_atomic_apply() {
+    return false;
+  }
+  if !test_commit_identity_and_parent_checks() {
     return false;
   }
   return true;

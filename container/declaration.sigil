@@ -10,6 +10,15 @@ use container.network.NetworkSpec;
 use container.network.validate_network_spec;
 use container.reconcile_state.HealthCheckSpec;
 use container.spec.ContainerSpec;
+use container.spec.EgressRule;
+use container.spec.EnvVar;
+use container.spec.Isolation;
+use container.spec.Mount;
+use container.spec.PeerConnection;
+use container.spec.PortMapping;
+use container.spec.Resources;
+use container.spec.RestartPolicy;
+use container.spec.SecretFile;
 use container.spec.validate_network_identifier;
 use container.spec.validate_spec;
 
@@ -36,6 +45,8 @@ pub struct DeclarationChange {
   old_replicas: Int,
   new_replicas: Int,
   spec_changed: Bool,
+  network_changed: Bool,
+  health_changed: Bool,
 }
 
 pub struct DeclarationDiff {
@@ -91,7 +102,363 @@ pub fn new_declaration_repository() -> DeclarationRepository
   ensures none
   effects none
 {
-  return DeclarationRepository { commits: List.new(), head_commit_id: "" };
+  return DeclarationRepository { commits: List.new(), head_commit_id: "".clone() };
+}
+
+// ---------------------------------------------------------------------------
+// 差分計算のための等値判定ヘルパー
+// ---------------------------------------------------------------------------
+
+fn list_str_equal(l1: &List<String>, l2: &List<String>) -> Bool
+  intent "文字列リストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if l1.len() != l2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < l1.len() {
+    match l1.get(i) {
+      Some(s1) => {
+        match l2.get(i) {
+          Some(s2) => {
+            if s1 != s2 {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn env_vars_equal(e1: &List<EnvVar>, e2: &List<EnvVar>) -> Bool
+  intent "環境変数リストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if e1.len() != e2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < e1.len() {
+    match e1.get(i) {
+      Some(v1) => {
+        match e2.get(i) {
+          Some(v2) => {
+            if v1.key != v2.key || v1.value != v2.value {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn ports_equal(p1: &List<PortMapping>, p2: &List<PortMapping>) -> Bool
+  intent "ポートマッピングリストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if p1.len() != p2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < p1.len() {
+    match p1.get(i) {
+      Some(a) => {
+        match p2.get(i) {
+          Some(b) => {
+            if a.host_port != b.host_port || a.container_port != b.container_port || a.protocol != b.protocol || a.host_ip != b.host_ip {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn egress_rules_equal(e1: &List<EgressRule>, e2: &List<EgressRule>) -> Bool
+  intent "外向き通信規則リストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if e1.len() != e2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < e1.len() {
+    match e1.get(i) {
+      Some(a) => {
+        match e2.get(i) {
+          Some(b) => {
+            if a.destination != b.destination || a.port != b.port || a.protocol != b.protocol {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn peer_connections_equal(p1: &List<PeerConnection>, p2: &List<PeerConnection>) -> Bool
+  intent "ピア接続リストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if p1.len() != p2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < p1.len() {
+    match p1.get(i) {
+      Some(a) => {
+        match p2.get(i) {
+          Some(b) => {
+            if a.target_workload != b.target_workload || a.port != b.port || a.protocol != b.protocol {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn mounts_equal(m1: &List<Mount>, m2: &List<Mount>) -> Bool
+  intent "マウントリストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if m1.len() != m2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < m1.len() {
+    match m1.get(i) {
+      Some(a) => {
+        match m2.get(i) {
+          Some(b) => {
+            if a.source != b.source || a.destination != b.destination || a.readonly != b.readonly || a.mount_type != b.mount_type {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn secrets_equal(s1: &List<SecretFile>, s2: &List<SecretFile>) -> Bool
+  intent "秘密ファイル定義リストの一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if s1.len() != s2.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < s1.len() {
+    match s1.get(i) {
+      Some(a) => {
+        match s2.get(i) {
+          Some(b) => {
+            if a.name != b.name || a.mount_path != b.mount_path {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn isolation_equal(i1: &Isolation, i2: &Isolation) -> Bool
+  intent "隔離設定の一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if i1.uid != i2.uid || i1.gid != i2.gid || i1.privileged != i2.privileged {
+    return false;
+  }
+  if i1.share_host_pid != i2.share_host_pid || i1.share_host_ipc != i2.share_host_ipc || i1.share_host_uts != i2.share_host_uts || i1.share_host_net != i2.share_host_net {
+    return false;
+  }
+  if i1.readonly_rootfs != i2.readonly_rootfs || i1.seccomp_profile != i2.seccomp_profile {
+    return false;
+  }
+  return list_str_equal(&i1.allowed_capabilities, &i2.allowed_capabilities);
+}
+
+fn resources_equal(r1: &Resources, r2: &Resources) -> Bool
+  intent "資源上限の一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  return r1.memory_max_bytes == r2.memory_max_bytes && r1.cpu_quota_us == r2.cpu_quota_us && r1.pids_max == r2.pids_max && r1.disk_max_bytes == r2.disk_max_bytes && r1.log_max_bytes == r2.log_max_bytes;
+}
+
+fn restart_policy_equal(p1: &RestartPolicy, p2: &RestartPolicy) -> Bool
+  intent "再起動方針の一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  return match p1 {
+    RestartPolicy.No => match p2 {
+      RestartPolicy.No => true,
+      _ => false,
+    },
+    RestartPolicy.Always => match p2 {
+      RestartPolicy.Always => true,
+      _ => false,
+    },
+    RestartPolicy.OnFailure(r1, b1) => match p2 {
+      RestartPolicy.OnFailure(r2, b2) => r1 == r2 && b1 == b2,
+      _ => false,
+    },
+  };
+}
+
+fn container_spec_equal(s1: &ContainerSpec, s2: &ContainerSpec) -> Bool
+  intent "ContainerSpec の全フィールド完全一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if s1.image_digest != s2.image_digest || s1.working_dir != s2.working_dir || s1.network_enabled != s2.network_enabled {
+    return false;
+  }
+  if !list_str_equal(&s1.args, &s2.args) {
+    return false;
+  }
+  if !env_vars_equal(&s1.env_vars, &s2.env_vars) {
+    return false;
+  }
+  if !isolation_equal(&s1.isolation, &s2.isolation) {
+    return false;
+  }
+  if !resources_equal(&s1.resources, &s2.resources) {
+    return false;
+  }
+  if !ports_equal(&s1.ports, &s2.ports) {
+    return false;
+  }
+  if !egress_rules_equal(&s1.egress_rules, &s2.egress_rules) {
+    return false;
+  }
+  if !peer_connections_equal(&s1.peer_connections, &s2.peer_connections) {
+    return false;
+  }
+  if !mounts_equal(&s1.mounts, &s2.mounts) {
+    return false;
+  }
+  if !secrets_equal(&s1.secrets, &s2.secrets) {
+    return false;
+  }
+  if !restart_policy_equal(&s1.restart_policy, &s2.restart_policy) {
+    return false;
+  }
+  return true;
+}
+
+fn network_spec_equal(n1: &NetworkSpec, n2: &NetworkSpec) -> Bool
+  intent "NetworkSpec の全フィールド完全一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if n1.enabled != n2.enabled {
+    return false;
+  }
+  if !ports_equal(&n1.ports, &n2.ports) {
+    return false;
+  }
+  if !egress_rules_equal(&n1.egress_rules, &n2.egress_rules) {
+    return false;
+  }
+  if !peer_connections_equal(&n1.peer_connections, &n2.peer_connections) {
+    return false;
+  }
+  return true;
+}
+
+fn health_spec_equal(h1: &HealthCheckSpec, h2: &HealthCheckSpec) -> Bool
+  intent "HealthCheckSpec の全フィールド完全一致判定"
+  requires none
+  ensures none
+  effects none
+{
+  return h1.enabled == h2.enabled && h1.interval_ms == h2.interval_ms && h1.timeout_ms == h2.timeout_ms && h1.failure_threshold == h2.failure_threshold && h1.start_period_ms == h2.start_period_ms;
 }
 
 fn find_declaration_in_list(decls: &List<WorkloadDeclaration>, workload_id: &String) -> Option<WorkloadDeclaration>
@@ -116,7 +483,7 @@ fn find_declaration_in_list(decls: &List<WorkloadDeclaration>, workload_id: &Str
 }
 
 pub fn compute_declaration_diff(old_list: &List<WorkloadDeclaration>, new_list: &List<WorkloadDeclaration>) -> DeclarationDiff
-  intent "2 つの宣言一覧の間の差分 (追加・削除・変更) を計算する"
+  intent "2 つの宣言一覧の間の差分 (追加・削除・変更) を全フィールド比較して正確に計算する"
   requires none
   ensures none
   effects none
@@ -137,10 +504,12 @@ pub fn compute_declaration_diff(old_list: &List<WorkloadDeclaration>, new_list: 
           Some(old_decl) => {
             let digest_diff = old_decl.image_digest != new_decl.image_digest;
             let replicas_diff = old_decl.desired_replicas != new_decl.desired_replicas;
-            let spec_diff = old_decl.spec.image_digest != new_decl.spec.image_digest || old_decl.spec.working_dir != new_decl.spec.working_dir;
+            let spec_diff = !container_spec_equal(&old_decl.spec, &new_decl.spec);
+            let network_diff = !network_spec_equal(&old_decl.network_spec, &new_decl.network_spec);
+            let health_diff = !health_spec_equal(&old_decl.health_spec, &new_decl.health_spec);
 
-            if digest_diff || replicas_diff || spec_diff {
-              modified.push(DeclarationChange { workload_id: new_decl.workload_id.clone(), digest_changed: digest_diff, old_digest: old_decl.image_digest.clone(), new_digest: new_decl.image_digest.clone(), replicas_changed: replicas_diff, old_replicas: old_decl.desired_replicas, new_replicas: new_decl.desired_replicas, spec_changed: spec_diff });
+            if digest_diff || replicas_diff || spec_diff || network_diff || health_diff {
+              modified.push(DeclarationChange { workload_id: new_decl.workload_id.clone(), digest_changed: digest_diff, old_digest: old_decl.image_digest.clone(), new_digest: new_decl.image_digest.clone(), replicas_changed: replicas_diff, old_replicas: old_decl.desired_replicas, new_replicas: new_decl.desired_replicas, spec_changed: spec_diff, network_changed: network_diff, health_changed: health_diff });
             }
           }
         }
@@ -186,10 +555,10 @@ pub fn validate_workload_declaration(decl: &WorkloadDeclaration) -> Result<Bool,
 
   // 2. レプリカ数上限
   if decl.desired_replicas < 0 {
-    return Err(ContainerError.SpecValidation("desired_replicas は 0 以上である必要があります。"));
+    return Err(ContainerError.SpecValidation("desired_replicas は 0 以上である必要があります。".clone()));
   }
   if decl.desired_replicas > max_replicas() {
-    return Err(ContainerError.LimitExceeded("desired_replicas が上限 (64) を超過しています。"));
+    return Err(ContainerError.LimitExceeded("desired_replicas が上限 (64) を超過しています。".clone()));
   }
 
   // 3. コンテナ仕様の検証 (既定拒否・セキュリティ境界・資源上限必須)
@@ -202,7 +571,7 @@ pub fn validate_workload_declaration(decl: &WorkloadDeclaration) -> Result<Bool,
 
   // ワークロードIDと仕様digestの整合確認
   if decl.image_digest != decl.spec.image_digest {
-    return Err(ContainerError.SpecValidation("workload の image_digest と container spec の image_digest が一致しません。"));
+    return Err(ContainerError.SpecValidation("workload の image_digest と container spec の image_digest が一致しません。".clone()));
   }
 
   // 4. ネットワーク仕様の検証 (既定拒否・内部アドレス限定・特権ポート拒否)
@@ -223,11 +592,11 @@ pub fn validate_declaration_commit(commit: &DeclarationCommit) -> Result<Bool, C
   effects none
 {
   if commit.commit_id.len() == 0 {
-    return Err(ContainerError.SpecValidation("commit_id は空にできません。"));
+    return Err(ContainerError.SpecValidation("commit_id は空にできません。".clone()));
   }
 
   if commit.declarations.len() > max_workload_count() {
-    return Err(ContainerError.LimitExceeded("コミット内のワークロード宣言数が上限 (1024) を超過しています。"));
+    return Err(ContainerError.LimitExceeded("コミット内のワークロード宣言数が上限 (1024) を超過しています。".clone()));
   }
 
   // 重複 workload_id の検査
@@ -240,7 +609,7 @@ pub fn validate_declaration_commit(commit: &DeclarationCommit) -> Result<Bool, C
           match commit.declarations.get(j) {
             Some(decl_j) => {
               if decl_i.workload_id == decl_j.workload_id {
-                return Err(ContainerError.SpecValidation("同一コミット内で重複する workload_id が宣言されています。"));
+                return Err(ContainerError.SpecValidation("同一コミット内で重複する workload_id が宣言されています。".clone()));
               }
             }
             None => {}
@@ -315,10 +684,37 @@ pub fn apply_declaration_commit(repo: &mut DeclarationRepository, commit: Declar
 {
   // 1. 履歴保持上限チェック
   if repo.commits.len() >= max_declaration_commits() {
-    return Err(ContainerError.LimitExceeded("リポジトリのコミット履歴数が上限 (256) に達しています。"));
+    return Err(ContainerError.LimitExceeded("リポジトリのコミット履歴数が上限 (256) に達しています。".clone()));
   }
 
-  // 2. 適用前の厳格検証: 不正があれば即時拒否し、リポジトリの状態は一切変更しない
+  // 2. コミット ID 重複検査 (既存コミットおよび HEAD との重複を拒否)
+  let mut ci = 0;
+  while ci < repo.commits.len() {
+    match repo.commits.get(ci) {
+      Some(c) => {
+        if c.commit_id == commit.commit_id {
+          return Err(ContainerError.StateError("同一 commit_id のコミットが既に存在します。".clone()));
+        }
+      }
+      None => {}
+    }
+    ci = ci + 1;
+  }
+
+  // 3. 親コミット整合性チェック
+  if repo.head_commit_id.len() == 0 {
+    // 初回コミットは parent_commit_id が空でなければならない
+    if commit.parent_commit_id.len() != 0 {
+      return Err(ContainerError.StateError("初回コミットの parent_commit_id は空文字列である必要があります。".clone()));
+    }
+  } else {
+    // 2回目以降は現在の HEAD と一致しなければならない
+    if commit.parent_commit_id != repo.head_commit_id {
+      return Err(ContainerError.StateError("parent_commit_id が現在の HEAD と一致しません (分岐または競合)。".clone()));
+    }
+  }
+
+  // 4. 適用前の厳格検証: 不正があれば即時拒否し、リポジトリの状態は一切変更しない (原子的検証)
   match validate_declaration_commit(&commit) {
     Ok(_) => {}
     Err(e) => {
@@ -326,16 +722,11 @@ pub fn apply_declaration_commit(repo: &mut DeclarationRepository, commit: Declar
     }
   }
 
-  // 3. 親コミット整合性チェック (初期コミット以外)
-  if repo.head_commit_id.len() > 0 && commit.parent_commit_id != repo.head_commit_id {
-    return Err(ContainerError.StateError("parent_commit_id が現在の HEAD と一致しません (分岐または競合)。"));
-  }
-
-  // 4. 現在の HEAD との差分を計算
+  // 5. 現在の HEAD との差分を計算
   let current_decls = get_head_declarations(&repo);
   let diff = compute_declaration_diff(&current_decls, &commit.declarations);
 
-  // 5. 原子的更新: コミットを履歴に追加し HEAD を前進
+  // 6. 原子的更新: コミットを履歴に追加し HEAD を前進
   let new_head = commit.commit_id.clone();
   repo.commits.push(commit);
   repo.head_commit_id = new_head;
