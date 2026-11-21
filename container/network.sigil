@@ -21,13 +21,13 @@ use db.types.encode_row;
 // - コンテナごとの network namespace と、ノード内のブリッジによる接続
 // - 既定は接続なし (省略が接続の許可にならない)
 // - 外向き通信の許可 (宛先・ポート) を宣言し、許可しないものは遮断 (0.0.0.0/0, ゲートウェイ, ブリッジサブネット, リンクローカル拒否)
-// - 宣言したポートの公開 (待ち受けはループバックまたは宣言した内部アドレスに限定、0.0.0.0 や特権ポート < 1024 拒否)
+// - 宣言したポートの公開 (待ち受けはループバックまたは RFC 1918 全域に限定、0.0.0.0 や特権ポート < 1024 拒否。ノード側の許可アドレス一覧による絞り込みは後続課題)
 // - ノード内の名前による参照 (名前解決): 宣言したワークロード/インスタンスを指し、宣言に無い名前は解決しない
 // - host network の拒否: host の network namespace を共有する指定は仕様エラーとして拒否
-// - コンテナ間の分離: 宣言した接続の無いコンテナ同士は通信不可、宣言に無い通信は遮断
+// - コンテナ間の分離: 宣言した接続の無いコンテナ同士は通信不可、宣言に無い通信は遮断 (ピア接続は ADR 0053 決定 4 準拠でクライアント側の外向き通信許可宣言として評価)
 //
 // 注意事項:
-// 1. 実配線 (Linux network namespace 作成, veth ペア, nftables 規則, ポート転送) は本 PR の範囲外であり後続課題。
+// 1. 実配線 (Linux network namespace 作成, veth ペア, nftables 規則, ポート転送) は本 PR の範囲外であり後続課題。実配線時はノード側の許可アドレス一覧による絞り込み、およびそのアドレスがホストに実在することの確認が必要。
 // 2. IPv6 は現在未対応であり、判定はすべて拒否 (fail-closed)。実配線時は netns 内で IPv6 を無効化する必要がある。
 // 3. P4 DB 保存 (NetworkEndpointRecord) は規則の件数のみを永続化し、再起動後はコンテナ仕様から決定論的に再導出する前提。
 
@@ -216,29 +216,51 @@ fn byte_to_hex2(val: Int) -> String
   };
 }
 
-fn find_available_ip_host(endpoints: &List<NetworkEndpoint>, subnet_prefix: &String) -> Option<Int>
-  intent "利用可能な最小のホスト番号 (2..254) を探索する (detach された IP を再利用)"
+fn get_octet(octets: &List<Int>, i: Int) -> Int
+  intent "List<Int> から i 番目のオクテットを取り出す"
   requires none
   ensures none
   effects none
 {
+  return match octets.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+fn find_available_ip_host(endpoints: &List<NetworkEndpoint>, subnet_prefix: &String) -> Option<Int>
+  intent "利用可能な最小のホスト番号 (2..254) を探索する (detach された IP を再利用, O(n) ルックアップ)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut used = Bytes.new();
+  let mut i = 0;
+  while i < 256 {
+    used.push(0);
+    i = i + 1;
+  }
+  let mut ep_idx = 0;
+  while ep_idx < endpoints.len() {
+    match endpoints.get(ep_idx) {
+      Some(ep) => {
+        match parse_strict_ipv4(&ep.ip_address) {
+          Some(octs) => {
+            let host_part = get_octet(&octs, 3);
+            if host_part >= 0 && host_part <= 255 {
+              let _ = used.set(host_part, 1);
+            }
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    ep_idx = ep_idx + 1;
+  }
   let mut candidate = 2;
   while candidate <= 254 {
-    let candidate_ip = concat_str(&subnet_prefix, &int_to_str(candidate));
-    let mut in_use = false;
-    let mut i = 0;
-    while i < endpoints.len() {
-      match endpoints.get(i) {
-        Some(ep) => {
-          if ep.ip_address == candidate_ip {
-            in_use = true;
-          }
-        }
-        None => {}
-      }
-      i = i + 1;
-    }
-    if !in_use {
+    if used.get(candidate).unwrap_or(0) == 0 {
       return Some(candidate);
     }
     candidate = candidate + 1;
@@ -394,6 +416,144 @@ pub fn detach_container(bridge: &mut BridgeNetwork, instance_id: &String) -> Res
   }
   bridge.endpoints = new_eps;
   return Ok(found);
+}
+
+pub fn restore_endpoint(bridge: &mut BridgeNetwork, record: &NetworkEndpointRecord, spec: NetworkSpec, share_host_net: Bool) -> Result<NetworkEndpoint, ContainerError>
+  intent "永続化された NetworkEndpointRecord から元の IP・MAC を維持してエンドポイントを復元する"
+  requires none
+  ensures none
+  effects none
+{
+  // 決定 4・6: host network の共有は禁止
+  if share_host_net {
+    return Err(ContainerError.SpecValidation("host network namespace の共有は禁止されています (決定 4・6)。"));
+  }
+
+  // 既定拒否: ネットワークが無効化されているコンテナはブリッジに接続できない
+  if !record.network_enabled || !spec.enabled {
+    return Err(ContainerError.SpecValidation("ネットワークが無効なコンテナはブリッジに接続できません (完全隔離)。"));
+  }
+
+  // 1. 識別子の厳格な検証 (Linux IFNAMSIZ 15文字制約: veth-h- 7文字 + id 8文字以内、先頭英数字)
+  match validate_network_identifier(&record.instance_id) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  match validate_network_identifier(&record.workload_id) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  if record.instance_id == record.workload_id {
+    return Err(ContainerError.SpecValidation("instance_id と workload_id は異なる識別子である必要があります (名前空間衝突の防止)。"));
+  }
+
+  // 重複 restore および名前空間・IP 衝突の検査
+  let mut ep_idx = 0;
+  while ep_idx < bridge.endpoints.len() {
+    match bridge.endpoints.get(ep_idx) {
+      Some(existing_ep) => {
+        if existing_ep.instance_id == record.instance_id {
+          return Err(ContainerError.SpecValidation("同一 instance_id のエンドポイントが既に存在します (重複 restore 拒否)。"));
+        }
+        if existing_ep.workload_id == record.instance_id {
+          return Err(ContainerError.SpecValidation("instance_id が既存の workload_id と重複しています。"));
+        }
+        if existing_ep.instance_id == record.workload_id {
+          return Err(ContainerError.SpecValidation("workload_id が既存の instance_id と重複しています。"));
+        }
+        if existing_ep.ip_address == record.ip_address {
+          return Err(ContainerError.SpecValidation("同一 IP アドレスのエンドポイントが既に存在します (IP 衝突防止)。"));
+        }
+      }
+      None => {}
+    }
+    ep_idx = ep_idx + 1;
+  }
+
+  // 上限検査
+  if bridge.endpoints.len() >= max_network_endpoints() {
+    return Err(ContainerError.LimitExceeded("ブリッジ上のエンドポイント数が上限を超過しています。"));
+  }
+
+  // 仕様の検証 (仕様内ポート重複、許可リスト、CIDR構文・危険規則検査を含む)
+  match validate_network_spec(&spec) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
+  // 既存エンドポイントとのホストポート競合検査
+  let mut p_idx = 0;
+  while p_idx < spec.ports.len() {
+    match spec.ports.get(p_idx) {
+      Some(p) => {
+        let mut ep_i = 0;
+        while ep_i < bridge.endpoints.len() {
+          match bridge.endpoints.get(ep_i) {
+            Some(existing_ep) => {
+              let mut existing_p_idx = 0;
+              while existing_p_idx < existing_ep.spec.ports.len() {
+                match existing_ep.spec.ports.get(existing_p_idx) {
+                  Some(ep_p) => {
+                    if p.host_ip == ep_p.host_ip && p.host_port == ep_p.host_port && p.protocol == ep_p.protocol {
+                      return Err(ContainerError.SpecValidation("ホストポートの競合が検出されました: 既存のエンドポイントと同一のホストポート (host_ip:host_port/protocol) が宣言されています。"));
+                    }
+                  }
+                  None => {}
+                }
+                existing_p_idx = existing_p_idx + 1;
+              }
+            }
+            None => {}
+          }
+          ep_i = ep_i + 1;
+        }
+      }
+      None => {}
+    }
+    p_idx = p_idx + 1;
+  }
+
+  // IP アドレスがブリッジのサブネットおよび有効範囲内にあるかの検証
+  let mut host_num = 0;
+  match parse_strict_ipv4(&record.ip_address) {
+    Some(octs) => {
+      host_num = get_octet(&octs, 3);
+      let expected_ip = concat_str(&bridge.config.subnet_prefix, &int_to_str(host_num));
+      if record.ip_address != expected_ip || host_num < 2 || host_num > 254 {
+        return Err(ContainerError.SpecValidation("復元対象の IP アドレスがブリッジのサブネット範囲外です。"));
+      }
+    }
+    None => {
+      return Err(ContainerError.SpecValidation("復元対象の IP アドレス構文が不正です。"));
+    }
+  }
+
+  let ep_id = concat_str(&"ep-", &record.instance_id);
+  let veth_h = concat_str(&"veth-h-", &record.instance_id);
+  let netns = concat_str(&"/var/run/netns/", &record.instance_id);
+
+  let endpoint = NetworkEndpoint { endpoint_id: ep_id, instance_id: record.instance_id.clone(), workload_id: record.workload_id.clone(), ip_address: record.ip_address.clone(), mac_address: record.mac_address.clone(), netns_path: netns, veth_host: veth_h, veth_container: "eth0", spec: spec };
+
+  bridge.endpoints.push(endpoint.clone());
+  if host_num >= bridge.next_ip_host {
+    bridge.next_ip_host = host_num + 1;
+  }
+  return Ok(endpoint);
+}
+
+pub fn endpoint_to_record(ep: &NetworkEndpoint) -> NetworkEndpointRecord
+  intent "NetworkEndpoint から永続化用の NetworkEndpointRecord を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return NetworkEndpointRecord { instance_id: ep.instance_id.clone(), workload_id: ep.workload_id.clone(), ip_address: ep.ip_address.clone(), mac_address: ep.mac_address.clone(), network_enabled: ep.spec.enabled, published_port_count: ep.spec.ports.len(), egress_rule_count: ep.spec.egress_rules.len(), peer_rule_count: ep.spec.peer_connections.len() };
 }
 
 pub fn find_endpoint(endpoints: &List<NetworkEndpoint>, instance_id: &String) -> Option<NetworkEndpoint>
@@ -553,18 +713,6 @@ fn power2(exp: Int) -> Int
     i = i + 1;
   }
   return res;
-}
-
-fn get_octet(octets: &List<Int>, i: Int) -> Int
-  intent "List<Int> から i 番目のオクテットを取り出す"
-  requires none
-  ensures none
-  effects none
-{
-  return match octets.get(i) {
-    Some(v) => v,
-    None => 0,
-  };
 }
 
 pub fn match_ip_or_cidr(rule_dest: &String, target_ip: &String) -> Bool
@@ -768,7 +916,7 @@ pub fn publish_ports(endpoint: &NetworkEndpoint) -> Result<List<PublishedPort>, 
     match endpoint.spec.ports.get(i) {
       Some(p) => {
         if !is_allowed_host_ip(&p.host_ip) {
-          return Err(ContainerError.SpecValidation("ホスト公開アドレスはループバック (127.0.0.0/8) または宣言された内部アドレス (RFC 1918) である必要があります。"));
+          return Err(ContainerError.SpecValidation("ホスト公開アドレスはループバック (127.0.0.0/8) または RFC 1918 全域である必要があります。"));
         }
         if p.host_port < 1024 {
           return Err(ContainerError.SpecValidation("ホストポートには 1024 以上の非特権ポートを指定する必要があります (1024 未満の特権ポートは非 root 実行環境の制約および安全のため拒否されます)。"));

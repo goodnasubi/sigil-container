@@ -19,6 +19,7 @@ use container.network.default_endpoint;
 use container.network.detach_container;
 use container.network.encode_endpoint_key;
 use container.network.encode_endpoint_record;
+use container.network.endpoint_to_record;
 use container.network.evaluate_packet;
 use container.network.find_endpoint;
 use container.network.find_endpoint_by_ip;
@@ -28,6 +29,7 @@ use container.network.new_network_endpoint_record;
 use container.network.new_network_spec;
 use container.network.publish_ports;
 use container.network.resolve_name;
+use container.network.restore_endpoint;
 use container.network.route_inbound_port;
 use container.network.validate_network_spec;
 use container.spec.ContainerSpec;
@@ -246,7 +248,7 @@ fn test_port_publishing() -> Bool
       return false;
     }
     Err(ContainerError.SpecValidation(msg)) => {
-      if msg != "ホスト公開アドレスはループバック (127.0.0.0/8) または宣言された内部アドレス (RFC 1918) である必要があります。" {
+      if msg != "ホスト公開アドレスはループバック (127.0.0.0/8) または RFC 1918 全域である必要があります。" {
         return false;
       }
     }
@@ -970,6 +972,26 @@ fn test_identifier_validation() -> Bool
     }
   }
 
+  // 先頭ハイフン (-b, -inst, -wl) の拒否 (コマンド引数注入防止)
+  match attach_container(&mut bridge, "-b", "wl-1", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match attach_container(&mut bridge, "inst-1", "-wl", net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
   // instance_id と workload_id が同一の場合は拒否 (名前解決衝突の防止)
   match attach_container(&mut bridge, "web", "web", net_spec.clone(), false) {
     Ok(_) => {
@@ -1187,6 +1209,26 @@ fn test_egress_destination_syntax_and_dangerous_rules() -> Bool
 
   // 2. プレフィックス長 0 ('0.0.0.0/0') の明示的拒否
   match validate_destination_cidr_or_ip(&"0.0.0.0/0") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 2-1. 0.0.0.0/8 (0.x.x.x) の拒否 (Issue #12 項目 3)
+  match validate_destination_cidr_or_ip(&"0.0.0.0/8") {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  match validate_destination_cidr_or_ip(&"0.1.2.3") {
     Ok(_) => {
       return false;
     }
@@ -1530,6 +1572,132 @@ fn test_host_port_collision() -> Bool
   return true;
 }
 
+fn test_endpoint_restore() -> Bool
+  intent "NetworkEndpointRecord からの restore_endpoint による IP・MAC 保持復元と起動順序変更耐性を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bridge1 = new_bridge_network(default_bridge_config());
+  let net_spec = new_network_spec(true, List.new(), List.new(), List.new());
+
+  // 1. 通常 attach して record を取得
+  let ep1_res = attach_container(&mut bridge1, "inst-1", "wl-1", net_spec.clone(), false);
+  let mut ep1 = default_endpoint();
+  match ep1_res {
+    Ok(e) => {
+      ep1 = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let rec1 = endpoint_to_record(&ep1);
+
+  let ep2_res = attach_container(&mut bridge1, "inst-2", "wl-2", net_spec.clone(), false);
+  let mut ep2 = default_endpoint();
+  match ep2_res {
+    Ok(e) => {
+      ep2 = e;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let rec2 = endpoint_to_record(&ep2);
+
+  if rec1.ip_address != "10.244.0.2" || rec2.ip_address != "10.244.0.3" {
+    return false;
+  }
+
+  // 2. 新しいブリッジ上で逆順に restore する (起動順序が異なっても元の IP を保持することの検証)
+  let mut bridge2 = new_bridge_network(default_bridge_config());
+
+  // 先に inst-2 を復元
+  let rest2_res = restore_endpoint(&mut bridge2, &rec2, net_spec.clone(), false);
+  match rest2_res {
+    Ok(e) => {
+      if e.ip_address != "10.244.0.3" || e.mac_address != rec2.mac_address {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 次に inst-1 を復元
+  let rest1_res = restore_endpoint(&mut bridge2, &rec1, net_spec.clone(), false);
+  match rest1_res {
+    Ok(e) => {
+      if e.ip_address != "10.244.0.2" || e.mac_address != rec1.mac_address {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 重複 restore の拒否 (同一 ID / 同一 IP)
+  match restore_endpoint(&mut bridge2, &rec1, net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  let dup_ip_rec = new_network_endpoint_record("inst-3", "wl-3", "10.244.0.2", "02:42:0a:f4:00:02", true, 0, 0, 0);
+  match restore_endpoint(&mut bridge2, &dup_ip_rec, net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 4. サブネット外 IP の復元拒否
+  let out_subnet_rec = new_network_endpoint_record("inst-4", "wl-4", "192.168.1.5", "02:42:0a:f4:00:05", true, 0, 0, 0);
+  match restore_endpoint(&mut bridge2, &out_subnet_rec, net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  // 5. 範囲外ホスト番号 (1 = gateway, 255 = broadcast) の復元拒否
+  let gw_rec = new_network_endpoint_record("inst-5", "wl-5", "10.244.0.1", "02:42:0a:f4:00:01", true, 0, 0, 0);
+  match restore_endpoint(&mut bridge2, &gw_rec, net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+  let bcast_rec = new_network_endpoint_record("inst-6", "wl-6", "10.244.0.255", "02:42:0a:f4:00:ff", true, 0, 0, 0);
+  match restore_endpoint(&mut bridge2, &bcast_rec, net_spec.clone(), false) {
+    Ok(_) => {
+      return false;
+    }
+    Err(ContainerError.SpecValidation(_)) => {}
+    _ => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // エントリポイント
 // ---------------------------------------------------------------------------
@@ -1583,6 +1751,9 @@ pub fn run_network_tests() -> Bool
     return false;
   }
   if !test_host_port_collision() {
+    return false;
+  }
+  if !test_endpoint_restore() {
     return false;
   }
   return true;
