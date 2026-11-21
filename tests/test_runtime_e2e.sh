@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--require" ]; }; then
+  echo "Usage: $0 [--require]" >&2
+  exit 2
+fi
+
 echo "=== 5. Real OCI Runtime Integration & Negative Tests (ADR 0053 P5-2) ==="
 
 TMP_DIR="$(mktemp -d -t sigil_runtime_e2e_XXXXXX)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
 cleanup() {
   # Clean up any lingering containers or directories across all installed runtimes
   for rt in crun runc; do
@@ -18,7 +25,6 @@ cleanup() {
   done
   rm -rf "$TMP_DIR"
 }
-trap cleanup EXIT
 
 echo "Working directory: $TMP_DIR"
 
@@ -70,7 +76,20 @@ BUNDLE_DIR="$TMP_DIR/bundle"
 mkdir -p "$BUNDLE_DIR/rootfs/dev"
 cp "$TMP_DIR/app" "$BUNDLE_DIR/rootfs/app"
 chmod 0555 "$BUNDLE_DIR/rootfs/app"
-chown 65532:65532 "$BUNDLE_DIR/rootfs/app"
+# This also checks whether UID/GID 65532 is mapped in a nested user namespace.
+if ! CHOWN_ERROR="$(LC_ALL=C chown 65532:65532 "$BUNDLE_DIR/rootfs/app" 2>&1)"; then
+  if [ "$#" -eq 0 ]; then
+    case "$CHOWN_ERROR" in
+      *"Operation not permitted"*|*"Invalid argument"*)
+        echo "=== 5. Skipping real OCI runtime integration (cannot chown /app to UID/GID 65532) ==="
+        echo "$CHOWN_ERROR"
+        exit 0
+        ;;
+    esac
+  fi
+  echo "$CHOWN_ERROR" >&2
+  exit 1
+fi
 chmod 0755 "$BUNDLE_DIR" "$BUNDLE_DIR/rootfs"
 
 cat << 'JSON_EOF' > "$BUNDLE_DIR/config.json"
@@ -130,6 +149,8 @@ if [ "$PRIMARY_RUNTIME" = "crun" ] && [ -z "$CGROUP_CONTROLLERS" ]; then
   echo "Recording reason: using --cgroup-manager disabled for crun in unprivileged nested sandbox."
   PRIMARY_ARGS=("--cgroup-manager" "disabled")
 fi
+
+trap cleanup EXIT
 
 echo "--- A. Testing ADR 0035 Image Execution with $PRIMARY_RUNTIME ---"
 # Test lifecycle transitions: create -> state -> start -> state -> delete
