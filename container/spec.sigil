@@ -660,6 +660,12 @@ pub fn validate_network_identifier(id: &String) -> Result<Bool, ContainerError>
   if bytes.len() < 1 || bytes.len() > 8 {
     return Err(ContainerError.SpecValidation("識別子の長さは 1〜8 文字である必要があります (Linux IFNAMSIZ 制約および安全のため)。"));
   }
+  let first_b = bytes.get(0).unwrap_or(0);
+  let first_is_lower = first_b >= 97 && first_b <= 122;
+  let first_is_digit = first_b >= 48 && first_b <= 57;
+  if !first_is_lower && !first_is_digit {
+    return Err(ContainerError.SpecValidation("識別子の先頭文字は英小文字または数字である必要があります (ハイフンで始まる識別子はコマンド引数注入防止のため禁止)。"));
+  }
   let mut i = 0;
   while i < bytes.len() {
     let b = bytes.get(i).unwrap_or(0);
@@ -756,9 +762,10 @@ pub fn validate_destination_cidr_or_ip(dest: &String) -> Result<Bool, ContainerE
   let base_u32 = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
 
   // 危険な規則の検査:
-  // 1. 全 IPv4 / 0.0.0.0 宛て
-  if base_u32 == 0 {
-    return Err(ContainerError.SpecValidation("0.0.0.0 を含む全方位外向き規則は拒否されます。"));
+  // 1. 0.0.0.0/8 (0.x.x.x: 現在のネットワーク / 0.0.0.0 を含む全方位外向き規則)
+  let zero_net_u32 = 0;
+  if cidrs_overlap(base_u32, prefix_len, zero_net_u32, 8) {
+    return Err(ContainerError.SpecValidation("0.0.0.0/8 (0.x.x.x) を含む外向き通信規則は拒否されます。"));
   }
 
   // 2. ゲートウェイ 10.244.0.1 (10.244.0.1/32)
@@ -822,9 +829,9 @@ pub fn validate_network_components(network_enabled: Bool, ports: &List<PortMappi
         if p.protocol != "tcp" && p.protocol != "udp" {
           return Err(ContainerError.SpecValidation("ポートマッピングのプロトコルは 'tcp' または 'udp' である必要があります。"));
         }
-        // ホスト IP: 許可リスト方式 (127.0.0.0/8 または RFC 1918 内部アドレスのみ)
+        // ホスト IP: 許可リスト方式 (127.0.0.0/8 または RFC 1918 全域。ノード側の許可アドレス一覧による絞り込みは後続課題)
         if !is_allowed_host_ip(&p.host_ip) {
-          return Err(ContainerError.SpecValidation("ホスト公開アドレスはループバック (127.0.0.0/8) または宣言された内部アドレス (RFC 1918) である必要があります。"));
+          return Err(ContainerError.SpecValidation("ホスト公開アドレスはループバック (127.0.0.0/8) または RFC 1918 全域である必要があります。"));
         }
       }
       None => {}
